@@ -2,17 +2,38 @@
 //!
 //! Generates virtual .svelte.ts files that tsgo can type-check.
 //! Also builds source maps for error position mapping.
+//!
+//! Transformation strategy:
+//! 1. Add Svelte type imports
+//! 2. Add Svelte 5 rune type declarations ($state, $derived, $effect, $props)
+//! 3. Emit module script content (context="module")
+//! 4. Emit instance script content
+//! 5. Extract `export let` declarations to generate $$Props interface
+//! 6. Extract <slot> elements to generate $$Slots interface
+//! 7. Generate component class extending SvelteComponentTyped
 
 const std = @import("std");
 const Ast = @import("svelte_parser.zig").Ast;
 const ScriptData = @import("svelte_parser.zig").ScriptData;
+const ElementData = @import("svelte_parser.zig").ElementData;
 const SourceMap = @import("source_map.zig").SourceMap;
 
 pub const VirtualFile = struct {
     original_path: []const u8,
-    virtual_path: []const u8, // path.svelte.ts
+    virtual_path: []const u8,
     content: []const u8,
     source_map: SourceMap,
+};
+
+const PropInfo = struct {
+    name: []const u8,
+    type_repr: ?[]const u8,
+    has_initializer: bool,
+};
+
+const SlotInfo = struct {
+    name: []const u8,
+    props: std.ArrayList([]const u8),
 };
 
 pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
@@ -21,16 +42,47 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     var mappings: std.ArrayList(SourceMap.Mapping) = .empty;
     defer mappings.deinit(allocator);
 
-    // Generate imports and setup
+    // Header comment
     try output.appendSlice(allocator, "// Generated from ");
     try output.appendSlice(allocator, ast.file_path);
     try output.appendSlice(allocator, "\n\n");
 
-    // Extract and emit script content
+    // Svelte type imports
+    try output.appendSlice(allocator, "import type { SvelteComponentTyped } from \"svelte\";\n\n");
+
+    // Svelte 5 rune type declarations
+    try output.appendSlice(allocator,
+        \\// Svelte 5 rune type stubs
+        \\declare function $state<T>(initial: T): T;
+        \\declare function $derived<T>(value: T | (() => T)): T;
+        \\declare function $effect(callback: () => void | (() => void)): void;
+        \\declare function $props<T = $$Props>(): T;
+        \\declare function $bindable<T>(initial?: T): T;
+        \\
+        \\
+    );
+
+    // Separate module and instance scripts
+    var module_script: ?ScriptData = null;
+    var instance_script: ?ScriptData = null;
+
     for (ast.scripts.items) |script| {
+        if (script.context) |ctx| {
+            if (std.mem.eql(u8, ctx, "module")) {
+                module_script = script;
+            } else {
+                instance_script = script;
+            }
+        } else {
+            instance_script = script;
+        }
+    }
+
+    // Emit module script content (if any)
+    if (module_script) |script| {
+        try output.appendSlice(allocator, "// <script context=\"module\">\n");
         const content = ast.source[script.content_start..script.content_end];
 
-        // Track mapping
         try mappings.append(allocator, .{
             .svelte_offset = script.content_start,
             .ts_offset = @intCast(output.items.len),
@@ -41,9 +93,95 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         try output.appendSlice(allocator, "\n\n");
     }
 
-    // Generate component type info for props, slots, etc.
-    try output.appendSlice(allocator, "// Component exports\n");
-    try output.appendSlice(allocator, "export default {};\n");
+    // Emit instance script content (if any)
+    if (instance_script) |script| {
+        try output.appendSlice(allocator, "// <script>\n");
+        const content = ast.source[script.content_start..script.content_end];
+
+        try mappings.append(allocator, .{
+            .svelte_offset = script.content_start,
+            .ts_offset = @intCast(output.items.len),
+            .len = @intCast(content.len),
+        });
+
+        try output.appendSlice(allocator, content);
+        try output.appendSlice(allocator, "\n\n");
+    }
+
+    // Extract props from instance script
+    var props: std.ArrayList(PropInfo) = .empty;
+    defer props.deinit(allocator);
+
+    if (instance_script) |script| {
+        const content = ast.source[script.content_start..script.content_end];
+        try extractExportLets(allocator, content, &props);
+    }
+
+    // Extract slots from AST
+    var slots: std.ArrayList(SlotInfo) = .empty;
+    defer {
+        for (slots.items) |*slot| {
+            slot.props.deinit(allocator);
+        }
+        slots.deinit(allocator);
+    }
+    try extractSlots(allocator, &ast, &slots);
+
+    // Generate $$Props interface
+    try output.appendSlice(allocator, "// Component typing\nexport interface $$Props {\n");
+    for (props.items) |prop| {
+        try output.appendSlice(allocator, "  ");
+        try output.appendSlice(allocator, prop.name);
+        if (prop.has_initializer) {
+            try output.appendSlice(allocator, "?");
+        }
+        try output.appendSlice(allocator, ": ");
+        if (prop.type_repr) |t| {
+            try output.appendSlice(allocator, t);
+        } else {
+            try output.appendSlice(allocator, "any");
+        }
+        try output.appendSlice(allocator, ";\n");
+    }
+    try output.appendSlice(allocator, "}\n\n");
+
+    // Generate $$Slots interface
+    try output.appendSlice(allocator, "export interface $$Slots {\n");
+    var has_default_slot = false;
+    for (slots.items) |slot| {
+        if (std.mem.eql(u8, slot.name, "default")) {
+            has_default_slot = true;
+        }
+        try output.appendSlice(allocator, "  ");
+        try output.appendSlice(allocator, slot.name);
+        if (!std.mem.eql(u8, slot.name, "default")) {
+            try output.appendSlice(allocator, "?");
+        }
+        try output.appendSlice(allocator, ": {");
+        for (slot.props.items, 0..) |prop, i| {
+            if (i > 0) try output.appendSlice(allocator, ",");
+            try output.appendSlice(allocator, " ");
+            try output.appendSlice(allocator, prop);
+            try output.appendSlice(allocator, "?: any");
+        }
+        if (slot.props.items.len > 0) {
+            try output.appendSlice(allocator, " ");
+        }
+        try output.appendSlice(allocator, "};\n");
+    }
+    if (!has_default_slot) {
+        try output.appendSlice(allocator, "  default: {};\n");
+    }
+    try output.appendSlice(allocator, "}\n\n");
+
+    // Generate $$Events type
+    try output.appendSlice(allocator, "export type $$Events = Record<string, any>;\n\n");
+
+    // Generate default export
+    try output.appendSlice(allocator,
+        \\export default class Component extends SvelteComponentTyped<$$Props, $$Events, $$Slots> {}
+        \\
+    );
 
     // Build virtual path
     const virtual_path = try std.fmt.allocPrint(allocator, "{s}.ts", .{ast.file_path});
@@ -57,6 +195,205 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             .svelte_source = ast.source,
         },
     };
+}
+
+fn extractExportLets(allocator: std.mem.Allocator, content: []const u8, props: *std.ArrayList(PropInfo)) !void {
+    var i: usize = 0;
+    var brace_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Track nesting depth
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+        if (c == '(') paren_depth += 1;
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        // Skip single-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
+            while (i < content.len and content[i] != '\n') : (i += 1) {}
+            continue;
+        }
+
+        // Skip multi-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < content.len) {
+                if (content[i] == '*' and content[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Only look for export let at top level
+        if (brace_depth == 0 and paren_depth == 0) {
+            if (startsWithKeyword(content[i..], "export")) {
+                i += 6;
+                i = skipWhitespace(content, i);
+
+                if (startsWithKeyword(content[i..], "let")) {
+                    i += 3;
+                    i = skipWhitespace(content, i);
+
+                    // Parse identifier
+                    const name_start = i;
+                    while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+                    const name = content[name_start..i];
+
+                    if (name.len == 0) continue;
+
+                    i = skipWhitespace(content, i);
+
+                    // Optional type annotation
+                    var type_repr: ?[]const u8 = null;
+                    if (i < content.len and content[i] == ':') {
+                        i += 1;
+                        i = skipWhitespace(content, i);
+                        const type_start = i;
+                        i = skipTypeAnnotation(content, i);
+                        const type_end = i;
+                        type_repr = std.mem.trim(u8, content[type_start..type_end], " \t\n\r");
+                    }
+
+                    i = skipWhitespace(content, i);
+
+                    // Check for initializer
+                    const has_initializer = i < content.len and content[i] == '=';
+
+                    try props.append(allocator, .{
+                        .name = name,
+                        .type_repr = type_repr,
+                        .has_initializer = has_initializer,
+                    });
+
+                    // Skip to end of statement
+                    while (i < content.len and content[i] != ';' and content[i] != '\n') : (i += 1) {}
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+}
+
+fn extractSlots(allocator: std.mem.Allocator, ast: *const Ast, slots: *std.ArrayList(SlotInfo)) !void {
+    for (ast.elements.items) |elem| {
+        if (!std.mem.eql(u8, elem.tag_name, "slot")) continue;
+
+        var slot_name: []const u8 = "default";
+        var slot_props: std.ArrayList([]const u8) = .empty;
+
+        for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+            if (std.mem.eql(u8, attr.name, "name")) {
+                if (attr.value) |v| slot_name = v;
+            } else if (!std.mem.eql(u8, attr.name, "slot") and
+                !std.mem.startsWith(u8, attr.name, "on:") and
+                !std.mem.startsWith(u8, attr.name, "bind:"))
+            {
+                try slot_props.append(allocator, attr.name);
+            }
+        }
+
+        // Check if slot already exists, merge props
+        var found = false;
+        for (slots.items) |*existing| {
+            if (std.mem.eql(u8, existing.name, slot_name)) {
+                for (slot_props.items) |prop| {
+                    var has_prop = false;
+                    for (existing.props.items) |ep| {
+                        if (std.mem.eql(u8, ep, prop)) {
+                            has_prop = true;
+                            break;
+                        }
+                    }
+                    if (!has_prop) {
+                        try existing.props.append(allocator, prop);
+                    }
+                }
+                slot_props.deinit(allocator);
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            try slots.append(allocator, .{
+                .name = slot_name,
+                .props = slot_props,
+            });
+        }
+    }
+}
+
+fn skipString(content: []const u8, start: usize) usize {
+    if (start >= content.len) return start;
+    const quote = content[start];
+    var i = start + 1;
+    while (i < content.len) {
+        if (content[i] == '\\' and i + 1 < content.len) {
+            i += 2;
+            continue;
+        }
+        if (content[i] == quote) {
+            return i + 1;
+        }
+        i += 1;
+    }
+    return i;
+}
+
+fn skipWhitespace(content: []const u8, start: usize) usize {
+    var i = start;
+    while (i < content.len and std.ascii.isWhitespace(content[i])) : (i += 1) {}
+    return i;
+}
+
+fn skipTypeAnnotation(content: []const u8, start: usize) usize {
+    var i = start;
+    var depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        if (c == '<' or c == '(' or c == '[' or c == '{') depth += 1;
+        if ((c == '>' or c == ')' or c == ']' or c == '}') and depth > 0) depth -= 1;
+
+        // Stop at = or ; or newline when at depth 0
+        if (depth == 0 and (c == '=' or c == ';' or c == '\n')) {
+            break;
+        }
+
+        i += 1;
+    }
+
+    return i;
+}
+
+fn startsWithKeyword(text: []const u8, keyword: []const u8) bool {
+    if (text.len < keyword.len) return false;
+    if (!std.mem.startsWith(u8, text, keyword)) return false;
+    if (text.len > keyword.len and isIdentChar(text[keyword.len])) return false;
+    return true;
+}
+
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
+}
+
+fn isIdentChar(c: u8) bool {
+    return isIdentStart(c) or (c >= '0' and c <= '9');
 }
 
 test "transform simple script" {
@@ -78,4 +415,121 @@ test "transform simple script" {
 
     try std.testing.expect(virtual.content.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let count = 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "SvelteComponentTyped") != null);
+}
+
+test "transform with export let" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  export let name: string;
+        \\  export let count: number = 0;
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "name: string") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "count?: number") != null);
+}
+
+test "transform module script" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script context="module">
+        \\  export const VERSION = "1.0";
+        \\</script>
+        \\<script>
+        \\  let count = 0;
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "// <script context=\"module\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "VERSION") != null);
+}
+
+test "extract export lets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const content =
+        \\  export let name: string;
+        \\  export let count: number = 0;
+        \\  export let items: string[] = [];
+        \\  let internal = 5;
+    ;
+
+    var props: std.ArrayList(PropInfo) = .empty;
+    try extractExportLets(allocator, content, &props);
+
+    try std.testing.expectEqual(@as(usize, 3), props.items.len);
+
+    try std.testing.expectEqualStrings("name", props.items[0].name);
+    try std.testing.expectEqualStrings("string", props.items[0].type_repr.?);
+    try std.testing.expect(!props.items[0].has_initializer);
+
+    try std.testing.expectEqualStrings("count", props.items[1].name);
+    try std.testing.expectEqualStrings("number", props.items[1].type_repr.?);
+    try std.testing.expect(props.items[1].has_initializer);
+
+    try std.testing.expectEqualStrings("items", props.items[2].name);
+    try std.testing.expectEqualStrings("string[]", props.items[2].type_repr.?);
+    try std.testing.expect(props.items[2].has_initializer);
+}
+
+test "transform typescript component" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  import Button from './Button.svelte';
+        \\  
+        \\  export let name: string;
+        \\  export let count: number = 0;
+        \\  
+        \\  let badType: number = "not a number";
+        \\</script>
+        \\
+        \\<main>
+        \\  <h1>Hello {name}!</h1>
+        \\  <Button />
+        \\  <slot />
+        \\</main>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "App.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify key parts of the generated TypeScript
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { SvelteComponentTyped }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Props") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "name: string") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "count?: number") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Slots") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "default: {}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "extends SvelteComponentTyped<$$Props, $$Events, $$Slots>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "badType: number = \"not a number\"") != null);
 }

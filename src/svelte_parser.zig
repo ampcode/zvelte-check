@@ -177,6 +177,11 @@ pub const Parser = struct {
 
     fn parseScript(self: *Parser, ast: *Ast) !u32 {
         const start = self.current.start;
+        const tag_end = self.current.end;
+
+        // Extract lang and context from <script ...> tag
+        const attrs = parseScriptTagAttrs(self.source[start..tag_end]);
+
         self.advance(); // consume script_start
 
         var content_start: u32 = self.current.start;
@@ -197,8 +202,8 @@ pub const Parser = struct {
         try ast.scripts.append(self.allocator, .{
             .content_start = content_start,
             .content_end = content_end,
-            .lang = null, // TODO: parse from attributes
-            .context = null,
+            .lang = attrs.lang,
+            .context = attrs.context,
         });
 
         const node_idx: u32 = @intCast(ast.nodes.items.len);
@@ -414,6 +419,61 @@ pub const Parser = struct {
     }
 };
 
+const ScriptTagAttrs = struct {
+    lang: ?[]const u8,
+    context: ?[]const u8,
+};
+
+fn parseScriptTagAttrs(tag: []const u8) ScriptTagAttrs {
+    var i: usize = 0;
+    var lang: ?[]const u8 = null;
+    var context: ?[]const u8 = null;
+
+    // Skip "<script"
+    while (i < tag.len and tag[i] != '>' and !std.ascii.isWhitespace(tag[i])) : (i += 1) {}
+
+    while (i < tag.len and tag[i] != '>') {
+        // Skip whitespace
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) : (i += 1) {}
+        if (i >= tag.len or tag[i] == '>') break;
+
+        const name_start = i;
+        while (i < tag.len and tag[i] != '=' and !std.ascii.isWhitespace(tag[i]) and tag[i] != '>') : (i += 1) {}
+        const name = tag[name_start..i];
+
+        // Skip whitespace
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) : (i += 1) {}
+
+        var value: ?[]const u8 = null;
+        if (i < tag.len and tag[i] == '=') {
+            i += 1;
+            while (i < tag.len and std.ascii.isWhitespace(tag[i])) : (i += 1) {}
+
+            if (i < tag.len and (tag[i] == '"' or tag[i] == '\'')) {
+                const quote = tag[i];
+                i += 1;
+                const v_start = i;
+                while (i < tag.len and tag[i] != quote) : (i += 1) {}
+                const v_end = i;
+                if (i < tag.len and tag[i] == quote) i += 1;
+                value = tag[v_start..v_end];
+            } else {
+                const v_start = i;
+                while (i < tag.len and !std.ascii.isWhitespace(tag[i]) and tag[i] != '>') : (i += 1) {}
+                value = tag[v_start..i];
+            }
+        }
+
+        if (std.mem.eql(u8, name, "lang")) {
+            lang = value;
+        } else if (std.mem.eql(u8, name, "context")) {
+            context = value;
+        }
+    }
+
+    return .{ .lang = lang, .context = context };
+}
+
 test "parse simple svelte" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -432,4 +492,76 @@ test "parse simple svelte" {
 
     try std.testing.expect(ast.nodes.items.len > 0);
     try std.testing.expect(ast.scripts.items.len == 1);
+}
+
+test "parse script tag attributes" {
+    // Test basic script tag
+    {
+        const attrs = parseScriptTagAttrs("<script>");
+        try std.testing.expect(attrs.lang == null);
+        try std.testing.expect(attrs.context == null);
+    }
+    // Test lang="ts"
+    {
+        const attrs = parseScriptTagAttrs("<script lang=\"ts\">");
+        try std.testing.expectEqualStrings("ts", attrs.lang.?);
+        try std.testing.expect(attrs.context == null);
+    }
+    // Test both attributes
+    {
+        const attrs = parseScriptTagAttrs("<script lang=\"ts\" context=\"module\">");
+        try std.testing.expectEqualStrings("ts", attrs.lang.?);
+        try std.testing.expectEqualStrings("module", attrs.context.?);
+    }
+    // Test context="module" only
+    {
+        const attrs = parseScriptTagAttrs("<script context=\"module\">");
+        try std.testing.expect(attrs.lang == null);
+        try std.testing.expectEqualStrings("module", attrs.context.?);
+    }
+    // Test single quotes
+    {
+        const attrs = parseScriptTagAttrs("<script lang='ts'>");
+        try std.testing.expectEqualStrings("ts", attrs.lang.?);
+    }
+}
+
+test "parse typescript script" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let count: number = 0;
+        \\</script>
+    ;
+
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    try std.testing.expectEqual(@as(usize, 1), ast.scripts.items.len);
+    try std.testing.expectEqualStrings("ts", ast.scripts.items[0].lang.?);
+}
+
+test "parse module script" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script context="module">
+        \\  export const VERSION = "1.0";
+        \\</script>
+        \\<script>
+        \\  let count = 0;
+        \\</script>
+    ;
+
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    try std.testing.expectEqual(@as(usize, 2), ast.scripts.items.len);
+    try std.testing.expectEqualStrings("module", ast.scripts.items[0].context.?);
+    try std.testing.expect(ast.scripts.items[1].context == null);
 }
