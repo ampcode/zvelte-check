@@ -10,6 +10,8 @@ const Lexer = @import("svelte_lexer.zig").Lexer;
 const Token = @import("svelte_lexer.zig").Token;
 const TokenKind = @import("svelte_lexer.zig").TokenKind;
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
+const a11y = @import("diagnostics/a11y.zig");
+const css = @import("diagnostics/css.zig");
 
 pub const NodeKind = enum(u8) {
     root,
@@ -59,10 +61,19 @@ pub const StyleData = struct {
     lang: ?[]const u8, // "scss", "less", etc.
 };
 
+pub const AttributeData = struct {
+    name: []const u8,
+    value: ?[]const u8, // null for valueless attributes like "disabled"
+    start: u32,
+    end: u32,
+};
+
 pub const ElementData = struct {
     tag_name: []const u8,
     is_self_closing: bool,
     is_component: bool, // PascalCase or svelte:*
+    attrs_start: u32, // index into attributes array
+    attrs_end: u32, // exclusive end index
 };
 
 pub const Ast = struct {
@@ -74,6 +85,7 @@ pub const Ast = struct {
     scripts: std.ArrayList(ScriptData),
     styles: std.ArrayList(StyleData),
     elements: std.ArrayList(ElementData),
+    attributes: std.ArrayList(AttributeData),
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8, file_path: []const u8) Ast {
         return .{
@@ -84,16 +96,15 @@ pub const Ast = struct {
             .scripts = .empty,
             .styles = .empty,
             .elements = .empty,
+            .attributes = .empty,
         };
     }
 
     // No deinit needed - arena handles cleanup
 
     pub fn runDiagnostics(self: *const Ast, allocator: std.mem.Allocator, diagnostics: *std.ArrayList(Diagnostic)) !void {
-        // TODO: implement a11y and CSS diagnostics
-        _ = self;
-        _ = allocator;
-        _ = diagnostics;
+        try a11y.runDiagnostics(allocator, self, diagnostics);
+        try css.runDiagnostics(allocator, self, diagnostics);
     }
 };
 
@@ -267,13 +278,67 @@ pub const Parser = struct {
         const is_component = tag_name.len > 0 and tag_name[0] >= 'A' and tag_name[0] <= 'Z';
         self.advance();
 
-        // Skip attributes for now
+        // Parse attributes
+        const attrs_start: u32 = @intCast(ast.attributes.items.len);
         while (self.current.kind != .gt and
             self.current.kind != .slash_gt and
             self.current.kind != .eof)
         {
-            self.advance();
+            if (self.current.kind == .identifier) {
+                const attr_start = self.current.start;
+                var attr_name_end = self.current.end;
+                self.advance();
+
+                // Handle Svelte directives (class:, on:, bind:, use:, etc.)
+                // These have the form name:modifier or name:modifier|options
+                if (self.current.kind == .colon and self.peek().kind == .identifier) {
+                    self.advance(); // consume :
+                    attr_name_end = self.current.end;
+                    self.advance(); // consume modifier name
+                }
+
+                const attr_name = self.source[attr_start..attr_name_end];
+
+                var attr_value: ?[]const u8 = null;
+                if (self.current.kind == .eq) {
+                    self.advance(); // consume =
+                    if (self.current.kind == .string_double or self.current.kind == .string_single) {
+                        // Extract value without quotes
+                        const raw = self.current.slice(self.source);
+                        if (raw.len >= 2) {
+                            attr_value = raw[1 .. raw.len - 1];
+                        }
+                        self.advance();
+                    } else if (self.current.kind == .lbrace) {
+                        // Expression value {expr} - store as expression marker
+                        const expr_start = self.current.start;
+                        var depth: u32 = 0;
+                        while (self.current.kind != .eof) {
+                            if (self.current.kind == .lbrace) depth += 1;
+                            if (self.current.kind == .rbrace) {
+                                depth -= 1;
+                                if (depth == 0) {
+                                    self.advance();
+                                    break;
+                                }
+                            }
+                            self.advance();
+                        }
+                        attr_value = self.source[expr_start..self.current.start];
+                    }
+                }
+
+                try ast.attributes.append(self.allocator, .{
+                    .name = attr_name,
+                    .value = attr_value,
+                    .start = attr_start,
+                    .end = self.current.start,
+                });
+            } else {
+                self.advance();
+            }
         }
+        const attrs_end: u32 = @intCast(ast.attributes.items.len);
 
         const is_self_closing = self.current.kind == .slash_gt;
         self.advance(); // consume > or />
@@ -283,6 +348,8 @@ pub const Parser = struct {
             .tag_name = tag_name,
             .is_self_closing = is_self_closing,
             .is_component = is_component,
+            .attrs_start = attrs_start,
+            .attrs_end = attrs_end,
         });
 
         const node_idx: u32 = @intCast(ast.nodes.items.len);
@@ -328,6 +395,22 @@ pub const Parser = struct {
 
     fn advance(self: *Parser) void {
         self.current = self.lexer.next();
+    }
+
+    fn peek(self: *Parser) Token {
+        // Save lexer state
+        const saved_pos = self.lexer.pos;
+        const saved_in_script = self.lexer.in_script;
+        const saved_in_style = self.lexer.in_style;
+
+        const next_token = self.lexer.next();
+
+        // Restore lexer state
+        self.lexer.pos = saved_pos;
+        self.lexer.in_script = saved_in_script;
+        self.lexer.in_style = saved_in_style;
+
+        return next_token;
     }
 };
 
