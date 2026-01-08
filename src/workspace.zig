@@ -35,9 +35,6 @@ fn walkDir(
     while (try iter.next()) |entry| {
         if (shouldIgnore(entry.name, ignore_patterns)) continue;
 
-        const full_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
-        errdefer allocator.free(full_path);
-
         switch (entry.kind) {
             .directory => {
                 if (std.mem.eql(u8, entry.name, "node_modules")) continue;
@@ -48,17 +45,19 @@ fn walkDir(
 
                 var sub_dir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
                 defer sub_dir.close();
+
+                const full_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
+                errdefer allocator.free(full_path);
                 try walkDir(allocator, sub_dir, full_path, ignore_patterns, files);
                 allocator.free(full_path);
             },
             .file => {
                 if (std.mem.endsWith(u8, entry.name, ".svelte")) {
+                    const full_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
                     try files.append(allocator, full_path);
-                } else {
-                    allocator.free(full_path);
                 }
             },
-            else => allocator.free(full_path),
+            else => {},
         }
     }
 }
