@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "paths": {
+      "$lib": ["../src/lib"],
+      "$lib/*": ["../src/lib/*"]
+    },
+    "rootDirs": ["..", "./types"]
+  },
+  "include": [
+    "../src/**/*.js",
+    "../src/**/*.ts",
+    "../src/**/*.svelte",
+    "./types/**/$types.d.ts"
+  ],
+  "exclude": ["../node_modules/**"]
+}
