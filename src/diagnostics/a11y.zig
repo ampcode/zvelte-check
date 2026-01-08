@@ -18,6 +18,7 @@ const Node = @import("../svelte_parser.zig").Node;
 const NodeKind = @import("../svelte_parser.zig").NodeKind;
 const ElementData = @import("../svelte_parser.zig").ElementData;
 const AttributeData = @import("../svelte_parser.zig").AttributeData;
+const CommentData = @import("../svelte_parser.zig").CommentData;
 const Diagnostic = @import("../diagnostic.zig").Diagnostic;
 const Severity = @import("../diagnostic.zig").Severity;
 const Source = @import("../diagnostic.zig").Source;
@@ -33,13 +34,32 @@ pub fn runDiagnostics(
 ) !void {
     var heading_tracker: HeadingTracker = .{};
 
+    // Track preceding comment node to check for svelte-ignore
+    var prev_comment: ?CommentData = null;
+
     for (ast.nodes.items) |node| {
-        if (node.kind != .element and node.kind != .component) continue;
+        if (node.kind == .comment) {
+            prev_comment = ast.comments.items[node.data];
+            continue;
+        }
+
+        if (node.kind != .element and node.kind != .component) {
+            prev_comment = null;
+            continue;
+        }
 
         const elem = ast.elements.items[node.data];
         const attrs = ast.attributes.items[elem.attrs_start..elem.attrs_end];
 
-        try checkElement(allocator, ast, node, elem, attrs, diagnostics, &heading_tracker);
+        // Get ignore codes from preceding comment (if any)
+        const ignore_codes = if (prev_comment) |comment|
+            ast.ignore_codes.items[comment.ignore_codes_start..comment.ignore_codes_end]
+        else
+            &[_][]const u8{};
+
+        try checkElement(allocator, ast, node, elem, attrs, diagnostics, &heading_tracker, ignore_codes);
+
+        prev_comment = null;
     }
 }
 
@@ -51,12 +71,13 @@ fn checkElement(
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
     heading_tracker: *HeadingTracker,
+    ignore_codes: []const []const u8,
 ) !void {
     const tag = elem.tag_name;
 
     // Distracting elements: marquee and blink
     if (std.mem.eql(u8, tag, "marquee") or std.mem.eql(u8, tag, "blink")) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
             .code = "a11y-distracting-elements",
             .message = try std.fmt.allocPrint(
@@ -69,38 +90,38 @@ fn checkElement(
 
     // img: must have alt attribute
     if (std.mem.eql(u8, tag, "img")) {
-        try checkImgAlt(allocator, ast, node, attrs, diagnostics);
-        try checkImgRedundantAlt(allocator, ast, node, attrs, diagnostics);
+        try checkImgAlt(allocator, ast, node, attrs, diagnostics, ignore_codes);
+        try checkImgRedundantAlt(allocator, ast, node, attrs, diagnostics, ignore_codes);
     }
 
     // a: should have href, and content for accessible name
     if (std.mem.eql(u8, tag, "a")) {
-        try checkAnchor(allocator, ast, node, attrs, diagnostics);
+        try checkAnchor(allocator, ast, node, attrs, diagnostics, ignore_codes);
     }
 
     // button: should have accessible name
     if (std.mem.eql(u8, tag, "button")) {
-        try checkButton(allocator, ast, node, attrs, diagnostics);
+        try checkButton(allocator, ast, node, attrs, diagnostics, ignore_codes);
     }
 
     // input: check for labels
     if (std.mem.eql(u8, tag, "input")) {
-        try checkInput(allocator, ast, node, attrs, diagnostics);
+        try checkInput(allocator, ast, node, attrs, diagnostics, ignore_codes);
     }
 
     // video/audio: check for captions
     if (std.mem.eql(u8, tag, "video") or std.mem.eql(u8, tag, "audio")) {
-        try checkMediaCaptions(allocator, ast, node, elem, attrs, diagnostics);
+        try checkMediaCaptions(allocator, ast, node, elem, attrs, diagnostics, ignore_codes);
     }
 
     // Heading structure
     if (isHeading(tag)) {
-        try checkHeadingOrder(allocator, ast, node, tag, diagnostics, heading_tracker);
+        try checkHeadingOrder(allocator, ast, node, tag, diagnostics, heading_tracker, ignore_codes);
     }
 
     // Check for autofocus attribute
     if (hasAttr(attrs, "autofocus")) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
             .code = "a11y-autofocus",
             .message = "Avoid using autofocus",
@@ -109,7 +130,7 @@ fn checkElement(
 
     // Check for accesskey attribute
     if (hasAttr(attrs, "accesskey")) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
             .code = "a11y-accesskey",
             .message = "Avoid using accesskey",
@@ -117,29 +138,29 @@ fn checkElement(
     }
 
     // Check for positive tabindex
-    try checkPositiveTabindex(allocator, ast, node, attrs, diagnostics);
+    try checkPositiveTabindex(allocator, ast, node, attrs, diagnostics, ignore_codes);
 
     // Check for redundant roles
-    try checkRedundantRoles(allocator, ast, node, tag, attrs, diagnostics);
+    try checkRedundantRoles(allocator, ast, node, tag, attrs, diagnostics, ignore_codes);
 
     // Check for required ARIA props based on role
-    try checkRoleRequiredProps(allocator, ast, node, attrs, diagnostics);
+    try checkRoleRequiredProps(allocator, ast, node, attrs, diagnostics, ignore_codes);
 
     // Check for event handler pairing
-    try checkClickKeyEvents(allocator, ast, node, tag, attrs, diagnostics);
-    try checkMouseKeyEvents(allocator, ast, node, attrs, diagnostics);
+    try checkClickKeyEvents(allocator, ast, node, tag, attrs, diagnostics, ignore_codes);
+    try checkMouseKeyEvents(allocator, ast, node, attrs, diagnostics, ignore_codes);
 
     // Check for non-interactive tabindex
-    try checkNoninteractiveTabindex(allocator, ast, node, tag, attrs, diagnostics);
+    try checkNoninteractiveTabindex(allocator, ast, node, tag, attrs, diagnostics, ignore_codes);
 
     // Check for static element interactions
-    try checkStaticElementInteractions(allocator, ast, node, tag, attrs, diagnostics);
+    try checkStaticElementInteractions(allocator, ast, node, tag, attrs, diagnostics, ignore_codes);
 
     // Check for interactive roles supporting focus
-    try checkInteractiveSupportsFocus(allocator, ast, node, tag, attrs, diagnostics);
+    try checkInteractiveSupportsFocus(allocator, ast, node, tag, attrs, diagnostics, ignore_codes);
 
     // Check all aria-* attributes for validity
-    try checkAriaAttributes(allocator, ast, node, attrs, diagnostics);
+    try checkAriaAttributes(allocator, ast, node, attrs, diagnostics, ignore_codes);
 }
 
 fn checkImgAlt(
@@ -148,13 +169,14 @@ fn checkImgAlt(
     node: Node,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     const has_alt = hasAttr(attrs, "alt");
     const has_role_presentation = hasAttrValue(attrs, "role", "presentation") or
         hasAttrValue(attrs, "role", "none");
 
     if (!has_alt and !has_role_presentation) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .@"error",
             .code = "a11y-missing-alt",
             .message = "<img> element must have an alt attribute",
@@ -168,6 +190,7 @@ fn checkImgRedundantAlt(
     node: Node,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     const alt = getAttrValue(attrs, "alt") orelse return;
     if (alt.len == 0) return;
@@ -178,7 +201,7 @@ fn checkImgRedundantAlt(
     const redundant_words = [_][]const u8{ "image", "photo", "picture" };
     for (redundant_words) |word| {
         if (std.mem.indexOf(u8, alt_lower, word) != null) {
-            try addDiagnostic(allocator, ast, node, diagnostics, .{
+            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
                 .code = "a11y-img-redundant-alt",
                 .message = "Alt text should not contain words like \"image\", \"photo\", or \"picture\"",
@@ -194,11 +217,12 @@ fn checkAnchor(
     node: Node,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     const has_href = hasAttr(attrs, "href");
 
     if (!has_href) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
             .code = "a11y-missing-href",
             .message = "<a> element should have an href attribute",
@@ -208,13 +232,13 @@ fn checkAnchor(
     // Check for empty href or javascript: href
     if (getAttrValue(attrs, "href")) |href| {
         if (href.len == 0) {
-            try addDiagnostic(allocator, ast, node, diagnostics, .{
+            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
                 .code = "a11y-invalid-href",
                 .message = "<a> element has empty href",
             });
         } else if (std.mem.startsWith(u8, href, "javascript:")) {
-            try addDiagnostic(allocator, ast, node, diagnostics, .{
+            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
                 .code = "a11y-invalid-href",
                 .message = "<a> element should not use javascript: URLs",
@@ -229,11 +253,13 @@ fn checkButton(
     node: Node,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     _ = allocator;
     _ = ast;
     _ = node;
     _ = diagnostics;
+    _ = ignore_codes;
 
     // Button accessible name comes from content, aria-label, or aria-labelledby
     // Since we don't parse children yet, we only check for aria-label/aria-labelledby
@@ -247,6 +273,7 @@ fn checkInput(
     node: Node,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     const input_type = getAttrValue(attrs, "type") orelse "text";
 
@@ -262,7 +289,7 @@ fn checkInput(
     // Note: We can't check for associated <label> elements without full DOM traversal
     // So we only warn if none of the inline labeling mechanisms are present
     if (!has_id and !has_aria_label and !has_aria_labelledby and !has_title) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
             .code = "a11y-missing-label",
             .message = "<input> element should have an associated label or aria-label",
@@ -277,6 +304,7 @@ fn checkMediaCaptions(
     elem: ElementData,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     // Muted videos don't need captions
     if (hasAttr(attrs, "muted")) return;
@@ -286,7 +314,7 @@ fn checkMediaCaptions(
     const has_captions = hasTrackWithCaptions(ast, node);
 
     if (!has_captions) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
             .code = "a11y-media-has-caption",
             .message = try std.fmt.allocPrint(
@@ -326,11 +354,12 @@ fn checkHeadingOrder(
     tag: []const u8,
     diagnostics: *std.ArrayList(Diagnostic),
     tracker: *HeadingTracker,
+    ignore_codes: []const []const u8,
 ) !void {
     const level = tag[1] - '0'; // h1 -> 1, h2 -> 2, etc.
 
     if (tracker.last_level > 0 and level > tracker.last_level + 1) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
             .code = "a11y-heading-order",
             .message = try std.fmt.allocPrint(
@@ -350,10 +379,11 @@ fn checkPositiveTabindex(
     node: Node,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     if (getAttrValue(attrs, "tabindex")) |tabindex| {
         if (tabindex.len > 0 and tabindex[0] != '-' and tabindex[0] != '0') {
-            try addDiagnostic(allocator, ast, node, diagnostics, .{
+            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
                 .code = "a11y-positive-tabindex",
                 .message = "Avoid positive tabindex values",
@@ -369,13 +399,14 @@ fn checkRedundantRoles(
     tag: []const u8,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     const role = getAttrValue(attrs, "role") orelse return;
     const implicit_role = getImplicitRole(tag, attrs);
 
     if (implicit_role) |ir| {
         if (std.mem.eql(u8, role, ir)) {
-            try addDiagnostic(allocator, ast, node, diagnostics, .{
+            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
                 .code = "a11y-no-redundant-roles",
                 .message = try std.fmt.allocPrint(
@@ -394,6 +425,7 @@ fn checkRoleRequiredProps(
     node: Node,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     const role = getAttrValue(attrs, "role") orelse return;
 
@@ -402,7 +434,7 @@ fn checkRoleRequiredProps(
 
     for (required_props) |prop| {
         if (!hasAttr(attrs, prop)) {
-            try addDiagnostic(allocator, ast, node, diagnostics, .{
+            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
                 .code = "a11y-role-has-required-aria-props",
                 .message = try std.fmt.allocPrint(
@@ -423,6 +455,7 @@ fn checkClickKeyEvents(
     tag: []const u8,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     // Native interactive elements don't need keyboard handlers
     if (isNativeInteractiveElement(tag)) return;
@@ -435,7 +468,7 @@ fn checkClickKeyEvents(
         hasEventHandler(attrs, "keypress");
 
     if (!has_keyboard) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
             .code = "a11y-click-events-have-key-events",
             .message = "Elements with on:click must have a keyboard event handler",
@@ -449,6 +482,7 @@ fn checkMouseKeyEvents(
     node: Node,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     const has_focus = hasEventHandler(attrs, "focus");
     const has_blur = hasEventHandler(attrs, "blur");
@@ -456,7 +490,7 @@ fn checkMouseKeyEvents(
     // mouseenter/mouseover should have focus
     if (hasEventHandler(attrs, "mouseenter") or hasEventHandler(attrs, "mouseover")) {
         if (!has_focus) {
-            try addDiagnostic(allocator, ast, node, diagnostics, .{
+            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
                 .code = "a11y-mouse-events-have-key-events",
                 .message = "on:mouseenter or on:mouseover must be accompanied by on:focus",
@@ -467,7 +501,7 @@ fn checkMouseKeyEvents(
     // mouseleave/mouseout should have blur
     if (hasEventHandler(attrs, "mouseleave") or hasEventHandler(attrs, "mouseout")) {
         if (!has_blur) {
-            try addDiagnostic(allocator, ast, node, diagnostics, .{
+            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
                 .code = "a11y-mouse-events-have-key-events",
                 .message = "on:mouseleave or on:mouseout must be accompanied by on:blur",
@@ -483,6 +517,7 @@ fn checkNoninteractiveTabindex(
     tag: []const u8,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     // Skip if element has an interactive role
     if (getAttrValue(attrs, "role")) |role| {
@@ -496,7 +531,7 @@ fn checkNoninteractiveTabindex(
     if (getAttrValue(attrs, "tabindex")) |tabindex| {
         if (tabindex.len > 0 and tabindex[0] != '-') {
             // tabindex="0" or positive
-            try addDiagnostic(allocator, ast, node, diagnostics, .{
+            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
                 .code = "a11y-no-noninteractive-tabindex",
                 .message = "Non-interactive elements should not have tabindex",
@@ -512,6 +547,7 @@ fn checkStaticElementInteractions(
     tag: []const u8,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     // Skip native interactive elements
     if (isNativeInteractiveElement(tag)) return;
@@ -521,7 +557,7 @@ fn checkStaticElementInteractions(
 
     // Check for click handler
     if (hasEventHandler(attrs, "click")) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
             .code = "a11y-no-static-element-interactions",
             .message = "Static elements with event handlers require a role",
@@ -536,6 +572,7 @@ fn checkInteractiveSupportsFocus(
     tag: []const u8,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     // Native interactive elements are focusable
     if (isNativeInteractiveElement(tag)) return;
@@ -546,7 +583,7 @@ fn checkInteractiveSupportsFocus(
 
     // Check for tabindex
     if (!hasAttr(attrs, "tabindex")) {
-        try addDiagnostic(allocator, ast, node, diagnostics, .{
+        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
             .code = "a11y-interactive-supports-focus",
             .message = try std.fmt.allocPrint(
@@ -564,6 +601,7 @@ fn checkAriaAttributes(
     node: Node,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
 ) !void {
     for (attrs) |attr| {
         if (!std.mem.startsWith(u8, attr.name, "aria-")) continue;
@@ -572,7 +610,7 @@ fn checkAriaAttributes(
 
         // Check if it's a valid aria attribute
         if (!isValidAriaAttribute(aria_name)) {
-            try addDiagnostic(allocator, ast, node, diagnostics, .{
+            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
                 .code = "a11y-unknown-aria",
                 .message = try std.fmt.allocPrint(
@@ -587,7 +625,7 @@ fn checkAriaAttributes(
         if (std.mem.eql(u8, aria_name, "hidden")) {
             if (attr.value != null and std.mem.eql(u8, attr.value.?, "true")) {
                 if (hasAttr(attrs, "tabindex") or hasAttr(attrs, "href")) {
-                    try addDiagnostic(allocator, ast, node, diagnostics, .{
+                    try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                         .severity = .warning,
                         .code = "a11y-hidden-focusable",
                         .message = "aria-hidden should not be used on focusable elements",
@@ -751,8 +789,14 @@ fn addDiagnostic(
     ast: *const Ast,
     node: Node,
     diagnostics: *std.ArrayList(Diagnostic),
+    ignore_codes: []const []const u8,
     info: DiagnosticInfo,
 ) !void {
+    // Check if this diagnostic code is suppressed by svelte-ignore
+    for (ignore_codes) |ignored| {
+        if (std.mem.eql(u8, ignored, info.code)) return;
+    }
+
     const loc = computeLineCol(ast.source, node.start);
 
     try diagnostics.append(allocator, .{
@@ -891,4 +935,78 @@ test "a11y: redundant roles" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "a11y: svelte-ignore suppresses diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<!-- svelte-ignore a11y-missing-alt -->\n<img src=\"test.png\">";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should have no a11y-missing-alt diagnostic due to svelte-ignore
+    var found_missing_alt = false;
+    for (diagnostics.items) |d| {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-missing-alt")) {
+            found_missing_alt = true;
+            break;
+        }
+    }
+    try std.testing.expect(!found_missing_alt);
+}
+
+test "a11y: svelte-ignore with multiple codes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<!-- svelte-ignore a11y-distracting-elements a11y-autofocus -->\n<marquee autofocus>Text</marquee>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Both diagnostics should be suppressed
+    var found_distracting = false;
+    var found_autofocus = false;
+    for (diagnostics.items) |d| {
+        if (d.code != null) {
+            if (std.mem.eql(u8, d.code.?, "a11y-distracting-elements")) found_distracting = true;
+            if (std.mem.eql(u8, d.code.?, "a11y-autofocus")) found_autofocus = true;
+        }
+    }
+    try std.testing.expect(!found_distracting);
+    try std.testing.expect(!found_autofocus);
+}
+
+test "a11y: regular comment does not suppress diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<!-- Just a regular comment -->\n<img src=\"test.png\">";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should have a11y-missing-alt since no svelte-ignore
+    var found_missing_alt = false;
+    for (diagnostics.items) |d| {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-missing-alt")) {
+            found_missing_alt = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_missing_alt);
 }

@@ -35,6 +35,7 @@ pub const NodeKind = enum(u8) {
     directive, // on:, bind:, class:, etc.
     slot,
     component, // PascalCase or svelte:component
+    comment, // HTML comment, stores index into comments array
 };
 
 pub const Node = struct {
@@ -76,6 +77,12 @@ pub const ElementData = struct {
     attrs_end: u32, // exclusive end index
 };
 
+pub const CommentData = struct {
+    content: []const u8, // The text inside <!-- ... -->
+    ignore_codes_start: u32, // Index into ignore_codes array
+    ignore_codes_end: u32, // Exclusive end index
+};
+
 pub const Ast = struct {
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -86,6 +93,8 @@ pub const Ast = struct {
     styles: std.ArrayList(StyleData),
     elements: std.ArrayList(ElementData),
     attributes: std.ArrayList(AttributeData),
+    comments: std.ArrayList(CommentData),
+    ignore_codes: std.ArrayList([]const u8), // Parsed svelte-ignore codes
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8, file_path: []const u8) Ast {
         return .{
@@ -97,6 +106,8 @@ pub const Ast = struct {
             .styles = .empty,
             .elements = .empty,
             .attributes = .empty,
+            .comments = .empty,
+            .ignore_codes = .empty,
         };
     }
 
@@ -168,6 +179,7 @@ pub const Parser = struct {
             .text => try self.parseText(ast),
             .lt => try self.parseElement(ast),
             .lbrace => try self.parseExpression(ast),
+            .comment => try self.parseComment(ast),
             else => {
                 self.advance();
                 return Node.NONE;
@@ -398,6 +410,44 @@ pub const Parser = struct {
         return node_idx;
     }
 
+    fn parseComment(self: *Parser, ast: *Ast) !u32 {
+        const start = self.current.start;
+        const end = self.current.end;
+
+        // Extract content between <!-- and -->
+        const token_slice = self.source[start..end];
+        var content: []const u8 = "";
+        if (token_slice.len >= 7) { // "<!--" + "-->"
+            content = std.mem.trim(u8, token_slice[4 .. token_slice.len - 3], " \t\n\r");
+        }
+
+        // Parse svelte-ignore codes if present
+        const ignore_codes_start: u32 = @intCast(ast.ignore_codes.items.len);
+        try parseSvelteIgnoreCodes(self.allocator, content, &ast.ignore_codes);
+        const ignore_codes_end: u32 = @intCast(ast.ignore_codes.items.len);
+
+        const data_idx: u32 = @intCast(ast.comments.items.len);
+        try ast.comments.append(self.allocator, .{
+            .content = content,
+            .ignore_codes_start = ignore_codes_start,
+            .ignore_codes_end = ignore_codes_end,
+        });
+
+        const node_idx: u32 = @intCast(ast.nodes.items.len);
+        try ast.nodes.append(self.allocator, .{
+            .kind = .comment,
+            .start = start,
+            .end = end,
+            .first_child = Node.NONE,
+            .next_sibling = Node.NONE,
+            .data = data_idx,
+        });
+
+        self.advance(); // consume comment token
+
+        return node_idx;
+    }
+
     fn advance(self: *Parser) void {
         self.current = self.lexer.next();
     }
@@ -423,6 +473,33 @@ const ScriptTagAttrs = struct {
     lang: ?[]const u8,
     context: ?[]const u8,
 };
+
+/// Parse svelte-ignore codes from a comment's content.
+/// Format: "svelte-ignore code1 code2 code3"
+fn parseSvelteIgnoreCodes(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    codes: *std.ArrayList([]const u8),
+) !void {
+    const prefix = "svelte-ignore";
+
+    // Check if content starts with "svelte-ignore"
+    const trimmed = std.mem.trimLeft(u8, content, " \t");
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return;
+
+    // Skip the prefix and parse codes
+    const rest = trimmed[prefix.len..];
+    if (rest.len == 0) return;
+
+    // Must be followed by whitespace
+    if (!std.ascii.isWhitespace(rest[0])) return;
+
+    // Parse space-separated codes
+    var iter = std.mem.tokenizeAny(u8, rest, " \t\n\r");
+    while (iter.next()) |code| {
+        try codes.append(allocator, code);
+    }
+}
 
 fn parseScriptTagAttrs(tag: []const u8) ScriptTagAttrs {
     var i: usize = 0;
@@ -564,4 +641,48 @@ test "parse module script" {
     try std.testing.expectEqual(@as(usize, 2), ast.scripts.items.len);
     try std.testing.expectEqualStrings("module", ast.scripts.items[0].context.?);
     try std.testing.expect(ast.scripts.items[1].context == null);
+}
+
+test "parse svelte-ignore comment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<!-- svelte-ignore a11y-missing-alt a11y-autofocus -->\n<img src=\"test.png\">";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    // Should have parsed the comment
+    try std.testing.expectEqual(@as(usize, 1), ast.comments.items.len);
+
+    // Should have extracted the ignore codes
+    try std.testing.expectEqual(@as(usize, 2), ast.ignore_codes.items.len);
+    try std.testing.expectEqualStrings("a11y-missing-alt", ast.ignore_codes.items[0]);
+    try std.testing.expectEqualStrings("a11y-autofocus", ast.ignore_codes.items[1]);
+
+    // Comment data should reference the correct range in ignore_codes
+    const comment = ast.comments.items[0];
+    try std.testing.expectEqual(@as(u32, 0), comment.ignore_codes_start);
+    try std.testing.expectEqual(@as(u32, 2), comment.ignore_codes_end);
+}
+
+test "parse regular comment without svelte-ignore" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<!-- Just a regular comment -->\n<div>Hello</div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    // Should have parsed the comment
+    try std.testing.expectEqual(@as(usize, 1), ast.comments.items.len);
+
+    // Should have no ignore codes
+    try std.testing.expectEqual(@as(usize, 0), ast.ignore_codes.items.len);
+
+    // Comment data should have empty ignore_codes range
+    const comment = ast.comments.items[0];
+    try std.testing.expectEqual(@as(u32, 0), comment.ignore_codes_start);
+    try std.testing.expectEqual(@as(u32, 0), comment.ignore_codes_end);
 }

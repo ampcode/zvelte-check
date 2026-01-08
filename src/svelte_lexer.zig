@@ -91,13 +91,21 @@ pub const Lexer = struct {
         if (self.in_script) return self.lexScriptContent();
         if (self.in_style) return self.lexStyleContent();
 
-        self.skipWhitespaceAndComments();
+        self.skipWhitespace();
 
         if (self.pos >= self.source.len) {
             return .{ .kind = .eof, .start = self.pos, .end = self.pos };
         }
 
         const start = self.pos;
+
+        // Check for HTML comment
+        if (self.pos + 3 < self.source.len and
+            std.mem.eql(u8, self.source[self.pos .. self.pos + 4], "<!--"))
+        {
+            return self.lexComment(start);
+        }
+
         const c = self.current();
 
         return switch (c) {
@@ -246,26 +254,27 @@ pub const Lexer = struct {
         return .{ .kind = .text, .start = start, .end = self.pos };
     }
 
-    fn skipWhitespaceAndComments(self: *Lexer) void {
+    fn skipWhitespace(self: *Lexer) void {
         while (self.pos < self.source.len) {
             const c = self.current();
             if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
                 self.advance();
-            } else if (self.pos + 3 < self.source.len and
-                std.mem.eql(u8, self.source[self.pos .. self.pos + 4], "<!--"))
-            {
-                self.pos += 4;
-                while (self.pos + 2 < self.source.len) {
-                    if (std.mem.eql(u8, self.source[self.pos .. self.pos + 3], "-->")) {
-                        self.pos += 3;
-                        break;
-                    }
-                    self.advance();
-                }
             } else {
                 break;
             }
         }
+    }
+
+    fn lexComment(self: *Lexer, start: u32) Token {
+        self.pos += 4; // skip <!--
+        while (self.pos + 2 < self.source.len) {
+            if (std.mem.eql(u8, self.source[self.pos .. self.pos + 3], "-->")) {
+                self.pos += 3;
+                break;
+            }
+            self.advance();
+        }
+        return .{ .kind = .comment, .start = start, .end = self.pos };
     }
 
     fn single(self: *Lexer, kind: TokenKind, start: u32) Token {
