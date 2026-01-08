@@ -4,12 +4,15 @@
 //! Also builds source maps for error position mapping.
 //!
 //! Transformation strategy:
-//! 1. Add Svelte type imports
-//! 2. Add Svelte 5 rune type declarations ($state, $derived, $effect, $props)
+//! 1. Add Svelte type imports (including Snippet for Svelte 5)
+//! 2. Add Svelte 5 rune type declarations ($state, $derived, $effect, $props, etc.)
 //! 3. Emit module script content (context="module")
 //! 4. Emit instance script content
-//! 5. Extract `export let` declarations to generate $$Props interface
-//! 6. Extract <slot> elements to generate $$Slots interface
+//! 5. Extract props from either:
+//!    - `export let` declarations (Svelte 4 style)
+//!    - `$props()` destructuring (Svelte 5 style)
+//!    - Interface types referenced in $props<T>()
+//! 6. Extract <slot> elements and snippet props to generate $$Slots interface
 //! 7. Generate component class extending SvelteComponentTyped
 
 const std = @import("std");
@@ -29,11 +32,17 @@ const PropInfo = struct {
     name: []const u8,
     type_repr: ?[]const u8,
     has_initializer: bool,
+    is_bindable: bool,
 };
 
 const SlotInfo = struct {
     name: []const u8,
     props: std.ArrayList([]const u8),
+};
+
+const SnippetInfo = struct {
+    name: []const u8,
+    params: ?[]const u8,
 };
 
 pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
@@ -47,17 +56,31 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     try output.appendSlice(allocator, ast.file_path);
     try output.appendSlice(allocator, "\n\n");
 
-    // Svelte type imports
-    try output.appendSlice(allocator, "import type { SvelteComponentTyped } from \"svelte\";\n\n");
+    // Svelte type imports (including Snippet for Svelte 5)
+    try output.appendSlice(allocator, "import type { SvelteComponentTyped, Snippet } from \"svelte\";\n\n");
 
     // Svelte 5 rune type declarations
     try output.appendSlice(allocator,
         \\// Svelte 5 rune type stubs
         \\declare function $state<T>(initial: T): T;
-        \\declare function $derived<T>(value: T | (() => T)): T;
-        \\declare function $effect(callback: () => void | (() => void)): void;
+        \\declare namespace $state {
+        \\  function raw<T>(initial: T): T;
+        \\  function snapshot<T>(state: T): T;
+        \\}
+        \\declare function $derived<T>(expr: T): T;
+        \\declare namespace $derived {
+        \\  function by<T>(fn: () => T): T;
+        \\}
+        \\declare function $effect(fn: () => void | (() => void)): void;
+        \\declare namespace $effect {
+        \\  function pre(fn: () => void | (() => void)): void;
+        \\  function tracking(): boolean;
+        \\  function root(fn: () => void | (() => void)): () => void;
+        \\}
         \\declare function $props<T = $$Props>(): T;
         \\declare function $bindable<T>(initial?: T): T;
+        \\declare function $inspect<T>(...values: T[]): { with: (fn: (type: 'init' | 'update', ...values: T[]) => void) => void };
+        \\declare function $host<T extends HTMLElement>(): T;
         \\
         \\
     );
@@ -112,9 +135,19 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     var props: std.ArrayList(PropInfo) = .empty;
     defer props.deinit(allocator);
 
+    // Track if we found a Props interface to use directly
+    var props_interface_name: ?[]const u8 = null;
+
     if (instance_script) |script| {
         const content = ast.source[script.content_start..script.content_end];
-        try extractExportLets(allocator, content, &props);
+
+        // Try Svelte 5 $props() first
+        if (try extractPropsRune(allocator, content, &props)) |interface_name| {
+            props_interface_name = interface_name;
+        } else {
+            // Fall back to Svelte 4 export let
+            try extractExportLets(allocator, content, &props);
+        }
     }
 
     // Extract slots from AST
@@ -128,22 +161,30 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     try extractSlots(allocator, &ast, &slots);
 
     // Generate $$Props interface
-    try output.appendSlice(allocator, "// Component typing\nexport interface $$Props {\n");
-    for (props.items) |prop| {
-        try output.appendSlice(allocator, "  ");
-        try output.appendSlice(allocator, prop.name);
-        if (prop.has_initializer) {
-            try output.appendSlice(allocator, "?");
+    try output.appendSlice(allocator, "// Component typing\n");
+    if (props_interface_name) |iface| {
+        // Use the existing interface directly
+        try output.appendSlice(allocator, "export type $$Props = ");
+        try output.appendSlice(allocator, iface);
+        try output.appendSlice(allocator, ";\n\n");
+    } else {
+        try output.appendSlice(allocator, "export interface $$Props {\n");
+        for (props.items) |prop| {
+            try output.appendSlice(allocator, "  ");
+            try output.appendSlice(allocator, prop.name);
+            if (prop.has_initializer) {
+                try output.appendSlice(allocator, "?");
+            }
+            try output.appendSlice(allocator, ": ");
+            if (prop.type_repr) |t| {
+                try output.appendSlice(allocator, t);
+            } else {
+                try output.appendSlice(allocator, "any");
+            }
+            try output.appendSlice(allocator, ";\n");
         }
-        try output.appendSlice(allocator, ": ");
-        if (prop.type_repr) |t| {
-            try output.appendSlice(allocator, t);
-        } else {
-            try output.appendSlice(allocator, "any");
-        }
-        try output.appendSlice(allocator, ";\n");
+        try output.appendSlice(allocator, "}\n\n");
     }
-    try output.appendSlice(allocator, "}\n\n");
 
     // Generate $$Slots interface
     try output.appendSlice(allocator, "export interface $$Slots {\n");
@@ -275,6 +316,7 @@ fn extractExportLets(allocator: std.mem.Allocator, content: []const u8, props: *
                         .name = name,
                         .type_repr = type_repr,
                         .has_initializer = has_initializer,
+                        .is_bindable = false,
                     });
 
                     // Skip to end of statement
@@ -286,6 +328,198 @@ fn extractExportLets(allocator: std.mem.Allocator, content: []const u8, props: *
 
         i += 1;
     }
+}
+
+/// Extracts props from Svelte 5 $props() destructuring pattern.
+/// Returns the interface name if $props<InterfaceName>() is used, otherwise null.
+/// Patterns supported:
+/// - `let { foo, bar } = $props()`
+/// - `let { foo, bar }: Props = $props()`
+/// - `let { foo = "default", bar }: Props = $props()`
+/// - `let { foo = $bindable() } = $props()`
+/// - `let props = $props<MyProps>()`
+fn extractPropsRune(allocator: std.mem.Allocator, content: []const u8, props: *std.ArrayList(PropInfo)) !?[]const u8 {
+    // Look for $props() call
+    const props_call = std.mem.indexOf(u8, content, "$props") orelse return null;
+
+    // Check for generic parameter: $props<InterfaceName>()
+    var i = props_call + 6; // Skip "$props"
+    i = skipWhitespace(content, i);
+
+    var generic_type: ?[]const u8 = null;
+    if (i < content.len and content[i] == '<') {
+        i += 1;
+        const generic_start = i;
+        var depth: u32 = 1;
+        while (i < content.len and depth > 0) {
+            if (content[i] == '<') depth += 1;
+            if (content[i] == '>') depth -= 1;
+            if (depth > 0) i += 1;
+        }
+        generic_type = std.mem.trim(u8, content[generic_start..i], " \t\n\r");
+        if (generic_type.?.len == 0) generic_type = null;
+    }
+
+    // If we have a generic type, return it as the interface name
+    if (generic_type) |gt| {
+        return gt;
+    }
+
+    // Otherwise, look for destructuring pattern before $props
+    // Find the start of the let statement
+    var let_pos: ?usize = null;
+    var search_pos: usize = props_call;
+    while (search_pos > 0) {
+        search_pos -= 1;
+        if (search_pos + 3 <= content.len and startsWithKeyword(content[search_pos..], "let")) {
+            let_pos = search_pos;
+            break;
+        }
+        if (content[search_pos] == '\n' or content[search_pos] == ';') break;
+    }
+
+    if (let_pos == null) return null;
+
+    // Parse from 'let' to '$props'
+    i = let_pos.? + 3;
+    i = skipWhitespace(content, i);
+
+    // Check for destructuring pattern
+    if (i >= content.len or content[i] != '{') {
+        // Not a destructuring pattern (e.g., `let props = $props<T>()`)
+        return null;
+    }
+
+    // Parse destructured props: { foo, bar = "default", baz: renamed }
+    i += 1; // Skip '{'
+    while (i < content.len and content[i] != '}') {
+        i = skipWhitespace(content, i);
+        if (i >= content.len or content[i] == '}') break;
+
+        // Parse prop name
+        const name_start = i;
+        while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+        const name = content[name_start..i];
+
+        if (name.len == 0) {
+            i += 1;
+            continue;
+        }
+
+        i = skipWhitespace(content, i);
+
+        // Check for renaming (prop: localName)
+        if (i < content.len and content[i] == ':') {
+            i += 1;
+            i = skipWhitespace(content, i);
+            // Skip the local name
+            while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+            i = skipWhitespace(content, i);
+        }
+
+        // Check for default value
+        var has_initializer = false;
+        var is_bindable = false;
+        if (i < content.len and content[i] == '=') {
+            has_initializer = true;
+            i += 1;
+            i = skipWhitespace(content, i);
+
+            // Check if default is $bindable()
+            if (i + 9 <= content.len and std.mem.startsWith(u8, content[i..], "$bindable")) {
+                is_bindable = true;
+                i += 9;
+                i = skipWhitespace(content, i);
+                // Skip the $bindable(...) call
+                if (i < content.len and content[i] == '(') {
+                    var paren_depth: u32 = 1;
+                    i += 1;
+                    while (i < content.len and paren_depth > 0) {
+                        if (content[i] == '(') paren_depth += 1;
+                        if (content[i] == ')') paren_depth -= 1;
+                        i += 1;
+                    }
+                }
+            } else {
+                // Skip the default value expression
+                i = skipExpression(content, i);
+            }
+        }
+
+        try props.append(allocator, .{
+            .name = name,
+            .type_repr = null, // Type comes from the interface
+            .has_initializer = has_initializer,
+            .is_bindable = is_bindable,
+        });
+
+        i = skipWhitespace(content, i);
+        if (i < content.len and content[i] == ',') {
+            i += 1;
+        }
+    }
+
+    // Check for type annotation after destructuring: { ... }: Props
+    if (i < content.len and content[i] == '}') {
+        i += 1;
+        i = skipWhitespace(content, i);
+        if (i < content.len and content[i] == ':') {
+            i += 1;
+            i = skipWhitespace(content, i);
+            const type_start = i;
+            while (i < content.len and (isIdentChar(content[i]) or content[i] == '<' or content[i] == '>')) {
+                if (content[i] == '<') {
+                    // Skip generic params
+                    var depth: u32 = 1;
+                    i += 1;
+                    while (i < content.len and depth > 0) {
+                        if (content[i] == '<') depth += 1;
+                        if (content[i] == '>') depth -= 1;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            const interface_name = std.mem.trim(u8, content[type_start..i], " \t\n\r");
+            if (interface_name.len > 0) {
+                return interface_name;
+            }
+        }
+    }
+
+    return null;
+}
+
+/// Skip an expression (for default values in destructuring)
+fn skipExpression(content: []const u8, start: usize) usize {
+    var i = start;
+    var depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Track nesting
+        if (c == '(' or c == '[' or c == '{') depth += 1;
+        if ((c == ')' or c == ']' or c == '}') and depth > 0) {
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+
+        // Stop at , or } when at depth 0
+        if (depth == 0 and (c == ',' or c == '}')) break;
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        i += 1;
+    }
+
+    return i;
 }
 
 fn extractSlots(allocator: std.mem.Allocator, ast: *const Ast, slots: *std.ArrayList(SlotInfo)) !void {
@@ -523,7 +757,7 @@ test "transform typescript component" {
     const virtual = try transform(allocator, ast);
 
     // Verify key parts of the generated TypeScript
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { SvelteComponentTyped }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { SvelteComponentTyped, Snippet }") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Props") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "name: string") != null);
@@ -532,4 +766,136 @@ test "transform typescript component" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "default: {}") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "extends SvelteComponentTyped<$$Props, $$Events, $$Slots>") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "badType: number = \"not a number\"") != null);
+}
+
+test "extract $props() with interface type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const content =
+        \\interface Props {
+        \\    name: string;
+        \\    count?: number;
+        \\}
+        \\let { name, count = 0 }: Props = $props();
+    ;
+
+    var props: std.ArrayList(PropInfo) = .empty;
+    const interface_name = try extractPropsRune(allocator, content, &props);
+
+    try std.testing.expectEqualStrings("Props", interface_name.?);
+    try std.testing.expectEqual(@as(usize, 2), props.items.len);
+    try std.testing.expectEqualStrings("name", props.items[0].name);
+    try std.testing.expect(!props.items[0].has_initializer);
+    try std.testing.expectEqualStrings("count", props.items[1].name);
+    try std.testing.expect(props.items[1].has_initializer);
+}
+
+test "extract $props() with generic type parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const content =
+        \\let props = $props<MyProps>();
+    ;
+
+    var props: std.ArrayList(PropInfo) = .empty;
+    const interface_name = try extractPropsRune(allocator, content, &props);
+
+    try std.testing.expectEqualStrings("MyProps", interface_name.?);
+    try std.testing.expectEqual(@as(usize, 0), props.items.len);
+}
+
+test "extract $props() with $bindable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const content =
+        \\let { value = $bindable(), name } = $props();
+    ;
+
+    var props: std.ArrayList(PropInfo) = .empty;
+    const interface_name = try extractPropsRune(allocator, content, &props);
+
+    try std.testing.expect(interface_name == null);
+    try std.testing.expectEqual(@as(usize, 2), props.items.len);
+    try std.testing.expectEqualStrings("value", props.items[0].name);
+    try std.testing.expect(props.items[0].has_initializer);
+    try std.testing.expect(props.items[0].is_bindable);
+    try std.testing.expectEqualStrings("name", props.items[1].name);
+    try std.testing.expect(!props.items[1].is_bindable);
+}
+
+test "transform svelte 5 runes component" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  import type { Snippet } from 'svelte';
+        \\  
+        \\  interface Props {
+        \\    initialCount?: number;
+        \\    children?: Snippet;
+        \\  }
+        \\  
+        \\  let { initialCount = 0, children }: Props = $props();
+        \\  
+        \\  let count = $state(initialCount);
+        \\  let doubled = $derived(count * 2);
+        \\  
+        \\  $effect(() => {
+        \\    console.log(count);
+        \\  });
+        \\</script>
+        \\
+        \\<button onclick={() => count++}>{count}</button>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Counter.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should use Props interface directly
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type $$Props = Props;") != null);
+    // Should have comprehensive rune stubs
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare namespace $state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare namespace $derived") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare namespace $effect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function pre(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function root(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $inspect") != null);
+}
+
+test "transform svelte 5 with generic $props" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  type Item = { id: number; name: string };
+        \\  interface ListProps<T> {
+        \\    items: T[];
+        \\    selected?: T;
+        \\  }
+        \\  
+        \\  let { items, selected } = $props<ListProps<Item>>();
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "List.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should use generic interface directly
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type $$Props = ListProps<Item>;") != null);
 }
