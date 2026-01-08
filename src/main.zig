@@ -21,6 +21,7 @@ pub const tsgo = @import("tsgo.zig");
 pub const source_map = @import("source_map.zig");
 pub const output = @import("output.zig");
 pub const Diagnostic = @import("diagnostic.zig").Diagnostic;
+pub const sveltekit = @import("sveltekit.zig");
 
 /// Result of processing a single file
 const FileResult = struct {

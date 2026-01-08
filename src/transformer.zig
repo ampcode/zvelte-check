@@ -4,22 +4,25 @@
 //! Also builds source maps for error position mapping.
 //!
 //! Transformation strategy:
-//! 1. Add Svelte type imports (including Snippet for Svelte 5)
-//! 2. Add Svelte 5 rune type declarations ($state, $derived, $effect, $props, etc.)
-//! 3. Emit module script content (context="module")
-//! 4. Emit instance script content
-//! 5. Extract props from either:
+//! 1. Detect SvelteKit route files (+page.svelte, +layout.svelte, +error.svelte)
+//! 2. Add Svelte type imports (including Snippet for Svelte 5)
+//! 3. Add SvelteKit route type imports (PageData, LayoutData from ./$types)
+//! 4. Add Svelte 5 rune type declarations ($state, $derived, $effect, $props, etc.)
+//! 5. Emit module script content (context="module")
+//! 6. Emit instance script content
+//! 7. Extract props from either:
 //!    - `export let` declarations (Svelte 4 style)
 //!    - `$props()` destructuring (Svelte 5 style)
 //!    - Interface types referenced in $props<T>()
-//! 6. Extract <slot> elements and snippet props to generate $$Slots interface
-//! 7. Generate component class extending SvelteComponentTyped
+//! 8. Extract <slot> elements and snippet props to generate $$Slots interface
+//! 9. Generate component class extending SvelteComponentTyped
 
 const std = @import("std");
 const Ast = @import("svelte_parser.zig").Ast;
 const ScriptData = @import("svelte_parser.zig").ScriptData;
 const ElementData = @import("svelte_parser.zig").ElementData;
 const SourceMap = @import("source_map.zig").SourceMap;
+const sveltekit = @import("sveltekit.zig");
 
 pub const VirtualFile = struct {
     original_path: []const u8,
@@ -51,13 +54,22 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     var mappings: std.ArrayList(SourceMap.Mapping) = .empty;
     defer mappings.deinit(allocator);
 
+    // Detect SvelteKit route files
+    const route_info = sveltekit.detectRoute(ast.file_path);
+
     // Header comment
     try output.appendSlice(allocator, "// Generated from ");
     try output.appendSlice(allocator, ast.file_path);
     try output.appendSlice(allocator, "\n\n");
 
     // Svelte type imports (including Snippet for Svelte 5)
-    try output.appendSlice(allocator, "import type { SvelteComponentTyped, Snippet } from \"svelte\";\n\n");
+    try output.appendSlice(allocator, "import type { SvelteComponentTyped, Snippet } from \"svelte\";\n");
+
+    // SvelteKit route type imports
+    if (route_info.isRoute()) {
+        try emitRouteTypeImports(allocator, &output, route_info);
+    }
+    try output.appendSlice(allocator, "\n");
 
     // Svelte 5 rune type declarations
     try output.appendSlice(allocator,
@@ -630,6 +642,42 @@ fn isIdentChar(c: u8) bool {
     return isIdentStart(c) or (c >= '0' and c <= '9');
 }
 
+/// Emits type imports for SvelteKit route files
+fn emitRouteTypeImports(allocator: std.mem.Allocator, output: *std.ArrayList(u8), route_info: sveltekit.RouteInfo) !void {
+    // Build the list of types to import from ./$types
+    var types: std.ArrayList([]const u8) = .empty;
+    defer types.deinit(allocator);
+
+    // Data type (PageData or LayoutData)
+    if (route_info.dataTypeName()) |data_type| {
+        try types.append(allocator, data_type);
+    }
+
+    // Load function types
+    if (route_info.loadTypeName()) |load_type| {
+        try types.append(allocator, load_type);
+    }
+    if (route_info.serverLoadTypeName()) |server_type| {
+        try types.append(allocator, server_type);
+    }
+
+    // Action types for pages
+    if (route_info.kind == .page) {
+        try types.append(allocator, "Actions");
+        try types.append(allocator, "ActionData");
+    }
+
+    if (types.items.len == 0) return;
+
+    // Emit: import type { PageData, PageLoad, ... } from "./$types";
+    try output.appendSlice(allocator, "import type { ");
+    for (types.items, 0..) |type_name, i| {
+        if (i > 0) try output.appendSlice(allocator, ", ");
+        try output.appendSlice(allocator, type_name);
+    }
+    try output.appendSlice(allocator, " } from \"./$types\";\n");
+}
+
 test "transform simple script" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -898,4 +946,118 @@ test "transform svelte 5 with generic $props" {
 
     // Should use generic interface directly
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type $$Props = ListProps<Item>;") != null);
+}
+
+test "transform sveltekit +page.svelte route" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  import type { PageData } from './$types';
+        \\  let { data }: { data: PageData } = $props();
+        \\</script>
+        \\<h1>{data.title}</h1>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "src/routes/+page.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should auto-import SvelteKit types
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { PageData, PageLoad, PageServerLoad, Actions, ActionData } from \"./$types\";") != null);
+    // Should still have Svelte imports
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "SvelteComponentTyped") != null);
+}
+
+test "transform sveltekit +layout.svelte route" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  import type { Snippet } from 'svelte';
+        \\  let { children }: { children: Snippet } = $props();
+        \\</script>
+        \\{@render children()}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "src/routes/+layout.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should auto-import layout types
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { LayoutData, LayoutLoad, LayoutServerLoad } from \"./$types\";") != null);
+}
+
+test "transform sveltekit +page@.svelte route variant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let count = $state(0);
+        \\</script>
+        \\<p>{count}</p>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "src/routes/admin/+page@.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Route variant should still get page types
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { PageData") != null);
+}
+
+test "transform sveltekit +error.svelte route" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  import { page } from '$app/stores';
+        \\</script>
+        \\<h1>{$page.status}</h1>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "src/routes/+error.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Error pages don't have data types, so no $types import
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "from \"./$types\"") == null);
+}
+
+test "transform non-route component has no sveltekit imports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  export let name: string;
+        \\</script>
+        \\<p>Hello {name}!</p>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "src/lib/Greeting.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Regular components should not have $types import
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "from \"./$types\"") == null);
 }
