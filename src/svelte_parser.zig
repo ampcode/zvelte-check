@@ -295,6 +295,11 @@ pub const Parser = struct {
         const is_component = tag_name.len > 0 and tag_name[0] >= 'A' and tag_name[0] <= 'Z';
         self.advance();
 
+        // Handle generic type parameters: <Component<T> /> or <Component<T, U> />
+        if (is_component and self.current.kind == .lt) {
+            self.skipGenericParams();
+        }
+
         // Parse attributes
         const attrs_start: u32 = @intCast(ast.attributes.items.len);
         while (self.current.kind != .gt and
@@ -386,7 +391,18 @@ pub const Parser = struct {
         const start = self.current.start;
         self.advance(); // consume {
 
-        // Find matching }
+        // Check for block/tag keywords
+        if (self.current.kind == .hash) {
+            return self.parseBlockStart(ast, start);
+        } else if (self.current.kind == .at) {
+            return self.parseTagExpression(ast, start);
+        } else if (self.current.kind == .slash) {
+            return self.parseBlockEnd(ast, start);
+        } else if (self.current.kind == .colon) {
+            return self.parseBlockContinuation(ast, start);
+        }
+
+        // Regular expression - find matching }
         var depth: u32 = 1;
         while (self.current.kind != .eof and depth > 0) {
             if (self.current.kind == .lbrace) depth += 1;
@@ -408,6 +424,154 @@ pub const Parser = struct {
         });
 
         return node_idx;
+    }
+
+    /// Parse {#if}, {#each}, {#await}, {#key}, {#snippet}
+    fn parseBlockStart(self: *Parser, ast: *Ast, start: u32) !u32 {
+        self.advance(); // consume #
+
+        const kind: NodeKind = if (self.current.kind == .identifier) blk: {
+            const name = self.current.slice(self.source);
+            break :blk if (std.mem.eql(u8, name, "if"))
+                .if_block
+            else if (std.mem.eql(u8, name, "each"))
+                .each_block
+            else if (std.mem.eql(u8, name, "await"))
+                .await_block
+            else if (std.mem.eql(u8, name, "key"))
+                .key_block
+            else if (std.mem.eql(u8, name, "snippet"))
+                .snippet
+            else
+                .expression;
+        } else .expression;
+
+        // Skip to closing brace
+        self.skipToClosingBrace();
+        const end = self.current.end;
+        if (self.current.kind == .rbrace) self.advance();
+
+        const node_idx: u32 = @intCast(ast.nodes.items.len);
+        try ast.nodes.append(self.allocator, .{
+            .kind = kind,
+            .start = start,
+            .end = end,
+            .first_child = Node.NONE,
+            .next_sibling = Node.NONE,
+            .data = 0,
+        });
+
+        return node_idx;
+    }
+
+    /// Parse {@render}, {@html}, {@const}, {@debug}
+    fn parseTagExpression(self: *Parser, ast: *Ast, start: u32) !u32 {
+        self.advance(); // consume @
+
+        const kind: NodeKind = if (self.current.kind == .identifier) blk: {
+            const name = self.current.slice(self.source);
+            break :blk if (std.mem.eql(u8, name, "render"))
+                .render
+            else if (std.mem.eql(u8, name, "html"))
+                .html
+            else if (std.mem.eql(u8, name, "const"))
+                .const_tag
+            else if (std.mem.eql(u8, name, "debug"))
+                .debug_tag
+            else
+                .expression;
+        } else .expression;
+
+        // Skip to closing brace
+        self.skipToClosingBrace();
+        const end = self.current.end;
+        if (self.current.kind == .rbrace) self.advance();
+
+        const node_idx: u32 = @intCast(ast.nodes.items.len);
+        try ast.nodes.append(self.allocator, .{
+            .kind = kind,
+            .start = start,
+            .end = end,
+            .first_child = Node.NONE,
+            .next_sibling = Node.NONE,
+            .data = 0,
+        });
+
+        return node_idx;
+    }
+
+    /// Parse {/if}, {/each}, {/await}, {/key}, {/snippet}
+    fn parseBlockEnd(self: *Parser, ast: *Ast, start: u32) !u32 {
+        self.advance(); // consume /
+
+        // Block ends just mark position, use expression kind since they close blocks
+        self.skipToClosingBrace();
+        const end = self.current.end;
+        if (self.current.kind == .rbrace) self.advance();
+
+        const node_idx: u32 = @intCast(ast.nodes.items.len);
+        try ast.nodes.append(self.allocator, .{
+            .kind = .expression, // Block end markers
+            .start = start,
+            .end = end,
+            .first_child = Node.NONE,
+            .next_sibling = Node.NONE,
+            .data = 0,
+        });
+
+        return node_idx;
+    }
+
+    /// Parse {:else}, {:then}, {:catch}
+    fn parseBlockContinuation(self: *Parser, ast: *Ast, start: u32) !u32 {
+        self.advance(); // consume :
+
+        const kind: NodeKind = if (self.current.kind == .identifier) blk: {
+            const name = self.current.slice(self.source);
+            break :blk if (std.mem.eql(u8, name, "else"))
+                .else_block
+            else
+                .expression;
+        } else .expression;
+
+        self.skipToClosingBrace();
+        const end = self.current.end;
+        if (self.current.kind == .rbrace) self.advance();
+
+        const node_idx: u32 = @intCast(ast.nodes.items.len);
+        try ast.nodes.append(self.allocator, .{
+            .kind = kind,
+            .start = start,
+            .end = end,
+            .first_child = Node.NONE,
+            .next_sibling = Node.NONE,
+            .data = 0,
+        });
+
+        return node_idx;
+    }
+
+    fn skipToClosingBrace(self: *Parser) void {
+        var depth: u32 = 1;
+        while (self.current.kind != .eof and depth > 0) {
+            if (self.current.kind == .lbrace) depth += 1;
+            if (self.current.kind == .rbrace) depth -= 1;
+            if (depth > 0) self.advance();
+        }
+    }
+
+    /// Skip generic type parameters like <T> or <T, U extends Foo>
+    fn skipGenericParams(self: *Parser) void {
+        if (self.current.kind != .lt) return;
+        self.advance(); // consume <
+
+        var depth: u32 = 1;
+        while (self.current.kind != .eof and depth > 0) {
+            if (self.current.kind == .lt) depth += 1;
+            if (self.current.kind == .gt) depth -= 1;
+            if (depth > 0) self.advance();
+        }
+        if (self.current.kind == .gt) self.advance();
     }
 
     fn parseComment(self: *Parser, ast: *Ast) !u32 {
@@ -685,4 +849,179 @@ test "parse regular comment without svelte-ignore" {
     const comment = ast.comments.items[0];
     try std.testing.expectEqual(@as(u32, 0), comment.ignore_codes_start);
     try std.testing.expectEqual(@as(u32, 0), comment.ignore_codes_end);
+}
+
+test "parse snippet block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{#snippet greeting(name)}<p>Hello {name}!</p>{/snippet}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    // Find snippet node
+    var found_snippet = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .snippet) {
+            found_snippet = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_snippet);
+}
+
+test "parse render tag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{@render greeting('world')}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_render = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .render) {
+            found_render = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_render);
+}
+
+test "parse html tag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{@html '<b>bold</b>'}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_html = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .html) {
+            found_html = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_html);
+}
+
+test "parse const tag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{#each items as item}{@const doubled = item * 2}{doubled}{/each}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_const = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .const_tag) {
+            found_const = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_const);
+}
+
+test "parse debug tag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{@debug foo, bar}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_debug = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .debug_tag) {
+            found_debug = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_debug);
+}
+
+test "parse if-else block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{#if condition}<p>Yes</p>{:else}<p>No</p>{/if}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_if = false;
+    var found_else = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .if_block) found_if = true;
+        if (node.kind == .else_block) found_else = true;
+    }
+    try std.testing.expect(found_if);
+    try std.testing.expect(found_else);
+}
+
+test "parse await block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{#await promise}<p>Loading...</p>{:then value}<p>{value}</p>{:catch error}<p>{error}</p>{/await}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_await = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .await_block) {
+            found_await = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_await);
+}
+
+test "parse key block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{#key value}<Component />{/key}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_key = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .key_block) {
+            found_key = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_key);
+}
+
+test "parse component with generics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<Table<User> items={users} />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_component = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .component) {
+            found_component = true;
+            const elem = ast.elements.items[node.data];
+            try std.testing.expectEqualStrings("Table", elem.tag_name);
+            try std.testing.expect(elem.is_self_closing);
+            break;
+        }
+    }
+    try std.testing.expect(found_component);
 }
