@@ -34,7 +34,7 @@ Comparison of svelte-check-zig vs official svelte-check on a real SvelteKit proj
 ## Caveats
 
 The svelte-check-zig tool currently reports false positives because:
-1. SvelteKit virtual modules ($app/environment, $app/stores) aren't resolved
+1. ~~SvelteKit virtual modules ($app/environment, $app/stores) aren't resolved~~ **FIXED**: Type stubs for `$app/*` modules are now generated
 2. ~~Svelte store auto-subscriptions ($storeName) aren't transformed~~ **FIXED**: `$storeName` is now transformed to `__svelte_store_get(storeName)`
 3. Workspace package imports aren't resolved (@sourcegraph/*, etc.)
 
