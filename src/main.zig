@@ -150,7 +150,7 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
 
     // 5. Run tsgo
     if (!args.no_tsconfig) {
-        const ts_diagnostics = try tsgo.check(allocator, virtual_files.items, args.tsconfig);
+        const ts_diagnostics = try tsgo.check(allocator, virtual_files.items, args.workspace, args.tsconfig);
 
         for (ts_diagnostics) |d| {
             try all_diagnostics.append(allocator, d);
