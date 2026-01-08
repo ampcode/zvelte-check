@@ -12,6 +12,7 @@ const TokenKind = @import("svelte_lexer.zig").TokenKind;
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
 const a11y = @import("diagnostics/a11y.zig");
 const css = @import("diagnostics/css.zig");
+const component = @import("diagnostics/component.zig");
 
 pub const NodeKind = enum(u8) {
     root,
@@ -116,6 +117,7 @@ pub const Ast = struct {
     pub fn runDiagnostics(self: *const Ast, allocator: std.mem.Allocator, diagnostics: *std.ArrayList(Diagnostic)) !void {
         try a11y.runDiagnostics(allocator, self, diagnostics);
         try css.runDiagnostics(allocator, self, diagnostics);
+        try component.runDiagnostics(allocator, self, diagnostics);
     }
 };
 
