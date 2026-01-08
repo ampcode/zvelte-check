@@ -6,6 +6,11 @@
 //! - Links without href
 //! - Form inputs without labels
 //! - aria-* attribute validation
+//! - Distracting elements (marquee, blink)
+//! - Event handler pairing (click/keyboard, mouse/focus)
+//! - Heading structure
+//! - Redundant roles
+//! - Required ARIA properties
 
 const std = @import("std");
 const Ast = @import("../svelte_parser.zig").Ast;
@@ -17,18 +22,24 @@ const Diagnostic = @import("../diagnostic.zig").Diagnostic;
 const Severity = @import("../diagnostic.zig").Severity;
 const Source = @import("../diagnostic.zig").Source;
 
+const HeadingTracker = struct {
+    last_level: u8 = 0,
+};
+
 pub fn runDiagnostics(
     allocator: std.mem.Allocator,
     ast: *const Ast,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !void {
+    var heading_tracker: HeadingTracker = .{};
+
     for (ast.nodes.items) |node| {
         if (node.kind != .element and node.kind != .component) continue;
 
         const elem = ast.elements.items[node.data];
         const attrs = ast.attributes.items[elem.attrs_start..elem.attrs_end];
 
-        try checkElement(allocator, ast, node, elem, attrs, diagnostics);
+        try checkElement(allocator, ast, node, elem, attrs, diagnostics, &heading_tracker);
     }
 }
 
@@ -39,12 +50,27 @@ fn checkElement(
     elem: ElementData,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
+    heading_tracker: *HeadingTracker,
 ) !void {
     const tag = elem.tag_name;
+
+    // Distracting elements: marquee and blink
+    if (std.mem.eql(u8, tag, "marquee") or std.mem.eql(u8, tag, "blink")) {
+        try addDiagnostic(allocator, ast, node, diagnostics, .{
+            .severity = .warning,
+            .code = "a11y-distracting-elements",
+            .message = try std.fmt.allocPrint(
+                allocator,
+                "<{s}> element is distracting and should be avoided",
+                .{tag},
+            ),
+        });
+    }
 
     // img: must have alt attribute
     if (std.mem.eql(u8, tag, "img")) {
         try checkImgAlt(allocator, ast, node, attrs, diagnostics);
+        try checkImgRedundantAlt(allocator, ast, node, attrs, diagnostics);
     }
 
     // a: should have href, and content for accessible name
@@ -62,10 +88,55 @@ fn checkElement(
         try checkInput(allocator, ast, node, attrs, diagnostics);
     }
 
-    // Interactive elements need accessible names
-    if (isInteractiveElement(tag)) {
-        try checkInteractive(allocator, ast, node, attrs, diagnostics);
+    // video/audio: check for captions
+    if (std.mem.eql(u8, tag, "video") or std.mem.eql(u8, tag, "audio")) {
+        try checkMediaCaptions(allocator, ast, node, elem, attrs, diagnostics);
     }
+
+    // Heading structure
+    if (isHeading(tag)) {
+        try checkHeadingOrder(allocator, ast, node, tag, diagnostics, heading_tracker);
+    }
+
+    // Check for autofocus attribute
+    if (hasAttr(attrs, "autofocus")) {
+        try addDiagnostic(allocator, ast, node, diagnostics, .{
+            .severity = .warning,
+            .code = "a11y-autofocus",
+            .message = "Avoid using autofocus",
+        });
+    }
+
+    // Check for accesskey attribute
+    if (hasAttr(attrs, "accesskey")) {
+        try addDiagnostic(allocator, ast, node, diagnostics, .{
+            .severity = .warning,
+            .code = "a11y-accesskey",
+            .message = "Avoid using accesskey",
+        });
+    }
+
+    // Check for positive tabindex
+    try checkPositiveTabindex(allocator, ast, node, attrs, diagnostics);
+
+    // Check for redundant roles
+    try checkRedundantRoles(allocator, ast, node, tag, attrs, diagnostics);
+
+    // Check for required ARIA props based on role
+    try checkRoleRequiredProps(allocator, ast, node, attrs, diagnostics);
+
+    // Check for event handler pairing
+    try checkClickKeyEvents(allocator, ast, node, tag, attrs, diagnostics);
+    try checkMouseKeyEvents(allocator, ast, node, attrs, diagnostics);
+
+    // Check for non-interactive tabindex
+    try checkNoninteractiveTabindex(allocator, ast, node, tag, attrs, diagnostics);
+
+    // Check for static element interactions
+    try checkStaticElementInteractions(allocator, ast, node, tag, attrs, diagnostics);
+
+    // Check for interactive roles supporting focus
+    try checkInteractiveSupportsFocus(allocator, ast, node, tag, attrs, diagnostics);
 
     // Check all aria-* attributes for validity
     try checkAriaAttributes(allocator, ast, node, attrs, diagnostics);
@@ -88,6 +159,32 @@ fn checkImgAlt(
             .code = "a11y-missing-alt",
             .message = "<img> element must have an alt attribute",
         });
+    }
+}
+
+fn checkImgRedundantAlt(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    node: Node,
+    attrs: []const AttributeData,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    const alt = getAttrValue(attrs, "alt") orelse return;
+    if (alt.len == 0) return;
+
+    var lower_buf: [256]u8 = undefined;
+    const alt_lower = toLowerBounded(alt, &lower_buf);
+
+    const redundant_words = [_][]const u8{ "image", "photo", "picture" };
+    for (redundant_words) |word| {
+        if (std.mem.indexOf(u8, alt_lower, word) != null) {
+            try addDiagnostic(allocator, ast, node, diagnostics, .{
+                .severity = .warning,
+                .code = "a11y-img-redundant-alt",
+                .message = "Alt text should not contain words like \"image\", \"photo\", or \"picture\"",
+            });
+            return;
+        }
     }
 }
 
@@ -173,14 +270,87 @@ fn checkInput(
     }
 }
 
-fn checkInteractive(
+fn checkMediaCaptions(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    node: Node,
+    elem: ElementData,
+    attrs: []const AttributeData,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    // Muted videos don't need captions
+    if (hasAttr(attrs, "muted")) return;
+
+    // Check if element has a track child with kind="captions" or kind="subtitles"
+    // For now, we check by looking at subsequent nodes until we find a closing or sibling
+    const has_captions = hasTrackWithCaptions(ast, node);
+
+    if (!has_captions) {
+        try addDiagnostic(allocator, ast, node, diagnostics, .{
+            .severity = .warning,
+            .code = "a11y-media-has-caption",
+            .message = try std.fmt.allocPrint(
+                allocator,
+                "<{s}> element should have a <track> with captions",
+                .{elem.tag_name},
+            ),
+        });
+    }
+}
+
+fn hasTrackWithCaptions(ast: *const Ast, parent_node: Node) bool {
+    // Look for track children with kind="captions" or kind="subtitles"
+    var child_idx = parent_node.first_child;
+    while (child_idx != Node.NONE and child_idx < ast.nodes.items.len) {
+        const child = ast.nodes.items[child_idx];
+        if (child.kind == .element) {
+            const child_elem = ast.elements.items[child.data];
+            if (std.mem.eql(u8, child_elem.tag_name, "track")) {
+                const child_attrs = ast.attributes.items[child_elem.attrs_start..child_elem.attrs_end];
+                if (hasAttrValue(child_attrs, "kind", "captions") or
+                    hasAttrValue(child_attrs, "kind", "subtitles"))
+                {
+                    return true;
+                }
+            }
+        }
+        child_idx = child.next_sibling;
+    }
+    return false;
+}
+
+fn checkHeadingOrder(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    node: Node,
+    tag: []const u8,
+    diagnostics: *std.ArrayList(Diagnostic),
+    tracker: *HeadingTracker,
+) !void {
+    const level = tag[1] - '0'; // h1 -> 1, h2 -> 2, etc.
+
+    if (tracker.last_level > 0 and level > tracker.last_level + 1) {
+        try addDiagnostic(allocator, ast, node, diagnostics, .{
+            .severity = .warning,
+            .code = "a11y-heading-order",
+            .message = try std.fmt.allocPrint(
+                allocator,
+                "Heading level jumped from h{d} to h{d}",
+                .{ tracker.last_level, level },
+            ),
+        });
+    }
+
+    tracker.last_level = level;
+}
+
+fn checkPositiveTabindex(
     allocator: std.mem.Allocator,
     ast: *const Ast,
     node: Node,
     attrs: []const AttributeData,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !void {
-    // Check for tabindex with positive values (anti-pattern)
     if (getAttrValue(attrs, "tabindex")) |tabindex| {
         if (tabindex.len > 0 and tabindex[0] != '-' and tabindex[0] != '0') {
             try addDiagnostic(allocator, ast, node, diagnostics, .{
@@ -189,6 +359,202 @@ fn checkInteractive(
                 .message = "Avoid positive tabindex values",
             });
         }
+    }
+}
+
+fn checkRedundantRoles(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    node: Node,
+    tag: []const u8,
+    attrs: []const AttributeData,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    const role = getAttrValue(attrs, "role") orelse return;
+    const implicit_role = getImplicitRole(tag, attrs);
+
+    if (implicit_role) |ir| {
+        if (std.mem.eql(u8, role, ir)) {
+            try addDiagnostic(allocator, ast, node, diagnostics, .{
+                .severity = .warning,
+                .code = "a11y-no-redundant-roles",
+                .message = try std.fmt.allocPrint(
+                    allocator,
+                    "<{s}> has implicit role \"{s}\"",
+                    .{ tag, ir },
+                ),
+            });
+        }
+    }
+}
+
+fn checkRoleRequiredProps(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    node: Node,
+    attrs: []const AttributeData,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    const role = getAttrValue(attrs, "role") orelse return;
+
+    const required_props = getRoleRequiredProps(role);
+    if (required_props.len == 0) return;
+
+    for (required_props) |prop| {
+        if (!hasAttr(attrs, prop)) {
+            try addDiagnostic(allocator, ast, node, diagnostics, .{
+                .severity = .warning,
+                .code = "a11y-role-has-required-aria-props",
+                .message = try std.fmt.allocPrint(
+                    allocator,
+                    "role=\"{s}\" requires {s}",
+                    .{ role, prop },
+                ),
+            });
+            return;
+        }
+    }
+}
+
+fn checkClickKeyEvents(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    node: Node,
+    tag: []const u8,
+    attrs: []const AttributeData,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    // Native interactive elements don't need keyboard handlers
+    if (isNativeInteractiveElement(tag)) return;
+
+    const has_click = hasEventHandler(attrs, "click");
+    if (!has_click) return;
+
+    const has_keyboard = hasEventHandler(attrs, "keydown") or
+        hasEventHandler(attrs, "keyup") or
+        hasEventHandler(attrs, "keypress");
+
+    if (!has_keyboard) {
+        try addDiagnostic(allocator, ast, node, diagnostics, .{
+            .severity = .warning,
+            .code = "a11y-click-events-have-key-events",
+            .message = "Elements with on:click must have a keyboard event handler",
+        });
+    }
+}
+
+fn checkMouseKeyEvents(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    node: Node,
+    attrs: []const AttributeData,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    const has_focus = hasEventHandler(attrs, "focus");
+    const has_blur = hasEventHandler(attrs, "blur");
+
+    // mouseenter/mouseover should have focus
+    if (hasEventHandler(attrs, "mouseenter") or hasEventHandler(attrs, "mouseover")) {
+        if (!has_focus) {
+            try addDiagnostic(allocator, ast, node, diagnostics, .{
+                .severity = .warning,
+                .code = "a11y-mouse-events-have-key-events",
+                .message = "on:mouseenter or on:mouseover must be accompanied by on:focus",
+            });
+        }
+    }
+
+    // mouseleave/mouseout should have blur
+    if (hasEventHandler(attrs, "mouseleave") or hasEventHandler(attrs, "mouseout")) {
+        if (!has_blur) {
+            try addDiagnostic(allocator, ast, node, diagnostics, .{
+                .severity = .warning,
+                .code = "a11y-mouse-events-have-key-events",
+                .message = "on:mouseleave or on:mouseout must be accompanied by on:blur",
+            });
+        }
+    }
+}
+
+fn checkNoninteractiveTabindex(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    node: Node,
+    tag: []const u8,
+    attrs: []const AttributeData,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    // Skip if element has an interactive role
+    if (getAttrValue(attrs, "role")) |role| {
+        if (isInteractiveRole(role)) return;
+    }
+
+    // Skip native interactive elements
+    if (isNativeInteractiveElement(tag)) return;
+
+    // Check for tabindex >= 0
+    if (getAttrValue(attrs, "tabindex")) |tabindex| {
+        if (tabindex.len > 0 and tabindex[0] != '-') {
+            // tabindex="0" or positive
+            try addDiagnostic(allocator, ast, node, diagnostics, .{
+                .severity = .warning,
+                .code = "a11y-no-noninteractive-tabindex",
+                .message = "Non-interactive elements should not have tabindex",
+            });
+        }
+    }
+}
+
+fn checkStaticElementInteractions(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    node: Node,
+    tag: []const u8,
+    attrs: []const AttributeData,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    // Skip native interactive elements
+    if (isNativeInteractiveElement(tag)) return;
+
+    // Skip if element has a role
+    if (hasAttr(attrs, "role")) return;
+
+    // Check for click handler
+    if (hasEventHandler(attrs, "click")) {
+        try addDiagnostic(allocator, ast, node, diagnostics, .{
+            .severity = .warning,
+            .code = "a11y-no-static-element-interactions",
+            .message = "Static elements with event handlers require a role",
+        });
+    }
+}
+
+fn checkInteractiveSupportsFocus(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    node: Node,
+    tag: []const u8,
+    attrs: []const AttributeData,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    // Native interactive elements are focusable
+    if (isNativeInteractiveElement(tag)) return;
+
+    // Check if element has an interactive role
+    const role = getAttrValue(attrs, "role") orelse return;
+    if (!isInteractiveRole(role)) return;
+
+    // Check for tabindex
+    if (!hasAttr(attrs, "tabindex")) {
+        try addDiagnostic(allocator, ast, node, diagnostics, .{
+            .severity = .warning,
+            .code = "a11y-interactive-supports-focus",
+            .message = try std.fmt.allocPrint(
+                allocator,
+                "Elements with role=\"{s}\" must have tabindex",
+                .{role},
+            ),
+        });
     }
 }
 
@@ -232,14 +598,80 @@ fn checkAriaAttributes(
     }
 }
 
-fn isInteractiveElement(tag: []const u8) bool {
-    const interactive_tags = [_][]const u8{
+// --- Data tables ---
+
+fn isHeading(tag: []const u8) bool {
+    return tag.len == 2 and tag[0] == 'h' and tag[1] >= '1' and tag[1] <= '6';
+}
+
+fn isNativeInteractiveElement(tag: []const u8) bool {
+    const interactive = [_][]const u8{
         "a", "button", "input", "select", "textarea", "details", "summary",
     };
-    for (interactive_tags) |t| {
+    for (interactive) |t| {
         if (std.mem.eql(u8, tag, t)) return true;
     }
     return false;
+}
+
+fn isInteractiveRole(role: []const u8) bool {
+    const interactive_roles = [_][]const u8{
+        "button",           "checkbox",      "link",       "menuitem",
+        "menuitemcheckbox", "menuitemradio", "option",     "radio",
+        "searchbox",        "slider",        "spinbutton", "switch",
+        "tab",              "textbox",       "treeitem",
+    };
+    for (interactive_roles) |r| {
+        if (std.mem.eql(u8, role, r)) return true;
+    }
+    return false;
+}
+
+fn getImplicitRole(tag: []const u8, attrs: []const AttributeData) ?[]const u8 {
+    if (std.mem.eql(u8, tag, "button")) return "button";
+    if (std.mem.eql(u8, tag, "a")) {
+        if (hasAttr(attrs, "href")) return "link";
+    }
+    if (std.mem.eql(u8, tag, "img")) return "img";
+    if (std.mem.eql(u8, tag, "nav")) return "navigation";
+    if (std.mem.eql(u8, tag, "main")) return "main";
+    if (std.mem.eql(u8, tag, "article")) return "article";
+    if (std.mem.eql(u8, tag, "aside")) return "complementary";
+    if (std.mem.eql(u8, tag, "section")) return "region";
+    if (std.mem.eql(u8, tag, "hr")) return "separator";
+    if (std.mem.eql(u8, tag, "ul") or std.mem.eql(u8, tag, "ol")) return "list";
+    if (std.mem.eql(u8, tag, "li")) return "listitem";
+    if (std.mem.eql(u8, tag, "table")) return "table";
+    if (isHeading(tag)) return "heading";
+    return null;
+}
+
+fn getRoleRequiredProps(role: []const u8) []const []const u8 {
+    const S = struct {
+        const checkbox_props = [_][]const u8{"aria-checked"};
+        const radio_props = [_][]const u8{"aria-checked"};
+        const switch_props = [_][]const u8{"aria-checked"};
+        const slider_props = [_][]const u8{"aria-valuenow"};
+        const spinbutton_props = [_][]const u8{"aria-valuenow"};
+        const scrollbar_props = [_][]const u8{"aria-valuenow"};
+        const combobox_props = [_][]const u8{ "aria-controls", "aria-expanded" };
+        const option_props = [_][]const u8{"aria-selected"};
+        const heading_props = [_][]const u8{"aria-level"};
+        const separator_props = [_][]const u8{"aria-valuenow"};
+    };
+
+    if (std.mem.eql(u8, role, "checkbox")) return &S.checkbox_props;
+    if (std.mem.eql(u8, role, "radio")) return &S.radio_props;
+    if (std.mem.eql(u8, role, "switch")) return &S.switch_props;
+    if (std.mem.eql(u8, role, "slider")) return &S.slider_props;
+    if (std.mem.eql(u8, role, "spinbutton")) return &S.spinbutton_props;
+    if (std.mem.eql(u8, role, "scrollbar")) return &S.scrollbar_props;
+    if (std.mem.eql(u8, role, "combobox")) return &S.combobox_props;
+    if (std.mem.eql(u8, role, "option")) return &S.option_props;
+    if (std.mem.eql(u8, role, "heading")) return &S.heading_props;
+    if (std.mem.eql(u8, role, "separator")) return &S.separator_props;
+
+    return &[_][]const u8{};
 }
 
 fn isValidAriaAttribute(name: []const u8) bool {
@@ -287,6 +719,25 @@ fn getAttrValue(attrs: []const AttributeData, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, attr.name, name)) return attr.value;
     }
     return null;
+}
+
+fn hasEventHandler(attrs: []const AttributeData, event: []const u8) bool {
+    for (attrs) |attr| {
+        // Match "on:click", "on:keydown", etc.
+        if (attr.name.len > 3 and std.mem.startsWith(u8, attr.name, "on:")) {
+            const event_name = attr.name[3..];
+            if (std.mem.eql(u8, event_name, event)) return true;
+        }
+    }
+    return false;
+}
+
+fn toLowerBounded(s: []const u8, buf: []u8) []const u8 {
+    const len = @min(s.len, buf.len);
+    for (s[0..len], 0..) |c, i| {
+        buf[i] = std.ascii.toLower(c);
+    }
+    return buf[0..len];
 }
 
 const DiagnosticInfo = struct {
@@ -355,14 +806,22 @@ test "a11y: img with alt" {
     const allocator = arena.allocator();
 
     const Parser = @import("../svelte_parser.zig").Parser;
-    const source = "<img src=\"test.png\" alt=\"A test image\">";
+    const source = "<img src=\"test.png\" alt=\"A sunset\">";
     var parser = Parser.init(allocator, source, "test.svelte");
     const ast = try parser.parse();
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     try runDiagnostics(allocator, &ast, &diagnostics);
 
-    try std.testing.expect(diagnostics.items.len == 0);
+    // Should have no a11y-missing-alt
+    var found_missing_alt = false;
+    for (diagnostics.items) |d| {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-missing-alt")) {
+            found_missing_alt = true;
+            break;
+        }
+    }
+    try std.testing.expect(!found_missing_alt);
 }
 
 test "a11y: anchor without href" {
@@ -382,6 +841,51 @@ test "a11y: anchor without href" {
     var found = false;
     for (diagnostics.items) |d| {
         if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-missing-href")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "a11y: distracting elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<marquee>Scrolling</marquee><blink>Blinking</blink>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    var count: usize = 0;
+    for (diagnostics.items) |d| {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-distracting-elements")) {
+            count += 1;
+        }
+    }
+    try std.testing.expect(count == 2);
+}
+
+test "a11y: redundant roles" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<button role=\"button\">Click</button>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    var found = false;
+    for (diagnostics.items) |d| {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-no-redundant-roles")) {
             found = true;
             break;
         }
