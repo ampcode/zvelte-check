@@ -116,12 +116,13 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Emit module script content (if any)
     if (module_script) |script| {
         try output.appendSlice(allocator, "// <script context=\"module\">\n");
-        const content = ast.source[script.content_start..script.content_end];
+        const raw_content = ast.source[script.content_start..script.content_end];
+        const content = try filterSvelteImports(allocator, raw_content);
 
         try mappings.append(allocator, .{
             .svelte_offset = script.content_start,
             .ts_offset = @intCast(output.items.len),
-            .len = @intCast(content.len),
+            .len = @intCast(raw_content.len),
         });
 
         try output.appendSlice(allocator, content);
@@ -131,12 +132,13 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Emit instance script content (if any)
     if (instance_script) |script| {
         try output.appendSlice(allocator, "// <script>\n");
-        const content = ast.source[script.content_start..script.content_end];
+        const raw_content = ast.source[script.content_start..script.content_end];
+        const content = try filterSvelteImports(allocator, raw_content);
 
         try mappings.append(allocator, .{
             .svelte_offset = script.content_start,
             .ts_offset = @intCast(output.items.len),
-            .len = @intCast(content.len),
+            .len = @intCast(raw_content.len),
         });
 
         try output.appendSlice(allocator, content);
@@ -642,6 +644,53 @@ fn isIdentChar(c: u8) bool {
     return isIdentStart(c) or (c >= '0' and c <= '9');
 }
 
+/// Filters out `import ... from 'svelte'` and `import ... from "svelte"` statements
+/// from script content to avoid duplicate identifier errors.
+/// Returns content with those import lines removed.
+fn filterSvelteImports(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < content.len) {
+        // Find start of current line
+        const line_start = i;
+
+        // Find end of line
+        var line_end = i;
+        while (line_end < content.len and content[line_end] != '\n') : (line_end += 1) {}
+
+        const line = content[line_start..line_end];
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        // Check if this is an import from 'svelte' or "svelte"
+        const is_svelte_import = blk: {
+            if (!std.mem.startsWith(u8, trimmed, "import")) break :blk false;
+
+            // Look for from 'svelte' or from "svelte"
+            if (std.mem.indexOf(u8, trimmed, "from 'svelte'")) |_| break :blk true;
+            if (std.mem.indexOf(u8, trimmed, "from \"svelte\"")) |_| break :blk true;
+
+            break :blk false;
+        };
+
+        if (!is_svelte_import) {
+            try result.appendSlice(allocator, content[line_start..line_end]);
+        }
+
+        // Move past newline
+        i = line_end;
+        if (i < content.len and content[i] == '\n') {
+            if (!is_svelte_import) {
+                try result.append(allocator, '\n');
+            }
+            i += 1;
+        }
+    }
+
+    return try result.toOwnedSlice(allocator);
+}
+
 /// Emits type imports for SvelteKit route files
 fn emitRouteTypeImports(allocator: std.mem.Allocator, output: *std.ArrayList(u8), route_info: sveltekit.RouteInfo) !void {
     // Build the list of types to import from ./$types
@@ -909,6 +958,17 @@ test "transform svelte 5 runes component" {
     const ast = try parser.parse();
 
     const virtual = try transform(allocator, ast);
+
+    // Verify Snippet only appears once (in our import, not duplicated from user code)
+    var snippet_count: usize = 0;
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, virtual.content, search_start, "Snippet")) |pos| {
+        snippet_count += 1;
+        search_start = pos + 7;
+    }
+    // Should appear exactly twice: once in "import type { SvelteComponentTyped, Snippet }"
+    // and once in the Props interface "children?: Snippet"
+    try std.testing.expectEqual(@as(usize, 2), snippet_count);
 
     // Should use Props interface directly
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type $$Props = Props;") != null);
