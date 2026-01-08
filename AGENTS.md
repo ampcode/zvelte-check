@@ -1,5 +1,19 @@
 # AGENTS.md
 
+## Project Scope
+
+This is a fast Svelte diagnostic tool (svelte-check replacement) written in Zig.
+
+**In scope:**
+- All svelte-check diagnostics (a11y, CSS, TypeScript/JavaScript)
+- Svelte 5+ support (runes, snippets, etc.)
+- Performance (parallel processing, fast startup)
+
+**Out of scope:**
+- Watch mode (users should use their editor's LSP or run on-demand)
+- Svelte 4 and earlier support
+- Output format compatibility (we use our own simpler formats)
+
 ## Zig Development
 
 Always use `zigdoc` to discover APIs for the Zig standard library and any third-party dependencies.
