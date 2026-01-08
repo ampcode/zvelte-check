@@ -208,6 +208,8 @@ fn processFileInner(ctx: *ProcessContext, file_path: []const u8, index: usize) !
     };
 }
 
+pub const integration_test = @import("integration_test.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
