@@ -2,7 +2,7 @@
 //!
 //! Pipeline:
 //! 1. Scan workspace for .svelte files
-//! 2. Parse each file (parallel)
+//! 2. Parse each file (parallel via thread pool)
 //! 3. Run Svelte diagnostics (a11y, CSS)
 //! 4. Transform to virtual .ts files
 //! 5. Run tsgo on all files
@@ -22,6 +22,20 @@ pub const source_map = @import("source_map.zig");
 pub const output = @import("output.zig");
 pub const Diagnostic = @import("diagnostic.zig").Diagnostic;
 
+/// Result of processing a single file
+const FileResult = struct {
+    virtual_file: transformer.VirtualFile,
+    diagnostics: []Diagnostic,
+    arena: ?std.heap.ArenaAllocator = null,
+    err: ?anyerror = null,
+};
+
+/// Shared context for parallel file processing
+const ProcessContext = struct {
+    backing_allocator: std.mem.Allocator,
+    results: []FileResult,
+};
+
 pub fn main() !void {
     // Use DebugAllocator in debug/safe modes, SmpAllocator in release
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -40,11 +54,11 @@ pub fn main() !void {
 
     const args = try cli.parseArgs(allocator);
 
-    const exit_code = try run(allocator, args);
+    const exit_code = try run(backing_allocator, allocator, args);
     std.process.exit(exit_code);
 }
 
-fn run(allocator: std.mem.Allocator, args: cli.Args) !u8 {
+fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args: cli.Args) !u8 {
     const stdout = std.fs.File.stdout();
     var msg_buf: [512]u8 = undefined;
 
@@ -61,49 +75,76 @@ fn run(allocator: std.mem.Allocator, args: cli.Args) !u8 {
         try stdout.writeAll(msg);
     }
 
-    // 2-4. Parse, diagnose, transform (TODO: parallelize)
+    // 2-4. Parse, diagnose, transform (parallel)
+    // Use backing_allocator for thread pool (arena isn't thread-safe)
+    // Each thread gets its own arena for allocations
+    const results = try backing_allocator.alloc(FileResult, files.len);
+    defer backing_allocator.free(results);
+    @memset(results, .{
+        .virtual_file = .{
+            .original_path = "",
+            .virtual_path = "",
+            .content = "",
+            .source_map = .{ .mappings = &.{}, .svelte_source = "" },
+        },
+        .diagnostics = &.{},
+        .arena = null,
+        .err = null,
+    });
+
+    var ctx: ProcessContext = .{
+        .backing_allocator = backing_allocator,
+        .results = results,
+    };
+
+    // Use thread pool for parallel processing
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const n_jobs = @max(1, cpu_count -| 1);
+
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{
+        .allocator = backing_allocator,
+        .n_jobs = n_jobs,
+    });
+    defer pool.deinit();
+
+    var wg: std.Thread.WaitGroup = .{};
+
+    for (files, 0..) |file_path, i| {
+        pool.spawnWg(&wg, processFile, .{ &ctx, file_path, i });
+    }
+
+    wg.wait();
+
+    // Collect results and clean up per-thread arenas
+    defer for (results) |*result| {
+        if (result.arena) |*arena| {
+            arena.deinit();
+        }
+    };
+
     var all_diagnostics: std.ArrayList(Diagnostic) = .empty;
     var virtual_files: std.ArrayList(transformer.VirtualFile) = .empty;
 
-    for (files) |file_path| {
-        const source = try std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024);
+    for (results) |result| {
+        if (result.err) |err| {
+            return err;
+        }
+        try virtual_files.append(allocator, result.virtual_file);
+        for (result.diagnostics) |d| {
+            try all_diagnostics.append(allocator, d);
+        }
+    }
 
-        // Parse
-        var parser: Parser = .init(allocator, source, file_path);
-        const ast = try parser.parse();
-
-        if (args.output_format == .human_verbose) {
-            const msg = std.fmt.bufPrint(&msg_buf, "{s}: {d} nodes, {d} scripts, {d} styles\n", .{
-                file_path,
-                ast.nodes.items.len,
-                ast.scripts.items.len,
-                ast.styles.items.len,
+    if (args.output_format == .human_verbose) {
+        for (virtual_files.items) |virtual| {
+            const msg = std.fmt.bufPrint(&msg_buf, "{s}: generated TS ({d} bytes)\n", .{
+                virtual.original_path,
+                virtual.content.len,
             }) catch "";
             try stdout.writeAll(msg);
         }
-
-        // Svelte diagnostics (a11y, CSS)
-        try ast.runDiagnostics(allocator, &all_diagnostics);
-
-        // Transform to TS
-        const virtual = try transformer.transform(allocator, ast);
-        try virtual_files.append(allocator, virtual);
-
-        if (args.output_format == .human_verbose) {
-            try stdout.writeAll("  Generated TS:\n");
-            // Show first 200 chars of generated TS
-            const preview_len = @min(virtual.content.len, 200);
-            try stdout.writeAll("  ");
-            for (virtual.content[0..preview_len]) |c| {
-                if (c == '\n') {
-                    try stdout.writeAll("\n  ");
-                } else {
-                    try stdout.writeAll(&.{c});
-                }
-            }
-            if (virtual.content.len > 200) try stdout.writeAll("...");
-            try stdout.writeAll("\n\n");
-        }
+        try stdout.writeAll("\n");
     }
 
     // 5. Run tsgo
@@ -130,6 +171,40 @@ fn run(allocator: std.mem.Allocator, args: cli.Args) !u8 {
     if (has_errors) return 1;
     if (has_warnings and args.fail_on_warnings) return 1;
     return 0;
+}
+
+fn processFile(ctx: *ProcessContext, file_path: []const u8, index: usize) void {
+    processFileInner(ctx, file_path, index) catch |err| {
+        ctx.results[index].err = err;
+    };
+}
+
+fn processFileInner(ctx: *ProcessContext, file_path: []const u8, index: usize) !void {
+    // Each thread gets its own arena (avoids lock contention)
+    var arena = std.heap.ArenaAllocator.init(ctx.backing_allocator);
+    errdefer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Read file
+    const source = try std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024);
+
+    // Parse
+    var parser: Parser = .init(allocator, source, file_path);
+    const ast = try parser.parse();
+
+    // Svelte diagnostics (a11y, CSS) - collect into local list
+    var diag_list: std.ArrayList(Diagnostic) = .empty;
+    try ast.runDiagnostics(allocator, &diag_list);
+
+    // Transform to TS
+    const virtual = try transformer.transform(allocator, ast);
+
+    // Store result (no lock needed - each thread writes to unique index)
+    ctx.results[index] = .{
+        .virtual_file = virtual,
+        .diagnostics = try diag_list.toOwnedSlice(allocator),
+        .arena = arena,
+    };
 }
 
 test {
