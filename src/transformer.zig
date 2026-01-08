@@ -63,7 +63,9 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     try output.appendSlice(allocator, "\n\n");
 
     // Svelte type imports (including Snippet for Svelte 5)
-    try output.appendSlice(allocator, "import type { SvelteComponentTyped, Snippet } from \"svelte\";\n");
+    // SvelteComponentTyped must be a regular import (not type-only) since we extend it
+    try output.appendSlice(allocator, "import { SvelteComponentTyped } from \"svelte\";\n");
+    try output.appendSlice(allocator, "import type { Snippet } from \"svelte\";\n");
 
     // SvelteKit route type imports
     if (route_info.isRoute()) {
@@ -854,7 +856,8 @@ test "transform typescript component" {
     const virtual = try transform(allocator, ast);
 
     // Verify key parts of the generated TypeScript
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { SvelteComponentTyped, Snippet }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import { SvelteComponentTyped }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Props") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "name: string") != null);
@@ -966,7 +969,7 @@ test "transform svelte 5 runes component" {
         snippet_count += 1;
         search_start = pos + 7;
     }
-    // Should appear exactly twice: once in "import type { SvelteComponentTyped, Snippet }"
+    // Should appear exactly twice: once in "import type { Snippet }"
     // and once in the Props interface "children?: Snippet"
     try std.testing.expectEqual(@as(usize, 2), snippet_count);
 
