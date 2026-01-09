@@ -603,13 +603,33 @@ const ExprInfo = struct {
     offset: u32,
 };
 
+const EachBindingInfo = struct {
+    iterable: []const u8,
+    item_binding: []const u8,
+    index_binding: ?[]const u8,
+    offset: u32,
+};
+
+const ConstBindingInfo = struct {
+    name: []const u8,
+    expr: []const u8,
+    offset: u32,
+};
+
+const SnippetParamInfo = struct {
+    params: []const u8,
+    offset: u32,
+};
+
 /// Extracts template expressions from the AST and emits them as TypeScript
 /// statements for type-checking. Handles:
 /// - {#if condition} → void (condition);
-/// - {#each items as item} → void (items); declare let item: typeof items[number];
+/// - {#each items as item, i} → void (items); let item: typeof (items)[number]; let i: number;
 /// - {#await promise} → void (promise);
 /// - {#key expr} → void (expr);
 /// - {@render snippet(args)} → void (snippet(args));
+/// - {#snippet name(params)} → function declarations with params
+/// - {@const x = expr} → let x = expr;
 ///
 /// Plain expressions like {variable} are NOT emitted separately because they
 /// often reference loop bindings that would be out of scope in the generated TS.
@@ -622,45 +642,185 @@ fn emitTemplateExpressions(
     var has_expressions = false;
 
     for (ast.nodes.items) |node| {
-        // Only emit controlling expressions from block statements.
-        // Skip plain expressions {foo} since they may reference loop bindings
-        // that are out of scope in the flat TS output.
-        const expr_info = switch (node.kind) {
-            .if_block => extractIfExpression(ast.source, node.start, node.end),
-            .each_block => extractEachExpression(ast.source, node.start, node.end),
-            .await_block => extractAwaitExpression(ast.source, node.start, node.end),
-            .key_block => extractKeyExpression(ast.source, node.start, node.end),
-            .render => extractRenderExpression(ast.source, node.start, node.end),
-            else => null,
-        };
+        switch (node.kind) {
+            .each_block => {
+                if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
 
-        if (expr_info) |info| {
-            if (!has_expressions) {
-                try output.appendSlice(allocator, "// Template expressions\n");
-                has_expressions = true;
-            }
+                    try mappings.append(allocator, .{
+                        .svelte_offset = node.start + binding.offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(binding.iterable.len),
+                    });
 
-            // Add source mapping for the expression
-            try mappings.append(allocator, .{
-                .svelte_offset = node.start + info.offset,
-                .ts_offset = @intCast(output.items.len),
-                .len = @intCast(info.expr.len),
-            });
+                    const transformed_iterable = try transformStoreSubscriptions(allocator, binding.iterable);
+                    try output.appendSlice(allocator, "void (");
+                    try output.appendSlice(allocator, transformed_iterable);
+                    try output.appendSlice(allocator, ");\n");
 
-            // Emit as a statement: void (expr);
-            // Using void ensures any expression is valid as a statement
-            try output.appendSlice(allocator, "void (");
+                    try emitEachBindingDeclarations(allocator, output, binding, transformed_iterable);
+                }
+            },
+            .snippet => {
+                if (extractSnippetParams(ast.source, node.start, node.end)) |info| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    try emitSnippetParamDeclarations(allocator, output, info.params);
+                }
+            },
+            .const_tag => {
+                if (extractConstBinding(ast.source, node.start, node.end)) |binding| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
 
-            // Transform store subscriptions in template expressions
-            const transformed = try transformStoreSubscriptions(allocator, info.expr);
-            try output.appendSlice(allocator, transformed);
+                    try mappings.append(allocator, .{
+                        .svelte_offset = node.start + binding.offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(binding.name.len + binding.expr.len + 3),
+                    });
 
-            try output.appendSlice(allocator, ");\n");
+                    // Emit as: var name = expr;
+                    // Using var allows redeclaration for multiple blocks with same name
+                    const transformed_expr = try transformStoreSubscriptions(allocator, binding.expr);
+                    try output.appendSlice(allocator, "var ");
+                    try output.appendSlice(allocator, binding.name);
+                    try output.appendSlice(allocator, " = ");
+                    try output.appendSlice(allocator, transformed_expr);
+                    try output.appendSlice(allocator, ";\n");
+                }
+            },
+            .if_block, .await_block, .key_block, .render => {
+                const expr_info = switch (node.kind) {
+                    .if_block => extractIfExpression(ast.source, node.start, node.end),
+                    .await_block => extractAwaitExpression(ast.source, node.start, node.end),
+                    .key_block => extractKeyExpression(ast.source, node.start, node.end),
+                    .render => extractRenderExpression(ast.source, node.start, node.end),
+                    else => null,
+                };
+
+                if (expr_info) |info| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+
+                    try mappings.append(allocator, .{
+                        .svelte_offset = node.start + info.offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(info.expr.len),
+                    });
+
+                    try output.appendSlice(allocator, "void (");
+                    const transformed = try transformStoreSubscriptions(allocator, info.expr);
+                    try output.appendSlice(allocator, transformed);
+                    try output.appendSlice(allocator, ");\n");
+                }
+            },
+            else => {},
         }
     }
 
     if (has_expressions) {
         try output.appendSlice(allocator, "\n");
+    }
+}
+
+/// Emits variable declarations for each block bindings
+fn emitEachBindingDeclarations(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    binding: EachBindingInfo,
+    iterable: []const u8,
+) !void {
+    // Emit item binding: var item = (iterable)[0];
+    // Using var allows redeclaration for multiple blocks with same name
+    try output.appendSlice(allocator, "var ");
+    try output.appendSlice(allocator, binding.item_binding);
+    try output.appendSlice(allocator, " = (");
+    try output.appendSlice(allocator, iterable);
+    try output.appendSlice(allocator, ")[0];\n");
+
+    // Emit index binding if present: var i = 0;
+    if (binding.index_binding) |idx| {
+        try output.appendSlice(allocator, "var ");
+        try output.appendSlice(allocator, idx);
+        try output.appendSlice(allocator, " = 0;\n");
+    }
+}
+
+/// Emits variable declarations for snippet parameters
+fn emitSnippetParamDeclarations(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    params: []const u8,
+) !void {
+    var i: usize = 0;
+    while (i < params.len) {
+        // Skip whitespace
+        while (i < params.len and std.ascii.isWhitespace(params[i])) : (i += 1) {}
+        if (i >= params.len) break;
+
+        const start = i;
+
+        // Find end of parameter name (stop at : for type, , for next, ) for end)
+        while (i < params.len) {
+            const c = params[i];
+            if (c == ':' or c == ',' or c == '=' or c == ')') break;
+            i += 1;
+        }
+
+        const param_name = std.mem.trim(u8, params[start..i], " \t\n\r");
+        if (param_name.len > 0) {
+            // Check if there's a type annotation
+            var type_annotation: ?[]const u8 = null;
+            if (i < params.len and params[i] == ':') {
+                i += 1;
+                const type_start = i;
+                var depth: u32 = 0;
+                while (i < params.len) {
+                    const c = params[i];
+                    if (c == '<' or c == '(' or c == '[' or c == '{') depth += 1;
+                    if ((c == '>' or c == ')' or c == ']' or c == '}') and depth > 0) depth -= 1;
+                    if (depth == 0 and (c == ',' or c == ')' or c == '=')) break;
+                    i += 1;
+                }
+                type_annotation = std.mem.trim(u8, params[type_start..i], " \t\n\r");
+            }
+
+            // Skip default value if present
+            if (i < params.len and params[i] == '=') {
+                i += 1;
+                var depth: u32 = 0;
+                while (i < params.len) {
+                    const c = params[i];
+                    if (c == '(' or c == '[' or c == '{') depth += 1;
+                    if ((c == ')' or c == ']' or c == '}') and depth > 0) depth -= 1;
+                    if (depth == 0 and c == ',') break;
+                    i += 1;
+                }
+            }
+
+            // Use var for redeclaration safety across multiple snippets
+            try output.appendSlice(allocator, "var ");
+            try output.appendSlice(allocator, param_name);
+            try output.appendSlice(allocator, ": ");
+            if (type_annotation) |t| {
+                try output.appendSlice(allocator, t);
+            } else {
+                try output.appendSlice(allocator, "any");
+            }
+            try output.appendSlice(allocator, ";\n");
+        }
+
+        // Skip comma
+        if (i < params.len and params[i] == ',') i += 1;
     }
 }
 
@@ -692,6 +852,127 @@ fn extractEachExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
     const expr = std.mem.trim(u8, content[expr_start .. expr_start + as_pos], " \t\n\r");
     if (expr.len == 0) return null;
     return .{ .expr = expr, .offset = @intCast(expr_start) };
+}
+
+/// Extracts iterable and bindings from {#each items as item, i}
+fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInfo {
+    const content = source[start..end];
+    // Format: {#each expr as item, index (key)}
+    const prefix = "{#each ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const expr_start = idx + prefix.len;
+
+    // Find " as " keyword
+    const as_pos = findAsKeyword(content[expr_start..]) orelse return null;
+    const iterable = std.mem.trim(u8, content[expr_start .. expr_start + as_pos], " \t\n\r");
+    if (iterable.len == 0) return null;
+
+    // Parse bindings after "as"
+    const binding_start = expr_start + as_pos + 4; // skip " as "
+    const binding_end = findEachBindingEnd(content, binding_start);
+    const bindings = std.mem.trim(u8, content[binding_start..binding_end], " \t\n\r");
+    if (bindings.len == 0) return null;
+
+    // Split on comma to get item and optional index
+    var item_binding: []const u8 = bindings;
+    var index_binding: ?[]const u8 = null;
+
+    if (std.mem.indexOf(u8, bindings, ",")) |comma_pos| {
+        item_binding = std.mem.trim(u8, bindings[0..comma_pos], " \t\n\r");
+        const after_comma = std.mem.trim(u8, bindings[comma_pos + 1 ..], " \t\n\r");
+        // Index might be followed by (key) - extract just the identifier
+        if (std.mem.indexOf(u8, after_comma, "(")) |paren_pos| {
+            index_binding = std.mem.trim(u8, after_comma[0..paren_pos], " \t\n\r");
+        } else {
+            index_binding = after_comma;
+        }
+    }
+
+    return .{
+        .iterable = iterable,
+        .item_binding = item_binding,
+        .index_binding = index_binding,
+        .offset = @intCast(expr_start),
+    };
+}
+
+/// Finds the end of each block bindings (before key expression or closing brace)
+fn findEachBindingEnd(content: []const u8, start: usize) usize {
+    var i = start;
+    var paren_depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        if (c == '(') {
+            // Only stop at top-level ( which is the key expression
+            if (paren_depth == 0) {
+                return i;
+            }
+            paren_depth += 1;
+        }
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+        if (c == '}' and paren_depth == 0) return i;
+
+        i += 1;
+    }
+    return i;
+}
+
+/// Extracts parameters from {#snippet name(params)}
+fn extractSnippetParams(source: []const u8, start: u32, end: u32) ?SnippetParamInfo {
+    const content = source[start..end];
+    // Format: {#snippet name(params)}
+    const prefix = "{#snippet ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const name_start = idx + prefix.len;
+
+    // Find opening paren
+    const paren_pos = std.mem.indexOf(u8, content[name_start..], "(") orelse return null;
+    const params_start = name_start + paren_pos + 1;
+
+    // Find closing paren
+    var paren_depth: u32 = 1;
+    var i = params_start;
+    while (i < content.len and paren_depth > 0) {
+        if (content[i] == '(') paren_depth += 1;
+        if (content[i] == ')') paren_depth -= 1;
+        if (paren_depth > 0) i += 1;
+    }
+
+    const params = std.mem.trim(u8, content[params_start..i], " \t\n\r");
+    if (params.len == 0) return null;
+
+    return .{
+        .params = params,
+        .offset = @intCast(params_start),
+    };
+}
+
+/// Extracts binding from {@const name = expr}
+fn extractConstBinding(source: []const u8, start: u32, end: u32) ?ConstBindingInfo {
+    const content = source[start..end];
+    // Format: {@const name = expr}
+    const prefix = "{@const ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const binding_start = idx + prefix.len;
+
+    // Find = sign
+    const eq_pos = std.mem.indexOf(u8, content[binding_start..], "=") orelse return null;
+    const name = std.mem.trim(u8, content[binding_start .. binding_start + eq_pos], " \t\n\r");
+    if (name.len == 0) return null;
+
+    // Find expression (until closing brace)
+    const expr_start = binding_start + eq_pos + 1;
+    const expr_end = std.mem.indexOf(u8, content[expr_start..], "}") orelse return null;
+    const expr = std.mem.trim(u8, content[expr_start .. expr_start + expr_end], " \t\n\r");
+    if (expr.len == 0) return null;
+
+    return .{
+        .name = name,
+        .expr = expr,
+        .offset = @intCast(binding_start),
+    };
 }
 
 /// Finds the position of " as " keyword in an each expression,
@@ -1995,4 +2276,107 @@ test "transform template expressions" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void (condition)") != null);
     // Should have the each iterable check
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void (items)") != null);
+    // Should have variable declaration for each binding
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var item = (items)[0];") != null);
+}
+
+test "transform each with index" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let items = ['a', 'b', 'c'];
+        \\</script>
+        \\{#each items as item, i}
+        \\  <p>{i}: {item}</p>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should have item declaration
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var item = (items)[0];") != null);
+    // Should have index declaration
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var i = 0;") != null);
+}
+
+test "transform each with key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let items = [{id: 1, name: 'a'}];
+        \\</script>
+        \\{#each items as item, index (item.id)}
+        \\  <p>{item.name}</p>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should have item declaration (not including key expr)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var item = (items)[0];") != null);
+    // Should have index declaration
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var index = 0;") != null);
+}
+
+test "transform snippet with params" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\</script>
+        \\{#snippet greeting(name: string, age: number)}
+        \\  <p>Hello {name}, you are {age}</p>
+        \\{/snippet}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should have param declarations with types
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name: string;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var age: number;") != null);
+}
+
+test "transform const binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let items = [1, 2, 3];
+        \\</script>
+        \\{#each items as item, index}
+        \\  {@const doubled = item * 2}
+        \\  <p>{doubled}</p>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should have const declaration (TypeScript infers the type)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var doubled = item * 2;") != null);
 }
