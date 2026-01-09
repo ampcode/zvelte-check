@@ -1002,6 +1002,7 @@ fn emitSnippetParamDeclarations(
             }
 
             // Use var for redeclaration safety across multiple snippets
+            // Must have initializer to avoid "used before being assigned" errors
             try output.appendSlice(allocator, "var ");
             try output.appendSlice(allocator, param_name);
             try output.appendSlice(allocator, ": ");
@@ -1010,10 +1011,11 @@ fn emitSnippetParamDeclarations(
                 if (is_optional) {
                     try output.appendSlice(allocator, " | undefined");
                 }
+                try output.appendSlice(allocator, " = undefined as any");
             } else if (is_optional) {
-                try output.appendSlice(allocator, "any | undefined");
+                try output.appendSlice(allocator, "any | undefined = undefined");
             } else {
-                try output.appendSlice(allocator, "any");
+                try output.appendSlice(allocator, "any = undefined as any");
             }
             try output.appendSlice(allocator, ";\n");
         }
@@ -2646,9 +2648,9 @@ test "transform snippet with params" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should have param declarations with types
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name: string;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var age: number;") != null);
+    // Should have param declarations with types and initializers
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name: string = undefined as any;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var age: number = undefined as any;") != null);
 }
 
 test "transform snippet with import type param" {
@@ -2670,9 +2672,9 @@ test "transform snippet with import type param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should handle import() types with parentheses correctly
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var key: import('svelte').Snippet | string;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var label: string;") != null);
+    // Should handle import() types with parentheses correctly (with initializers)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var key: import('svelte').Snippet | string = undefined as any;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var label: string = undefined as any;") != null);
 }
 
 test "transform const binding" {
@@ -2721,8 +2723,8 @@ test "debug Svelte5EdgeCases optional param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should generate valid TypeScript with | undefined, not ?
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name: string | undefined;") != null);
+    // Should generate valid TypeScript with | undefined and initializer, not ?
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name: string | undefined = undefined as any;") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name?: string;") == null);
 }
 
