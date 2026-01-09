@@ -2215,6 +2215,348 @@ test "transform svelte 5 runes component" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $inspect") != null);
 }
 
+// ============================================================================
+// Svelte 5 rune type declaration tests
+// ============================================================================
+
+test "rune stubs: $state with type inference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let count = $state(0);
+        \\  let name = $state<string>('hello');
+        \\  let items = $state<string[]>([]);
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "State.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify $state declaration exists with correct signature
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state<T = undefined>(initial?: T): T;") != null);
+    // Verify script content is preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let count = $state(0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let name = $state<string>('hello');") != null);
+}
+
+test "rune stubs: $state.raw and $state.snapshot" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let data = $state.raw({ x: 1, y: 2 });
+        \\  function save() {
+        \\    const snapshot = $state.snapshot(data);
+        \\    console.log(snapshot);
+        \\  }
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "StateRaw.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify $state namespace with raw and snapshot
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare namespace $state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function raw<T>(initial: T): T;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function snapshot<T>(state: T): T;") != null);
+    // Verify script content
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$state.raw({ x: 1, y: 2 })") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$state.snapshot(data)") != null);
+}
+
+test "rune stubs: $derived with expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let count = $state(0);
+        \\  let doubled = $derived(count * 2);
+        \\  let message = $derived(`Count is ${count}`);
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Derived.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify $derived declaration
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $derived<T>(expr: T): T;") != null);
+    // Verify usage is preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$derived(count * 2)") != null);
+}
+
+test "rune stubs: $derived.by with function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let items = $state<number[]>([1, 2, 3]);
+        \\  let total = $derived.by(() => {
+        \\    return items.reduce((a, b) => a + b, 0);
+        \\  });
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "DerivedBy.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify $derived namespace with by
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare namespace $derived") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function by<T>(fn: () => T): T;") != null);
+    // Verify usage
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$derived.by(()") != null);
+}
+
+test "rune stubs: $effect basic usage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let count = $state(0);
+        \\  $effect(() => {
+        \\    console.log('count changed:', count);
+        \\  });
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Effect.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify $effect declaration with cleanup return type
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $effect(fn: () => void | (() => void)): void;") != null);
+}
+
+test "rune stubs: $effect.pre and $effect.root" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let count = $state(0);
+        \\  
+        \\  $effect.pre(() => {
+        \\    console.log('before DOM update');
+        \\  });
+        \\  
+        \\  const cleanup = $effect.root(() => {
+        \\    console.log('root effect');
+        \\    return () => console.log('cleanup');
+        \\  });
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "EffectPre.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify $effect namespace functions
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare namespace $effect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function pre(fn: () => void | (() => void)): void;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function root(fn: () => void | (() => void)): () => void;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function tracking(): boolean;") != null);
+    // Verify usage
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$effect.pre(()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$effect.root(()") != null);
+}
+
+test "rune stubs: $props basic usage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let { name, age = 0 } = $props();
+        \\</script>
+        \\<p>{name} is {age} years old</p>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Props.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify $props declaration with default generic
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $props<T = $$Props>(): T;") != null);
+}
+
+test "rune stubs: $props with typed interface" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  interface ButtonProps {
+        \\    label: string;
+        \\    disabled?: boolean;
+        \\    onclick?: () => void;
+        \\  }
+        \\  let { label, disabled = false, onclick }: ButtonProps = $props();
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Button.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify the interface is used for $$Props
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type $$Props = ButtonProps;") != null);
+}
+
+test "rune stubs: $bindable for two-way binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let { value = $bindable('') } = $props();
+        \\</script>
+        \\<input bind:value />
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Input.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify $bindable declaration
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $bindable<T>(initial?: T): T;") != null);
+    // Verify usage is preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$bindable('')") != null);
+}
+
+test "rune stubs: $inspect for debugging" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let count = $state(0);
+        \\  $inspect(count);
+        \\  $inspect(count).with(console.log);
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Inspect.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify $inspect declaration with .with() chaining
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $inspect<T>(...values: T[]): { with: (fn: (type: 'init' | 'update', ...values: T[]) => void) => void };") != null);
+    // Verify usage
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$inspect(count)") != null);
+}
+
+test "rune stubs: $host for custom elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  const host = $host<HTMLDivElement>();
+        \\  $effect(() => {
+        \\    host.style.color = 'red';
+        \\  });
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "CustomElement.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify $host declaration with HTMLElement constraint
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $host<T extends HTMLElement>(): T;") != null);
+    // Verify usage
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$host<HTMLDivElement>()") != null);
+}
+
+test "rune stubs: all runes in single component" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  interface Props { initial?: number }
+        \\  
+        \\  let { initial = 0 }: Props = $props();
+        \\  let count = $state(initial);
+        \\  let doubled = $derived(count * 2);
+        \\  let expensive = $derived.by(() => count ** 10);
+        \\  
+        \\  $effect(() => {
+        \\    console.log(count);
+        \\  });
+        \\  
+        \\  $effect.pre(() => {
+        \\    // before DOM
+        \\  });
+        \\  
+        \\  $inspect(count, doubled);
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "AllRunes.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Verify all main rune declarations are present
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $derived") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $effect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $props") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $bindable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $inspect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $host") != null);
+
+    // Verify namespace declarations
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare namespace $state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare namespace $derived") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare namespace $effect") != null);
+}
+
 test "transform svelte 5 with generic $props" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
