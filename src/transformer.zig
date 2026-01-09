@@ -124,7 +124,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         try output.appendSlice(allocator, "// <script context=\"module\">\n");
         const raw_content = ast.source[script.content_start..script.content_end];
         const filtered = try filterSvelteImports(allocator, raw_content);
-        const content = try transformStoreSubscriptions(allocator, filtered);
+        const reactive_transformed = try transformReactiveStatements(allocator, filtered);
+        const content = try transformStoreSubscriptions(allocator, reactive_transformed);
 
         try mappings.append(allocator, .{
             .svelte_offset = script.content_start,
@@ -141,7 +142,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         try output.appendSlice(allocator, "// <script>\n");
         const raw_content = ast.source[script.content_start..script.content_end];
         const filtered = try filterSvelteImports(allocator, raw_content);
-        const content = try transformStoreSubscriptions(allocator, filtered);
+        const reactive_transformed = try transformReactiveStatements(allocator, filtered);
+        const content = try transformStoreSubscriptions(allocator, reactive_transformed);
 
         try mappings.append(allocator, .{
             .svelte_offset = script.content_start,
@@ -857,6 +859,138 @@ fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8
     return try result.toOwnedSlice(allocator);
 }
 
+/// Transforms Svelte reactive statements ($: x = expr) into valid TypeScript (let x = expr).
+/// Reactive statements in Svelte implicitly declare variables, but tsgo needs explicit declarations.
+/// Handles:
+/// - `$: doubled = value * 2` → `let doubled = value * 2`
+/// - `$: doubled: number = value * 2` → `let doubled: number = value * 2`
+/// Does NOT transform:
+/// - Reactive blocks: `$: { ... }` - left as-is (valid labeled statement)
+/// - Reactive expressions: `$: console.log(x)` - left as-is (valid labeled statement)
+fn transformReactiveStatements(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < content.len) {
+        // Skip strings
+        if (content[i] == '"' or content[i] == '\'' or content[i] == '`') {
+            const start = i;
+            i = skipStringForReactive(content, i);
+            try result.appendSlice(allocator, content[start..i]);
+            continue;
+        }
+
+        // Skip single-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
+            const start = i;
+            while (i < content.len and content[i] != '\n') : (i += 1) {}
+            try result.appendSlice(allocator, content[start..i]);
+            continue;
+        }
+
+        // Skip multi-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '*') {
+            const start = i;
+            i += 2;
+            while (i + 1 < content.len) {
+                if (content[i] == '*' and content[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            try result.appendSlice(allocator, content[start..i]);
+            continue;
+        }
+
+        // Look for $: at start of statement
+        if (content[i] == '$' and i + 1 < content.len and content[i + 1] == ':') {
+            // Check that we're at the start of a statement (only whitespace since line start)
+            const at_start = isAtStatementStart(content, i);
+
+            if (at_start) {
+                // Skip "$:" and any whitespace after it
+                var j = i + 2;
+                while (j < content.len and (content[j] == ' ' or content[j] == '\t')) : (j += 1) {}
+
+                // Check if this is an assignment: identifier (optional type annotation) =
+                if (j < content.len and isIdentStartChar(content[j])) {
+                    const ident_start = j;
+                    while (j < content.len and isIdentChar(content[j])) : (j += 1) {}
+
+                    // Skip whitespace
+                    while (j < content.len and (content[j] == ' ' or content[j] == '\t')) : (j += 1) {}
+
+                    // Check for optional type annotation; default to end of identifier
+                    var type_end = j;
+                    if (j < content.len and content[j] == ':') {
+                        j += 1;
+                        j = skipTypeAnnotation(content, j);
+                        type_end = j;
+                        while (j < content.len and (content[j] == ' ' or content[j] == '\t')) : (j += 1) {}
+                    }
+
+                    // Check for assignment
+                    if (j < content.len and content[j] == '=') {
+                        // This is `$: x = expr` or `$: x: type = expr`
+                        // Transform to `let x = expr` or `let x: type = expr`
+                        try result.appendSlice(allocator, "let ");
+                        try result.appendSlice(allocator, content[ident_start..type_end]);
+                        i = j; // Continue from the '='
+                        continue;
+                    }
+                }
+            }
+        }
+
+        try result.append(allocator, content[i]);
+        i += 1;
+    }
+
+    return try result.toOwnedSlice(allocator);
+}
+
+/// Checks if position i is at the start of a statement (only whitespace or statement
+/// boundary characters precede it on the current line)
+fn isAtStatementStart(content: []const u8, pos: usize) bool {
+    if (pos == 0) return true;
+
+    // Look backwards from pos to find if we're at statement start
+    var j = pos;
+    while (j > 0) {
+        j -= 1;
+        const c = content[j];
+        if (c == '\n' or c == ';' or c == '{' or c == '}') {
+            // Found statement boundary - we're at start
+            return true;
+        }
+        if (c != ' ' and c != '\t') {
+            // Found non-whitespace that isn't a boundary - not at start
+            return false;
+        }
+    }
+    // Reached start of content with only whitespace
+    return true;
+}
+
+fn skipStringForReactive(content: []const u8, start: usize) usize {
+    if (start >= content.len) return start;
+    const quote = content[start];
+    var i = start + 1;
+    while (i < content.len) {
+        if (content[i] == '\\' and i + 1 < content.len) {
+            i += 2;
+            continue;
+        }
+        if (content[i] == quote) {
+            return i + 1;
+        }
+        i += 1;
+    }
+    return i;
+}
+
 fn isIdentStartChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
 }
@@ -1376,4 +1510,63 @@ test "transform component with store subscriptions" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__svelte_store_get(page).url") != null);
     // Should NOT have untransformed $page
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$page.url") == null);
+}
+
+test "transform reactive statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  export let value: number = 0;
+        \\  
+        \\  $: doubled = value * 2;
+        \\  $: tripled = value * 3;
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Reactive.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should have transformed $: to let declarations
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let doubled = value * 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let tripled = value * 3") != null);
+    // Should NOT have raw $: labels anymore
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$: doubled") == null);
+}
+
+test "transform reactive statement with type annotation" {
+    const allocator = std.testing.allocator;
+
+    const input = "  $: count: number = value + 1;";
+    const result = try transformReactiveStatements(allocator, input);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("  let count: number = value + 1;", result);
+}
+
+test "transform reactive statement preserves blocks" {
+    const allocator = std.testing.allocator;
+
+    // Reactive blocks should be preserved as-is (valid labeled statement)
+    const input = "  $: { console.log(x); }";
+    const result = try transformReactiveStatements(allocator, input);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("  $: { console.log(x); }", result);
+}
+
+test "transform reactive statement preserves function calls" {
+    const allocator = std.testing.allocator;
+
+    // Reactive function calls should be preserved as-is
+    const input = "  $: console.log(x);";
+    const result = try transformReactiveStatements(allocator, input);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("  $: console.log(x);", result);
 }
