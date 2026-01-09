@@ -325,6 +325,20 @@ fn writeSvelteKitStubs(tmp_dir: std.fs.Dir) !void {
         \\  };
         \\}
         \\
+        \\// Vite import.meta.env ambient types
+        \\interface ImportMetaEnv {
+        \\  readonly MODE: string;
+        \\  readonly BASE_URL: string;
+        \\  readonly PROD: boolean;
+        \\  readonly DEV: boolean;
+        \\  readonly SSR: boolean;
+        \\  [key: string]: any;
+        \\}
+        \\
+        \\interface ImportMeta {
+        \\  readonly env: ImportMetaEnv;
+        \\}
+        \\
     );
 }
 
