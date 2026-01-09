@@ -46,7 +46,8 @@ After refactoring to run tsgo from the workspace root (instead of an isolated te
 
 ### What Doesn't Work (Yet)
 
-- **Vite virtual modules**: `~icons/*` and other Vite plugin virtual imports (~549 remaining errors, mostly from these)
+- **Vite virtual modules**: `~icons/*` and other Vite plugin virtual imports (~246 remaining "Cannot find module" errors)
+- **Package.json exports subpath patterns**: e.g., `@sourcegraph/amp-web-ui/components/button/storybook` (2 errors) - requires bundler-style resolution of complex exports patterns
 - **Some edge cases**: Complex type inference in certain Svelte 5 runes patterns
 
 ### Error Count Progress
@@ -55,6 +56,7 @@ After refactoring to run tsgo from the workspace root (instead of an isolated te
 |-------|--------|-------|
 | Initial (temp dir) | ~1600 | Module resolution broken for everything |
 | After workspace-root refactor | ~549 | Most are Vite virtual module failures |
+| Current | ~549 | 246 are `~icons/*`, 2 are subpath exports, rest are type errors |
 
 The remaining errors are primarily `~icons/*` imports from unplugin-icons, which generates virtual modules at build time. These would require either:
 1. Vite plugin integration (out of scope)
@@ -66,7 +68,7 @@ The performance comparison remains valid—the 7x speedup is real. The remaining
 
 1. ~~SvelteKit virtual modules ($app/environment, $app/stores) aren't resolved~~ **FIXED**
 2. ~~Svelte store auto-subscriptions ($storeName) aren't transformed~~ **FIXED**
-3. ~~Workspace package imports aren't resolved (@sourcegraph/*, etc.)~~ **FIXED**
+3. ~~Workspace package imports aren't resolved (@sourcegraph/*, etc.)~~ **FIXED** (main imports work; 2 complex subpath exports remain)
 4. Vite plugin virtual modules (`~icons/*`) aren't resolved (expected, out of scope)
 
 ## Raw Data
