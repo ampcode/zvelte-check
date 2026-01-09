@@ -55,6 +55,7 @@ pub const ScriptData = struct {
     content_end: u32,
     lang: ?[]const u8, // "ts" or null
     context: ?[]const u8, // "module" for <script context="module">
+    generics: ?[]const u8, // "T" or "T extends SomeType" for <script generics="T">
 };
 
 pub const StyleData = struct {
@@ -218,6 +219,7 @@ pub const Parser = struct {
             .content_end = content_end,
             .lang = attrs.lang,
             .context = attrs.context,
+            .generics = attrs.generics,
         });
 
         const node_idx: u32 = @intCast(ast.nodes.items.len);
@@ -638,6 +640,7 @@ pub const Parser = struct {
 const ScriptTagAttrs = struct {
     lang: ?[]const u8,
     context: ?[]const u8,
+    generics: ?[]const u8,
 };
 
 /// Parse svelte-ignore codes from a comment's content.
@@ -671,6 +674,7 @@ fn parseScriptTagAttrs(tag: []const u8) ScriptTagAttrs {
     var i: usize = 0;
     var lang: ?[]const u8 = null;
     var context: ?[]const u8 = null;
+    var generics: ?[]const u8 = null;
 
     // Skip "<script"
     while (i < tag.len and tag[i] != '>' and !std.ascii.isWhitespace(tag[i])) : (i += 1) {}
@@ -714,10 +718,12 @@ fn parseScriptTagAttrs(tag: []const u8) ScriptTagAttrs {
         } else if (std.mem.eql(u8, name, "module") and value == null) {
             // Svelte 5 bare `module` attribute: <script module>
             context = "module";
+        } else if (std.mem.eql(u8, name, "generics")) {
+            generics = value;
         }
     }
 
-    return .{ .lang = lang, .context = context };
+    return .{ .lang = lang, .context = context, .generics = generics };
 }
 
 test "parse simple svelte" {
@@ -782,6 +788,22 @@ test "parse script tag attributes" {
         try std.testing.expectEqualStrings("ts", attrs.lang.?);
         try std.testing.expectEqualStrings("module", attrs.context.?);
     }
+    // Test generics attribute
+    {
+        const attrs = parseScriptTagAttrs("<script lang=\"ts\" generics=\"T\">");
+        try std.testing.expectEqualStrings("ts", attrs.lang.?);
+        try std.testing.expectEqualStrings("T", attrs.generics.?);
+    }
+    // Test generics with extends constraint
+    {
+        const attrs = parseScriptTagAttrs("<script lang=\"ts\" generics=\"T extends SomeType\">");
+        try std.testing.expectEqualStrings("T extends SomeType", attrs.generics.?);
+    }
+    // Test multiple generic parameters
+    {
+        const attrs = parseScriptTagAttrs("<script lang=\"ts\" generics=\"T, U extends Record<string, T>\">");
+        try std.testing.expectEqualStrings("T, U extends Record<string, T>", attrs.generics.?);
+    }
 }
 
 test "parse typescript script" {
@@ -800,6 +822,33 @@ test "parse typescript script" {
 
     try std.testing.expectEqual(@as(usize, 1), ast.scripts.items.len);
     try std.testing.expectEqualStrings("ts", ast.scripts.items[0].lang.?);
+}
+
+test "parse script with generics attribute" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts" module>
+        \\  export type Item<T> = { value: T };
+        \\</script>
+        \\
+        \\<script lang="ts" generics="T">
+        \\  let items: T[] = [];
+        \\</script>
+    ;
+
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    try std.testing.expectEqual(@as(usize, 2), ast.scripts.items.len);
+    // Module script
+    try std.testing.expectEqualStrings("module", ast.scripts.items[0].context.?);
+    try std.testing.expect(ast.scripts.items[0].generics == null);
+    // Instance script with generics
+    try std.testing.expect(ast.scripts.items[1].context == null);
+    try std.testing.expectEqualStrings("T", ast.scripts.items[1].generics.?);
 }
 
 test "parse module script" {

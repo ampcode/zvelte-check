@@ -140,6 +140,12 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Emit instance script content (if any)
     if (instance_script) |script| {
         try output.appendSlice(allocator, "// <script>\n");
+
+        // Emit generic type declarations if present (Svelte 5 generics="T" attribute)
+        if (script.generics) |generics| {
+            try emitGenericTypeDeclarations(allocator, &output, generics);
+        }
+
         const raw_content = ast.source[script.content_start..script.content_end];
         const filtered = try filterSvelteImports(allocator, raw_content);
         const reactive_transformed = try transformReactiveStatements(allocator, filtered);
@@ -626,6 +632,78 @@ const SnippetNameInfo = struct {
     params: ?[]const u8,
     offset: u32,
 };
+
+/// Emits type declarations for generic parameters from Svelte 5 generics="..." attribute.
+/// Parses comma-separated generic parameters and emits each as a type declaration.
+/// Examples:
+/// - "T" → "type T = unknown;"
+/// - "T extends Foo" → "type T = Foo;"
+/// - "T, U" → "type T = unknown;\ntype U = unknown;"
+/// - "T extends Foo, U extends Bar" → "type T = Foo;\ntype U = Bar;"
+fn emitGenericTypeDeclarations(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    generics: []const u8,
+) !void {
+    var i: usize = 0;
+
+    while (i < generics.len) {
+        // Skip whitespace
+        while (i < generics.len and std.ascii.isWhitespace(generics[i])) : (i += 1) {}
+        if (i >= generics.len) break;
+
+        // Parse generic parameter name
+        const name_start = i;
+        while (i < generics.len and std.ascii.isAlphanumeric(generics[i])) : (i += 1) {}
+        const name = generics[name_start..i];
+
+        if (name.len == 0) {
+            // Skip unexpected characters
+            i += 1;
+            continue;
+        }
+
+        // Skip whitespace
+        while (i < generics.len and std.ascii.isWhitespace(generics[i])) : (i += 1) {}
+
+        // Check for "extends" constraint
+        var constraint: []const u8 = "unknown";
+        if (i + 7 <= generics.len and std.mem.eql(u8, generics[i .. i + 7], "extends")) {
+            i += 7;
+            // Skip whitespace after "extends"
+            while (i < generics.len and std.ascii.isWhitespace(generics[i])) : (i += 1) {}
+
+            // Parse constraint type (until comma or end, handling < > for generics)
+            const constraint_start = i;
+            var angle_depth: u32 = 0;
+            while (i < generics.len) {
+                const c = generics[i];
+                if (c == '<') {
+                    angle_depth += 1;
+                } else if (c == '>') {
+                    if (angle_depth > 0) angle_depth -= 1;
+                } else if (c == ',' and angle_depth == 0) {
+                    break;
+                }
+                i += 1;
+            }
+            constraint = std.mem.trim(u8, generics[constraint_start..i], " \t\n\r");
+        }
+
+        // Emit type declaration
+        try output.appendSlice(allocator, "type ");
+        try output.appendSlice(allocator, name);
+        try output.appendSlice(allocator, " = ");
+        try output.appendSlice(allocator, constraint);
+        try output.appendSlice(allocator, ";\n");
+
+        // Skip comma if present
+        while (i < generics.len and std.ascii.isWhitespace(generics[i])) : (i += 1) {}
+        if (i < generics.len and generics[i] == ',') {
+            i += 1;
+        }
+    }
+}
 
 /// Extracts template expressions from the AST and emits them as TypeScript
 /// statements for type-checking. Handles:
@@ -2737,4 +2815,96 @@ test "const tag with template literal" {
 
     // Template literal should be complete with closing backtick
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var label = `Item ${item.id}`;") != null);
+}
+
+test "emit generic type declarations - single" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var output: std.ArrayList(u8) = .empty;
+    try emitGenericTypeDeclarations(allocator, &output, "T");
+
+    try std.testing.expectEqualStrings("type T = unknown;\n", output.items);
+}
+
+test "emit generic type declarations - with extends" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var output: std.ArrayList(u8) = .empty;
+    try emitGenericTypeDeclarations(allocator, &output, "T extends SomeType");
+
+    try std.testing.expectEqualStrings("type T = SomeType;\n", output.items);
+}
+
+test "emit generic type declarations - multiple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var output: std.ArrayList(u8) = .empty;
+    try emitGenericTypeDeclarations(allocator, &output, "T, U extends Bar");
+
+    try std.testing.expectEqualStrings("type T = unknown;\ntype U = Bar;\n", output.items);
+}
+
+test "emit generic type declarations - complex constraint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var output: std.ArrayList(u8) = .empty;
+    try emitGenericTypeDeclarations(allocator, &output, "T extends Record<string, number>");
+
+    try std.testing.expectEqualStrings("type T = Record<string, number>;\n", output.items);
+}
+
+test "transform with generics attribute" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts" generics="T extends SomeInterface">
+        \\    let value: T;
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Generic.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should have generic type declaration
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "type T = SomeInterface;") != null);
+}
+
+test "transform with module and instance generics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts" module>
+        \\    export type ComboboxItem<T> = { id: string; value: T; label: string }
+        \\</script>
+        \\
+        \\<script lang="ts" generics="T">
+        \\    let items: ComboboxItem<T>[] = [];
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Combobox.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should have generic type declaration for T
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "type T = unknown;") != null);
+    // Should also have the module script content
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type ComboboxItem<T>") != null);
 }
