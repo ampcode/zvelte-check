@@ -3182,3 +3182,531 @@ test "transform with renamed $props has only one default export" {
     }
     try std.testing.expectEqual(@as(usize, 1), count);
 }
+
+// ============================================================================
+// Event Handler Tests
+// ============================================================================
+
+test "event handler: on:click directive with function reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let count = $state(0);
+        \\  
+        \\  function handleClick(event: MouseEvent) {
+        \\    count++;
+        \\  }
+        \\</script>
+        \\
+        \\<button on:click={handleClick}>Count: {count}</button>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Button.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Event handler function should be preserved in script
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleClick(event: MouseEvent)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "count++") != null);
+    // Component class should be generated
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "class __SvelteComponent__ extends SvelteComponentTyped") != null);
+}
+
+test "event handler: on:click with inline arrow function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let count = $state(0);
+        \\</script>
+        \\
+        \\<button on:click={() => count++}>Increment</button>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Counter.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Script content should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let count = $state(0)") != null);
+    // $state rune stub should be declared
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state<T = undefined>(initial?: T): T;") != null);
+}
+
+test "event handler: on:change for input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let value = $state("");
+        \\  
+        \\  function handleChange(event: Event) {
+        \\    const target = event.target as HTMLInputElement;
+        \\    value = target.value;
+        \\  }
+        \\</script>
+        \\
+        \\<input on:change={handleChange} />
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Input.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Handler function and type assertion should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleChange(event: Event)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "event.target as HTMLInputElement") != null);
+}
+
+test "event handler: multiple events on same element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  function handleMouseEnter() { console.log('enter'); }
+        \\  function handleMouseLeave() { console.log('leave'); }
+        \\  function handleClick() { console.log('click'); }
+        \\</script>
+        \\
+        \\<div on:mouseenter={handleMouseEnter} on:mouseleave={handleMouseLeave} on:click={handleClick}>
+        \\  Hover me
+        \\</div>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Hover.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // All handlers should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleMouseEnter()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleMouseLeave()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleClick()") != null);
+}
+
+test "event handler: Svelte 5 onclick attribute" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let count = $state(0);
+        \\</script>
+        \\
+        \\<button onclick={() => count++}>Svelte 5 style</button>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Button5.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Svelte 5 uses regular onclick attributes
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let count = $state(0)") != null);
+}
+
+test "event handler: with event modifiers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  function handleSubmit(event: Event) {
+        \\    // Form submitted
+        \\  }
+        \\</script>
+        \\
+        \\<form on:submit|preventDefault={handleSubmit}>
+        \\  <button type="submit">Submit</button>
+        \\</form>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Form.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Handler should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleSubmit(event: Event)") != null);
+}
+
+// ============================================================================
+// Binding Tests
+// ============================================================================
+
+test "binding: bind:value on text input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let name = $state("");
+        \\</script>
+        \\
+        \\<input type="text" bind:value={name} placeholder="Enter name" />
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "NameInput.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // State should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let name = $state(\"\")") != null);
+}
+
+test "binding: bind:value shorthand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let value = $state("");
+        \\</script>
+        \\
+        \\<input bind:value />
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Shorthand.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Shorthand binding should work
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let value = $state(\"\")") != null);
+}
+
+test "binding: bind:checked on checkbox" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let accepted = $state(false);
+        \\</script>
+        \\
+        \\<label>
+        \\  <input type="checkbox" bind:checked={accepted} />
+        \\  Accept terms
+        \\</label>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Checkbox.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Boolean state should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let accepted = $state(false)") != null);
+}
+
+test "binding: bind:group for radio buttons" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let selected = $state<string | null>(null);
+        \\</script>
+        \\
+        \\<label>
+        \\  <input type="radio" bind:group={selected} value="a" />
+        \\  Option A
+        \\</label>
+        \\<label>
+        \\  <input type="radio" bind:group={selected} value="b" />
+        \\  Option B
+        \\</label>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "RadioGroup.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Generic state type should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let selected = $state<string | null>(null)") != null);
+}
+
+test "binding: bind:group for checkboxes (array)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let flavors = $state<string[]>([]);
+        \\</script>
+        \\
+        \\<label>
+        \\  <input type="checkbox" bind:group={flavors} value="chocolate" />
+        \\  Chocolate
+        \\</label>
+        \\<label>
+        \\  <input type="checkbox" bind:group={flavors} value="vanilla" />
+        \\  Vanilla
+        \\</label>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Flavors.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Array state type should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let flavors = $state<string[]>([])") != null);
+}
+
+test "binding: bind:this for element reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let canvas: HTMLCanvasElement;
+        \\  
+        \\  $effect(() => {
+        \\    const ctx = canvas?.getContext('2d');
+        \\    if (ctx) {
+        \\      ctx.fillRect(0, 0, 100, 100);
+        \\    }
+        \\  });
+        \\</script>
+        \\
+        \\<canvas bind:this={canvas}></canvas>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Canvas.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Element reference type should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let canvas: HTMLCanvasElement") != null);
+    // Effect using the reference should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "canvas?.getContext('2d')") != null);
+}
+
+test "binding: multiple bindings on same element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let value = $state("");
+        \\  let inputEl: HTMLInputElement;
+        \\</script>
+        \\
+        \\<input bind:value={value} bind:this={inputEl} />
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "MultiBinding.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Both bindings should be supported
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let value = $state(\"\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let inputEl: HTMLInputElement") != null);
+}
+
+// ============================================================================
+// Two-way Binding with $bindable Tests
+// ============================================================================
+
+test "two-way binding: $bindable prop with bind:value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let { value = $bindable("") } = $props<{ value?: string }>();
+        \\</script>
+        \\
+        \\<input bind:value={value} />
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "BindableInput.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // $bindable declaration and usage should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $bindable<T>(initial?: T): T;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$bindable(\"\")") != null);
+}
+
+test "two-way binding: component with bindable checked" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  interface Props {
+        \\    checked?: boolean;
+        \\  }
+        \\  
+        \\  let { checked = $bindable(false) }: Props = $props();
+        \\</script>
+        \\
+        \\<input type="checkbox" bind:checked={checked} />
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "BindableCheckbox.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Interface and bindable usage should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "interface Props") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$bindable(false)") != null);
+}
+
+// ============================================================================
+// Combined Event + Binding Tests
+// ============================================================================
+
+test "combined: input with both event and binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let value = $state("");
+        \\  
+        \\  function handleKeydown(event: KeyboardEvent) {
+        \\    if (event.key === 'Enter') {
+        \\      console.log('Submitted:', value);
+        \\    }
+        \\  }
+        \\</script>
+        \\
+        \\<input bind:value={value} on:keydown={handleKeydown} />
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "SearchInput.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Both state and handler should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let value = $state(\"\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleKeydown(event: KeyboardEvent)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "event.key === 'Enter'") != null);
+}
+
+test "combined: form with submit handler and multiple bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let email = $state("");
+        \\  let password = $state("");
+        \\  let rememberMe = $state(false);
+        \\  
+        \\  function handleSubmit(event: Event) {
+        \\    event.preventDefault();
+        \\    console.log({ email, password, rememberMe });
+        \\  }
+        \\</script>
+        \\
+        \\<form on:submit={handleSubmit}>
+        \\  <input type="email" bind:value={email} />
+        \\  <input type="password" bind:value={password} />
+        \\  <input type="checkbox" bind:checked={rememberMe} />
+        \\  <button type="submit">Login</button>
+        \\</form>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "LoginForm.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // All state and handlers should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let email = $state(\"\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let password = $state(\"\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let rememberMe = $state(false)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleSubmit(event: Event)") != null);
+}
+
+test "combined: select with bind:value and on:change" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  type Option = { value: string; label: string };
+        \\  
+        \\  let selected = $state("");
+        \\  let options: Option[] = [
+        \\    { value: "a", label: "Option A" },
+        \\    { value: "b", label: "Option B" },
+        \\  ];
+        \\  
+        \\  function handleChange() {
+        \\    console.log('Selected:', selected);
+        \\  }
+        \\</script>
+        \\
+        \\<select bind:value={selected} on:change={handleChange}>
+        \\  {#each options as opt}
+        \\    <option value={opt.value}>{opt.label}</option>
+        \\  {/each}
+        \\</select>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Select.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Type, state, and handler should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "type Option = { value: string; label: string }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let selected = $state(\"\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleChange()") != null);
+}
