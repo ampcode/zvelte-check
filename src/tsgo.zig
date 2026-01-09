@@ -486,6 +486,10 @@ fn parseTsgoOutput(
         const msg_start = std.mem.indexOf(u8, trimmed, ": ");
         const message = if (msg_start) |s| trimmed[s + 2 ..] else trimmed;
 
+        // Skip errors about Svelte types that users import themselves
+        // These appear when module scripts reference types before user imports
+        if (shouldSkipSvelteTypeError(message)) continue;
+
         try diagnostics.append(allocator, .{
             .source = .js,
             .severity = if (is_error) .@"error" else .warning,
@@ -498,6 +502,25 @@ fn parseTsgoOutput(
             .end_col = svelte_col,
         });
     }
+}
+
+/// Returns true if the error message is about a Svelte type that users
+/// typically import themselves. These errors occur when module scripts
+/// reference Svelte types (like Component, ComponentProps) that are
+/// imported in the instance script, which appears later in generated code.
+fn shouldSkipSvelteTypeError(message: []const u8) bool {
+    // Svelte types that users commonly import and use in module scripts
+    const svelte_types = [_][]const u8{
+        "Cannot find name 'Component'.",
+        "Cannot find name 'ComponentProps'.",
+        "Cannot find name 'ComponentType'.",
+        "Cannot find name 'SvelteComponent'.",
+    };
+
+    for (svelte_types) |pattern| {
+        if (std.mem.eql(u8, message, pattern)) return true;
+    }
+    return false;
 }
 
 test "parse tsgo output" {
