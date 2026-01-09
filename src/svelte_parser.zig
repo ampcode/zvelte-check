@@ -711,6 +711,9 @@ fn parseScriptTagAttrs(tag: []const u8) ScriptTagAttrs {
             lang = value;
         } else if (std.mem.eql(u8, name, "context")) {
             context = value;
+        } else if (std.mem.eql(u8, name, "module") and value == null) {
+            // Svelte 5 bare `module` attribute: <script module>
+            context = "module";
         }
     }
 
@@ -766,6 +769,18 @@ test "parse script tag attributes" {
     {
         const attrs = parseScriptTagAttrs("<script lang='ts'>");
         try std.testing.expectEqualStrings("ts", attrs.lang.?);
+    }
+    // Test Svelte 5 bare module attribute
+    {
+        const attrs = parseScriptTagAttrs("<script module>");
+        try std.testing.expect(attrs.lang == null);
+        try std.testing.expectEqualStrings("module", attrs.context.?);
+    }
+    // Test Svelte 5 bare module with lang
+    {
+        const attrs = parseScriptTagAttrs("<script lang=\"ts\" module>");
+        try std.testing.expectEqualStrings("ts", attrs.lang.?);
+        try std.testing.expectEqualStrings("module", attrs.context.?);
     }
 }
 
