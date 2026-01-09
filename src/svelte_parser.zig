@@ -1664,3 +1664,380 @@ test "parse multiple void elements in sequence" {
     try std.testing.expectEqual(@as(u32, 2), br_count);
     try std.testing.expectEqual(@as(u32, 1), hr_count);
 }
+
+// === Regex Literal Edge Cases ===
+// These tests verify the parser handles expressions containing regex literals correctly.
+// The parser doesn't interpret JS expressions deeply but must not be confused by regex syntax.
+
+test "parse simple regex literal in expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{value.match(/test/)}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_expression = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .expression) {
+            found_expression = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_expression);
+}
+
+test "parse regex with flags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{value.replace(/test/gi, 'REPLACED')}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_expression = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .expression) {
+            found_expression = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_expression);
+}
+
+test "parse regex with quantifier braces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Regex {n,m} quantifiers should not confuse brace counting
+    const source =
+        \\{value.match(/\d{2,4}/)}
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_expression = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .expression) {
+            found_expression = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_expression);
+}
+
+test "parse regex with character class containing special chars" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Character classes can contain } and ) without closing the expression
+    const source = "{value.match(/[{}]+/)}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_expression = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .expression) {
+            found_expression = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_expression);
+}
+
+test "parse regex with escaped slash" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\{value.match(/path\/to\/file/)}
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_expression = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .expression) {
+            found_expression = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_expression);
+}
+
+test "parse const with regex match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // @const with regex from svelte-check-rs issue #46
+    const source = "{#if true}{@const [, label] = value.match(/^(.+?)\\s*\\(([^)]+)\\)$/) ?? [, value, ``]}{label}{/if}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_const = false;
+    var found_if = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .const_tag) found_const = true;
+        if (node.kind == .if_block) found_if = true;
+    }
+    try std.testing.expect(found_const);
+    try std.testing.expect(found_if);
+}
+
+test "parse const with regex test" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{#if true}{@const matches = /rgba\\([^)]+\\)$/.test(color)}{matches}{/if}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_const = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .const_tag) {
+            found_const = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_const);
+}
+
+test "parse snippet with const regex" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\{#snippet tooltip({ x })}
+        \\    {@const match = x.match(/test/)}
+        \\    <span>{match}</span>
+        \\{/snippet}
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_snippet = false;
+    var found_const = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .snippet) found_snippet = true;
+        if (node.kind == .const_tag) found_const = true;
+    }
+    try std.testing.expect(found_snippet);
+    try std.testing.expect(found_const);
+}
+
+test "parse const arrow function with regex" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Arrow function containing regex
+    const source = "{#if true}{@const check = (s: string): boolean => /test/.test(s)}{check('x')}{/if}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_const = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .const_tag) {
+            found_const = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_const);
+}
+
+test "parse const iife with regex" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // IIFE containing regex
+    const source = "{#if true}{@const result = (() => { return /test/.test(x); })()}{result}{/if}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_const = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .const_tag) {
+            found_const = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_const);
+}
+
+test "parse division not confused with regex" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Division should parse correctly (not as regex)
+    const source = "{(a + b) / 2}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_expression = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .expression) {
+            found_expression = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_expression);
+}
+
+test "parse regex in template literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Regex inside template literal
+    const source = "{`result: ${/test/.test(x)}`}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_expression = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .expression) {
+            found_expression = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_expression);
+}
+
+test "parse regex with colons" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Regex with colons should not confuse the parser
+    const source =
+        \\<script lang="ts">
+        \\    const timeRegex = /\d{2}:\d{2}:\d{2}/;
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    try std.testing.expectEqual(@as(usize, 1), ast.scripts.items.len);
+}
+
+test "parse regex in each block filter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\{#each items.filter(x => /test/.test(x)) as item}
+        \\    <span>{item}</span>
+        \\{/each}
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_each = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .each_block) {
+            found_each = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_each);
+}
+
+test "parse multiple regex in expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Multiple regex patterns in one expression
+    const source = "{[/a/, /b/, /c/]}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_expression = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .expression) {
+            found_expression = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_expression);
+}
+
+test "parse regex in ternary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{true ? /yes/ : /no/}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_expression = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .expression) {
+            found_expression = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_expression);
+}
+
+test "parse regex after logical operator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{false || /fallback/.test(value)}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_expression = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .expression) {
+            found_expression = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_expression);
+}
+
+test "parse complex snippet with multiple const and regex" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Complex case from svelte-check-rs issue #46
+    const source =
+        \\<div class="parent">
+        \\  {#snippet tooltip({ x, y_formatted }: { x: number; y_formatted: string })}
+        \\    {@const [, y_label, y_unit] = y_label_full.match(/^(.+?)\s*\(([^)]+)\)$/) ??
+        \\      [, y_label_full, ``]}
+        \\    {@const segment = Object.entries(x_positions ?? {}).find(([, [start, end]]) =>
+        \\      x >= start && x <= end
+        \\    )}
+        \\    <span>{y_label}: {y_formatted} {y_unit}</span>
+        \\  {/snippet}
+        \\</div>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_snippet = false;
+    var const_count: u32 = 0;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .snippet) found_snippet = true;
+        if (node.kind == .const_tag) const_count += 1;
+    }
+    try std.testing.expect(found_snippet);
+    try std.testing.expectEqual(@as(u32, 2), const_count);
+}
