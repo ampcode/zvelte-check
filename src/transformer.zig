@@ -807,12 +807,11 @@ fn emitTemplateExpressions(
                     try output.appendSlice(allocator, ";\n");
                 }
             },
-            .if_block, .await_block, .key_block, .render => {
+            .if_block, .await_block, .key_block => {
                 const expr_info = switch (node.kind) {
                     .if_block => extractIfExpression(ast.source, node.start, node.end),
                     .await_block => extractAwaitExpression(ast.source, node.start, node.end),
                     .key_block => extractKeyExpression(ast.source, node.start, node.end),
-                    .render => extractRenderExpression(ast.source, node.start, node.end),
                     else => null,
                 };
 
