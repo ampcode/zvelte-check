@@ -75,9 +75,9 @@
 {#if isOpen}
     <nav aria-label="Main navigation">
         <ul role="menu">
-            <li role="menuitem"><a href="/home">Home</a></li>
-            <li role="menuitem"><a href="/products">Products</a></li>
-            <li role="menuitem"><a href="/contact">Contact</a></li>
+            <li role="none"><a role="menuitem" href="/home">Home</a></li>
+            <li role="none"><a role="menuitem" href="/products">Products</a></li>
+            <li role="none"><a role="menuitem" href="/contact">Contact</a></li>
         </ul>
     </nav>
 {/if}
