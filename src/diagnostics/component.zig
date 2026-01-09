@@ -117,6 +117,7 @@ fn checkInvalidRuneUsage(
 
 /// Checks if text contains a rune call (e.g., "$state(") with proper boundaries.
 /// Returns the position of the rune if found, null otherwise.
+/// Excludes matches inside string literals.
 fn containsRuneCall(text: []const u8, rune: []const u8) ?u32 {
     var search_start: usize = 0;
 
@@ -137,10 +138,36 @@ fn containsRuneCall(text: []const u8, rune: []const u8) ?u32 {
             }
         }
 
+        // Check if position is inside a string literal
+        if (isInsideString(text, pos)) {
+            search_start = pos + 1;
+            continue;
+        }
+
         return @intCast(pos);
     }
 
     return null;
+}
+
+/// Checks if a position in text is inside a string literal.
+/// Scans from the beginning, tracking string state.
+fn isInsideString(text: []const u8, target_pos: usize) bool {
+    var i: usize = 0;
+    while (i < target_pos and i < text.len) {
+        const c = text[i];
+        if (c == '"' or c == '\'' or c == '`') {
+            const string_end = skipString(text, i);
+            // If target position is within this string, it's inside
+            if (target_pos > i and target_pos < string_end) {
+                return true;
+            }
+            i = string_end;
+        } else {
+            i += 1;
+        }
+    }
+    return false;
 }
 
 fn checkUnusedExportLet(
