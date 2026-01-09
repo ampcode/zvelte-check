@@ -59,6 +59,17 @@ defer writer.flush() catch {};
 try writer.print("hello {s}\n", .{"world"});
 ```
 
+**File Writer (buffered):**
+```zig
+const file = try dir.createFile("output.txt", .{});
+defer file.close();
+
+var buf: [4096]u8 = undefined;
+var writer = file.writer(&buf);
+defer writer.end() catch {};
+try writer.interface.writeAll("content");
+```
+
 **build.zig executable/test:**
 ```zig
 b.addExecutable(.{
