@@ -72,13 +72,17 @@ pub fn check(
 
     try child.spawn();
 
-    const stdout = try child.stdout.?.readToEndAlloc(allocator, 10 * 1024 * 1024);
-    defer allocator.free(stdout);
+    // Collect stdout/stderr concurrently to avoid pipe deadlock
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
 
-    const stderr = try child.stderr.?.readToEndAlloc(allocator, 10 * 1024 * 1024);
-    defer allocator.free(stderr);
-
+    try child.collectOutput(allocator, &stdout_buf, &stderr_buf, 10 * 1024 * 1024);
     const result = try child.wait();
+
+    const stdout = stdout_buf.items;
+    const stderr = stderr_buf.items;
 
     // Clean up generated files before parsing output
     cleanupGeneratedFiles(workspace_dir, generated_files.items);
@@ -108,11 +112,7 @@ pub fn check(
 fn writeVirtualFile(workspace_dir: std.fs.Dir, relative_path: []const u8, content: []const u8) !void {
     const file = try workspace_dir.createFile(relative_path, .{});
     defer file.close();
-
-    var buf: [4096]u8 = undefined;
-    var writer = file.writer(&buf);
-    defer writer.end() catch {};
-    try writer.interface.writeAll(content);
+    try file.writeAll(content);
 }
 
 /// Strips workspace prefix from a path to get a relative path.
@@ -150,7 +150,7 @@ fn writeGeneratedTsconfig(
 
     var buf: [4096]u8 = undefined;
     var writer = file.writer(&buf);
-    defer writer.end() catch {};
+    errdefer writer.end() catch {};
     const w = &writer.interface;
 
     try w.writeAll("{\n");
@@ -177,11 +177,12 @@ fn writeGeneratedTsconfig(
     try w.writeAll("    \"noUnusedParameters\": false\n");
     try w.writeAll("  },\n");
 
-    // Include only our generated files
+    // Include our generated files plus all .ts files they may import
     try w.writeAll("  \"include\": [\n");
     try w.writeAll("    \"");
     try w.writeAll(generated_stubs);
-    try w.writeAll("\"");
+    try w.writeAll("\",\n");
+    try w.writeAll("    \"src/**/*.ts\"");
 
     for (virtual_files) |vf| {
         // Strip workspace prefix from virtual_path to get relative path
@@ -197,6 +198,8 @@ fn writeGeneratedTsconfig(
     // Exclude node_modules to avoid scanning everything
     try w.writeAll("  \"exclude\": [\"node_modules\"]\n");
     try w.writeAll("}\n");
+
+    try w.flush();
 }
 
 /// Writes SvelteKit virtual module type stubs to the workspace.
@@ -207,7 +210,7 @@ fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
 
     var buf: [4096]u8 = undefined;
     var writer = file.writer(&buf);
-    defer writer.end() catch {};
+    errdefer writer.end() catch {};
 
     try writer.interface.writeAll(
         \\// SvelteKit virtual module type stubs
@@ -479,6 +482,8 @@ fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
         \\}
         \\
     );
+
+    try writer.interface.flush();
 }
 
 fn parseTsgoOutput(
@@ -614,6 +619,8 @@ test "writeGeneratedTsconfig generates valid config" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"include\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "src/routes/+page.svelte.ts") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"exclude\"") != null);
+    // Verify .ts files are included for imports from .svelte files
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"src/**/*.ts\"") != null);
 }
 
 test "writeGeneratedTsconfig extends project config when available" {

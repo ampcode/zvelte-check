@@ -787,8 +787,14 @@ fn emitSnippetParamDeclarations(
                 while (i < params.len) {
                     const c = params[i];
                     if (c == '<' or c == '(' or c == '[' or c == '{') depth += 1;
-                    if ((c == '>' or c == ')' or c == ']' or c == '}') and depth > 0) depth -= 1;
-                    if (depth == 0 and (c == ',' or c == ')' or c == '=')) break;
+                    if (c == '>' or c == ')' or c == ']' or c == '}') {
+                        if (depth > 0) {
+                            depth -= 1;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    if (depth == 0 and (c == ',' or c == '=')) break;
                     i += 1;
                 }
                 type_annotation = std.mem.trim(u8, params[type_start..i], " \t\n\r");
@@ -2354,6 +2360,30 @@ test "transform snippet with params" {
     // Should have param declarations with types
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name: string;") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var age: number;") != null);
+}
+
+test "transform snippet with import type param" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\</script>
+        \\{#snippet shortcut(key: import('svelte').Snippet | string, label: string)}
+        \\  <span>{label}</span>
+        \\{/snippet}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should handle import() types with parentheses correctly
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var key: import('svelte').Snippet | string;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var label: string;") != null);
 }
 
 test "transform const binding" {
