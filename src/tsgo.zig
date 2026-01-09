@@ -1,14 +1,17 @@
 //! tsgo runner - spawns tsgo for TypeScript type-checking
 //!
-//! Writes virtual files to temp dir, runs tsgo, parses output.
-//! Generates a temporary tsconfig.json that extends the project's config
-//! to inherit path aliases ($lib, $app, etc.) for module resolution.
+//! Writes transformed .svelte.ts files alongside their .svelte sources,
+//! generates a tsconfig that extends the project's config, runs tsgo
+//! from the workspace root for proper module resolution, then cleans up.
 
 const std = @import("std");
 const VirtualFile = @import("transformer.zig").VirtualFile;
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
 const SourceMap = @import("source_map.zig").SourceMap;
 const LineTable = @import("source_map.zig").LineTable;
+
+const generated_tsconfig = ".svelte-check-tsconfig.json";
+const generated_stubs = ".svelte-check-stubs.d.ts";
 
 pub fn check(
     allocator: std.mem.Allocator,
@@ -18,26 +21,33 @@ pub fn check(
 ) ![]Diagnostic {
     if (virtual_files.len == 0) return &.{};
 
-    // Create temp directory for virtual files
-    var tmp_dir = try std.fs.cwd().makeOpenPath(".svelte-check-zig-tmp", .{});
-    defer {
-        std.fs.cwd().deleteTree(".svelte-check-zig-tmp") catch {};
-    }
-    defer tmp_dir.close();
+    // Open workspace directory for writing generated files
+    var workspace_dir = try std.fs.cwd().openDir(workspace_path, .{});
+    defer workspace_dir.close();
 
-    // Write virtual files
+    // Track generated files for cleanup
+    var generated_files: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (generated_files.items) |path| {
+            allocator.free(path);
+        }
+        generated_files.deinit(allocator);
+    }
+    errdefer cleanupGeneratedFiles(workspace_dir, generated_files.items);
+
+    // Write transformed .svelte.ts files alongside .svelte sources
     for (virtual_files) |vf| {
-        const basename = std.fs.path.basename(vf.virtual_path);
-        const file = try tmp_dir.createFile(basename, .{});
-        defer file.close();
-        try file.writeAll(vf.content);
+        try writeVirtualFile(workspace_dir, vf);
+        try generated_files.append(allocator, try allocator.dupe(u8, vf.virtual_path));
     }
 
     // Write SvelteKit ambient type stubs
-    try writeSvelteKitStubs(tmp_dir);
+    try writeSvelteKitStubs(workspace_dir);
+    try generated_files.append(allocator, try allocator.dupe(u8, generated_stubs));
 
-    // Generate tsconfig.json in temp dir that extends the project's config
-    const has_project_config = try writeTempTsconfig(allocator, tmp_dir, workspace_path, tsconfig_path, virtual_files);
+    // Generate tsconfig that extends project config and includes only our files
+    try writeGeneratedTsconfig(allocator, workspace_dir, tsconfig_path, virtual_files);
+    try generated_files.append(allocator, try allocator.dupe(u8, generated_tsconfig));
 
     // Build tsgo command
     var args: std.ArrayList([]const u8) = .empty;
@@ -45,24 +55,17 @@ pub fn check(
 
     try args.append(allocator, "tsgo");
     try args.append(allocator, "--noEmit");
+    try args.append(allocator, "--project");
 
-    if (has_project_config) {
-        // Use project mode to pick up path aliases
-        try args.append(allocator, "--project");
-        try args.append(allocator, ".svelte-check-zig-tmp/tsconfig.json");
-    } else {
-        // No tsconfig - pass files directly
-        for (virtual_files) |vf| {
-            const basename = std.fs.path.basename(vf.virtual_path);
-            const tmp_path = try std.fs.path.join(allocator, &.{ ".svelte-check-zig-tmp", basename });
-            try args.append(allocator, try allocator.dupe(u8, tmp_path));
-        }
-    }
+    const tsconfig_abs = try std.fs.path.join(allocator, &.{ workspace_path, generated_tsconfig });
+    defer allocator.free(tsconfig_abs);
+    try args.append(allocator, tsconfig_abs);
 
-    // Run tsgo
+    // Run tsgo from workspace root for proper module resolution
     var child = std.process.Child.init(args.items, allocator);
     child.stderr_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
+    child.cwd = workspace_path;
 
     try child.spawn();
 
@@ -74,11 +77,13 @@ pub fn check(
 
     const result = try child.wait();
 
+    // Clean up generated files before parsing output
+    cleanupGeneratedFiles(workspace_dir, generated_files.items);
+
     // Parse tsgo output
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     errdefer diagnostics.deinit(allocator);
 
-    // tsgo outputs diagnostics to stdout, not stderr
     const has_output = stdout.len > 0 or stderr.len > 0;
     const exited_with_error = switch (result) {
         .Exited => |code| code != 0,
@@ -86,9 +91,7 @@ pub fn check(
     };
 
     if (exited_with_error or has_output) {
-        // tsgo outputs to stdout
         try parseTsgoOutput(allocator, stdout, virtual_files, &diagnostics);
-        // Also check stderr for any errors
         if (stderr.len > 0) {
             try parseTsgoOutput(allocator, stderr, virtual_files, &diagnostics);
         }
@@ -97,53 +100,46 @@ pub fn check(
     return diagnostics.toOwnedSlice(allocator);
 }
 
-/// Generates a tsconfig.json in the temp directory.
-/// If a project tsconfig exists, extends it to inherit path aliases.
-/// Returns true if a tsconfig was written.
-fn writeTempTsconfig(
+/// Writes a transformed .svelte.ts file alongside its .svelte source.
+fn writeVirtualFile(workspace_dir: std.fs.Dir, vf: VirtualFile) !void {
+    const file = try workspace_dir.createFile(vf.virtual_path, .{});
+    defer file.close();
+    try file.writeAll(vf.content);
+}
+
+/// Cleans up generated .svelte.ts files and tsconfig.
+fn cleanupGeneratedFiles(workspace_dir: std.fs.Dir, paths: []const []const u8) void {
+    for (paths) |path| {
+        workspace_dir.deleteFile(path) catch {};
+    }
+}
+
+/// Generates a tsconfig that extends the project's config.
+/// Includes only transformed .svelte.ts files and our type stubs.
+fn writeGeneratedTsconfig(
     allocator: std.mem.Allocator,
-    tmp_dir: std.fs.Dir,
-    workspace_path: []const u8,
+    workspace_dir: std.fs.Dir,
     tsconfig_path: ?[]const u8,
     virtual_files: []const VirtualFile,
-) !bool {
-    // Determine the project tsconfig path
-    const project_tsconfig = tsconfig_path orelse blk: {
-        // Auto-detect tsconfig.json in workspace root
-        const candidate = try std.fs.path.join(allocator, &.{ workspace_path, "tsconfig.json" });
-        const cwd = std.fs.cwd();
-        if (cwd.access(candidate, .{})) {
-            break :blk candidate;
-        } else |_| {
-            break :blk null;
-        }
-    };
-
-    // Build file list for "include"
-    var include_files: std.ArrayList([]const u8) = .empty;
-    defer include_files.deinit(allocator);
-
-    for (virtual_files) |vf| {
-        const basename = std.fs.path.basename(vf.virtual_path);
-        try include_files.append(allocator, basename);
-    }
-
-    // Create the tsconfig content
-    const file = try tmp_dir.createFile("tsconfig.json", .{});
+) !void {
+    const file = try workspace_dir.createFile(generated_tsconfig, .{});
     defer file.close();
 
     try file.writeAll("{\n");
 
-    // Extend project tsconfig if available (for path aliases)
-    if (project_tsconfig) |ptsconfig| {
-        // Convert to absolute path for reliable resolution
-        const abs_path = try std.fs.cwd().realpathAlloc(allocator, ptsconfig);
-        try file.writeAll("  \"extends\": \"");
-        try file.writeAll(abs_path);
+    // Extend project tsconfig if available (for path aliases, baseUrl, etc.)
+    if (tsconfig_path) |ptsconfig| {
+        try file.writeAll("  \"extends\": \"./");
+        try file.writeAll(ptsconfig);
         try file.writeAll("\",\n");
+    } else {
+        // Auto-detect tsconfig.json in workspace root
+        if (workspace_dir.access("tsconfig.json", .{})) {
+            try file.writeAll("  \"extends\": \"./tsconfig.json\",\n");
+        } else |_| {}
     }
 
-    // Compiler options for virtual files
+    // Compiler options optimized for Svelte checking
     try file.writeAll("  \"compilerOptions\": {\n");
     try file.writeAll("    \"noEmit\": true,\n");
     try file.writeAll("    \"skipLibCheck\": true,\n");
@@ -153,28 +149,37 @@ fn writeTempTsconfig(
     try file.writeAll("    \"noUnusedParameters\": false\n");
     try file.writeAll("  },\n");
 
-    // Include our virtual files and SvelteKit stubs
+    // Include only our generated files
     try file.writeAll("  \"include\": [\n");
-    try file.writeAll("    \"sveltekit.d.ts\",\n");
-    for (include_files.items, 0..) |file_name, i| {
-        try file.writeAll("    \"");
-        try file.writeAll(file_name);
+    try file.writeAll("    \"");
+    try file.writeAll(generated_stubs);
+    try file.writeAll("\"");
+
+    for (virtual_files) |vf| {
+        try file.writeAll(",\n    \"");
+        try file.writeAll(vf.virtual_path);
         try file.writeAll("\"");
-        if (i < include_files.items.len - 1) {
-            try file.writeAll(",");
-        }
-        try file.writeAll("\n");
     }
-    try file.writeAll("  ]\n");
+
+    try file.writeAll("\n  ],\n");
+
+    // Exclude node_modules to avoid scanning everything
+    try file.writeAll("  \"exclude\": [\"node_modules\"]\n");
     try file.writeAll("}\n");
 
-    return true;
+    // Debug: log generated config path
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (workspace_dir.realpath(generated_tsconfig, &path_buf)) |real_path| {
+        _ = real_path;
+        // Could add logging here if needed
+    } else |_| {}
+    _ = allocator;
 }
 
-/// Writes SvelteKit virtual module type stubs to the temp directory.
+/// Writes SvelteKit virtual module type stubs to the workspace.
 /// These ambient declarations allow tsgo to resolve $app/* imports.
-fn writeSvelteKitStubs(tmp_dir: std.fs.Dir) !void {
-    const file = try tmp_dir.createFile("sveltekit.d.ts", .{});
+fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
+    const file = try workspace_dir.createFile(generated_stubs, .{});
     defer file.close();
 
     try file.writeAll(
@@ -249,15 +254,15 @@ fn writeSvelteKitStubs(tmp_dir: std.fs.Dir) !void {
         \\declare module "$app/forms" {
         \\  export function enhance<Success = Record<string, any>, Failure = Record<string, any>>(
         \\    form: HTMLFormElement,
-        \\    opts?: {
-        \\      onSubmit?: (input: { action: URL; formElement: HTMLFormElement; formData: FormData; controller: AbortController; cancel: () => void; submitter: HTMLElement | null }) => void;
-        \\      onResult?: (input: { result: any; update: (opts?: { reset?: boolean; invalidateAll?: boolean }) => Promise<void> }) => void;
-        \\      onError?: (input: { error: any }) => void;
-        \\      invalidateAll?: boolean;
-        \\      reset?: boolean;
-        \\    }
+        \\    options?: {
+        \\      formElement?: HTMLFormElement;
+        \\      formData?: FormData;
+        \\      action?: URL;
+        \\      submitter?: HTMLElement | null;
+        \\      cancel?: () => void;
+        \\      controller?: AbortController;
+        \\    } | ((input: { formElement: HTMLFormElement; formData: FormData; action: URL; submitter: HTMLElement | null; cancel: () => void; controller: AbortController }) => Promise<void | ((opts: { formElement: HTMLFormElement; formData: FormData; action: URL; result: { type: 'success' | 'failure' | 'redirect' | 'error'; status?: number; data?: Success | Failure; location?: string; error?: any }; update: (options?: { reset?: boolean; invalidateAll?: boolean }) => Promise<void>; }) => Promise<void>)>)
         \\  ): { destroy: () => void };
-        \\  export function deserialize<T = Record<string, any>>(data: string): { type: 'success' | 'failure' | 'redirect' | 'error'; status?: number; data?: T; location?: string; error?: any };
         \\  export function applyAction<T = Record<string, any>>(result: { type: 'success' | 'failure' | 'redirect' | 'error'; status?: number; data?: T; location?: string; error?: any }): Promise<void>;
         \\}
         \\
@@ -370,9 +375,9 @@ fn parseTsgoOutput(
         const ts_line = std.fmt.parseInt(u32, line_str, 10) catch continue;
         const ts_col = std.fmt.parseInt(u32, col_str, 10) catch continue;
 
-        // Find corresponding virtual file
+        // Find corresponding virtual file by matching .svelte.ts path
         const vf: ?VirtualFile = for (virtual_files) |v| {
-            if (std.mem.endsWith(u8, file_path, std.fs.path.basename(v.virtual_path))) {
+            if (std.mem.endsWith(u8, file_path, v.virtual_path)) {
                 break v;
             }
         } else null;
@@ -412,7 +417,7 @@ fn parseTsgoOutput(
         try diagnostics.append(allocator, .{
             .source = .js,
             .severity = if (is_error) .@"error" else .warning,
-            .code = null, // TODO: extract TSxxxx code
+            .code = null,
             .message = try allocator.dupe(u8, message),
             .file_path = try allocator.dupe(u8, original_path),
             .start_line = svelte_line,
@@ -428,13 +433,13 @@ test "parse tsgo output" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const tsgo_output = "test.svelte.ts(5,10): error TS2322: Type 'string' is not assignable to type 'number'.\n";
+    const tsgo_output = "src/routes/+page.svelte.ts(5,10): error TS2322: Type 'string' is not assignable to type 'number'.\n";
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
 
     const virtual_files = [_]VirtualFile{.{
-        .original_path = "test.svelte",
-        .virtual_path = "test.svelte.ts",
+        .original_path = "src/routes/+page.svelte",
+        .virtual_path = "src/routes/+page.svelte.ts",
         .content = "",
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
     }};
@@ -442,69 +447,70 @@ test "parse tsgo output" {
     try parseTsgoOutput(allocator, tsgo_output, &virtual_files, &diagnostics);
 
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("src/routes/+page.svelte", diagnostics.items[0].file_path);
 }
 
-test "writeTempTsconfig generates valid config" {
+test "writeGeneratedTsconfig generates valid config" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // Create a temp dir to test
-    var tmp_dir = try std.fs.cwd().makeOpenPath(".svelte-check-zig-test-tmp", .{});
+    // Create a temp workspace dir to test
+    var workspace_dir = try std.fs.cwd().makeOpenPath(".svelte-check-zig-test-workspace", .{});
     defer {
-        tmp_dir.close();
-        std.fs.cwd().deleteTree(".svelte-check-zig-test-tmp") catch {};
+        workspace_dir.close();
+        std.fs.cwd().deleteTree(".svelte-check-zig-test-workspace") catch {};
     }
 
     const virtual_files = [_]VirtualFile{.{
-        .original_path = "test.svelte",
-        .virtual_path = "test.svelte.ts",
+        .original_path = "src/routes/+page.svelte",
+        .virtual_path = "src/routes/+page.svelte.ts",
         .content = "const x = 1;",
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
     }};
 
-    // Test with no project tsconfig (should still create config)
-    const result = try writeTempTsconfig(allocator, tmp_dir, "nonexistent-dir", null, &virtual_files);
-    try std.testing.expect(result);
+    // Test with no project tsconfig
+    try writeGeneratedTsconfig(allocator, workspace_dir, null, &virtual_files);
 
     // Read generated config
-    const content = try tmp_dir.readFileAlloc(allocator, "tsconfig.json", 10 * 1024);
+    const content = try workspace_dir.readFileAlloc(allocator, generated_tsconfig, 10 * 1024);
 
     // Verify basic structure
     try std.testing.expect(std.mem.indexOf(u8, content, "\"compilerOptions\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"include\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "test.svelte.ts") != null);
-    // No extends when project tsconfig doesn't exist
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"extends\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "src/routes/+page.svelte.ts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"exclude\"") != null);
 }
 
-test "writeTempTsconfig extends project config when available" {
+test "writeGeneratedTsconfig extends project config when available" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // Create a temp dir to test
-    var tmp_dir = try std.fs.cwd().makeOpenPath(".svelte-check-zig-test-tmp", .{});
+    // Create a temp workspace dir to test
+    var workspace_dir = try std.fs.cwd().makeOpenPath(".svelte-check-zig-test-workspace", .{});
     defer {
-        tmp_dir.close();
-        std.fs.cwd().deleteTree(".svelte-check-zig-test-tmp") catch {};
+        workspace_dir.close();
+        std.fs.cwd().deleteTree(".svelte-check-zig-test-workspace") catch {};
     }
 
+    // Create a fake project tsconfig
+    const tsconfig_file = try workspace_dir.createFile("tsconfig.json", .{});
+    tsconfig_file.close();
+
     const virtual_files = [_]VirtualFile{.{
-        .original_path = "test.svelte",
-        .virtual_path = "test.svelte.ts",
+        .original_path = "src/routes/+page.svelte",
+        .virtual_path = "src/routes/+page.svelte.ts",
         .content = "const x = 1;",
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
     }};
 
-    // Test with a real project tsconfig (using test-fixtures)
-    const result = try writeTempTsconfig(allocator, tmp_dir, "test-fixtures/projects/sveltekit", null, &virtual_files);
-    try std.testing.expect(result);
+    // Test with project tsconfig auto-detection
+    try writeGeneratedTsconfig(allocator, workspace_dir, null, &virtual_files);
 
     // Read generated config
-    const content = try tmp_dir.readFileAlloc(allocator, "tsconfig.json", 10 * 1024);
+    const content = try workspace_dir.readFileAlloc(allocator, generated_tsconfig, 10 * 1024);
 
-    // Verify extends is present (inherits path aliases)
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"extends\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "tsconfig.json") != null);
+    // Verify extends is present
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"extends\": \"./tsconfig.json\"") != null);
 }
