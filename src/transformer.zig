@@ -67,10 +67,10 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     try output.appendSlice(allocator, "import { SvelteComponentTyped } from \"svelte\";\n");
     try output.appendSlice(allocator, "import type { Snippet } from \"svelte\";\n");
 
-    // SvelteKit route type imports
-    if (route_info.isRoute()) {
-        try emitRouteTypeImports(allocator, &output, route_info);
-    }
+    // SvelteKit route type imports are NOT auto-generated
+    // User code imports from './$types' which resolves via SvelteKit's generated types
+    // in .svelte-kit/types/ (requires SvelteKit to be built/dev'd first)
+    _ = route_info;
     try output.appendSlice(allocator, "\n");
 
     // Svelte 5 rune type declarations
@@ -1590,12 +1590,11 @@ fn filterSvelteImports(allocator: std.mem.Allocator, content: []const u8) ![]con
         const line = content[line_start..line_end];
         const trimmed = std.mem.trim(u8, line, " \t\r");
 
-        // Check import source - we filter types from 'svelte' and './$types'
+        // Check import source - we only filter types from 'svelte' (avoid duplicates)
+        // ./$types imports are kept - they resolve via SvelteKit's generated types
         const is_svelte_import = std.mem.indexOf(u8, trimmed, "from 'svelte'") != null or
             std.mem.indexOf(u8, trimmed, "from \"svelte\"") != null;
-        const is_types_import = std.mem.indexOf(u8, trimmed, "from './$types'") != null or
-            std.mem.indexOf(u8, trimmed, "from \"./$types\"") != null;
-        const should_filter = is_svelte_import or is_types_import;
+        const should_filter = is_svelte_import;
 
         if (should_filter and std.mem.startsWith(u8, trimmed, "import")) {
             // Case 1: `import type { ... } from ...` - filter entire line
@@ -2301,8 +2300,8 @@ test "transform sveltekit +page.svelte route" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should auto-import SvelteKit types
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { PageData, PageLoad, PageServerLoad, Actions, ActionData } from \"./$types\";") != null);
+    // User's ./$types import should be preserved (not filtered, not auto-generated)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { PageData } from './$types';") != null);
     // Should still have Svelte imports
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "SvelteComponentTyped") != null);
 }
@@ -2314,8 +2313,9 @@ test "transform sveltekit +layout.svelte route" {
 
     const source =
         \\<script lang="ts">
+        \\  import type { LayoutData } from './$types';
         \\  import type { Snippet } from 'svelte';
-        \\  let { children }: { children: Snippet } = $props();
+        \\  let { children, data }: { children: Snippet; data: LayoutData } = $props();
         \\</script>
         \\{@render children()}
     ;
@@ -2326,8 +2326,8 @@ test "transform sveltekit +layout.svelte route" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should auto-import layout types
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { LayoutData, LayoutLoad, LayoutServerLoad } from \"./$types\";") != null);
+    // User's ./$types import should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { LayoutData } from './$types';") != null);
 }
 
 test "transform sveltekit +page@.svelte route variant" {
@@ -2337,9 +2337,10 @@ test "transform sveltekit +page@.svelte route variant" {
 
     const source =
         \\<script lang="ts">
-        \\  let count = $state(0);
+        \\  import type { PageData } from './$types';
+        \\  let { data }: { data: PageData } = $props();
         \\</script>
-        \\<p>{count}</p>
+        \\<p>{data.count}</p>
     ;
 
     const Parser = @import("svelte_parser.zig").Parser;
@@ -2348,8 +2349,8 @@ test "transform sveltekit +page@.svelte route variant" {
 
     const virtual = try transform(allocator, ast);
 
-    // Route variant should still get page types
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { PageData") != null);
+    // User's ./$types import should be preserved for route variants too
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { PageData } from './$types';") != null);
 }
 
 test "transform sveltekit +error.svelte route" {
