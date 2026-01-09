@@ -48,7 +48,11 @@ pub const CompilerWarnings = std.StringHashMapUnmanaged(WarningBehavior);
 pub fn parseArgs(allocator: std.mem.Allocator) !Args {
     var args_iter = try std.process.argsWithAllocator(allocator);
     defer args_iter.deinit();
+    return parseArgsFromIterator(allocator, &args_iter);
+}
 
+/// Parse arguments from any iterator (used by tests)
+pub fn parseArgsFromIterator(allocator: std.mem.Allocator, args_iter: anytype) !Args {
     _ = args_iter.next(); // skip program name
 
     var result: Args = .{
@@ -94,6 +98,10 @@ pub fn parseArgs(allocator: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, arg, "--compiler-warnings")) {
             const warnings = args_iter.next() orelse return error.MissingArgValue;
             try parseCompilerWarnings(allocator, warnings, &result.compiler_warnings);
+        } else if (std.mem.eql(u8, arg, "--watch") or std.mem.eql(u8, arg, "-w")) {
+            return error.WatchModeNotSupported;
+        } else if (std.mem.eql(u8, arg, "--preserveWatchOutput")) {
+            return error.WatchModeNotSupported;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             std.process.exit(0);
@@ -235,4 +243,28 @@ test "parseCompilerWarnings rejects invalid format" {
 
     try std.testing.expectError(error.InvalidWarningFormat, parseCompilerWarnings(allocator, "no-colon", &map));
     try std.testing.expectError(error.InvalidWarningBehavior, parseCompilerWarnings(allocator, "code:badvalue", &map));
+}
+
+const TestArgIterator = struct {
+    args: []const []const u8,
+    index: usize = 0,
+
+    fn next(self: *@This()) ?[]const u8 {
+        if (self.index >= self.args.len) return null;
+        defer self.index += 1;
+        return self.args[self.index];
+    }
+};
+
+test "watch mode flags return WatchModeNotSupported error" {
+    const allocator = std.testing.allocator;
+
+    var watch_iter: TestArgIterator = .{ .args = &.{ "prog", "--watch" } };
+    try std.testing.expectError(error.WatchModeNotSupported, parseArgsFromIterator(allocator, &watch_iter));
+
+    var short_iter: TestArgIterator = .{ .args = &.{ "prog", "-w" } };
+    try std.testing.expectError(error.WatchModeNotSupported, parseArgsFromIterator(allocator, &short_iter));
+
+    var preserve_iter: TestArgIterator = .{ .args = &.{ "prog", "--preserveWatchOutput" } };
+    try std.testing.expectError(error.WatchModeNotSupported, parseArgsFromIterator(allocator, &preserve_iter));
 }
