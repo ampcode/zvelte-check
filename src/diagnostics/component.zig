@@ -2,6 +2,7 @@
 //!
 //! Checks for component-level issues:
 //! - unused-export-let: Exported props not used in the template
+//! - invalid-rune-usage: Rune calls ($state, $derived, etc.) in template expressions
 
 const std = @import("std");
 const Ast = @import("../svelte_parser.zig").Ast;
@@ -12,12 +13,137 @@ const Diagnostic = @import("../diagnostic.zig").Diagnostic;
 const Severity = @import("../diagnostic.zig").Severity;
 const Source = @import("../diagnostic.zig").Source;
 
+/// Svelte 5 runes that must only be used in script blocks
+const RUNES = [_][]const u8{
+    "$state",
+    "$state.raw",
+    "$state.snapshot",
+    "$derived",
+    "$derived.by",
+    "$effect",
+    "$effect.pre",
+    "$effect.tracking",
+    "$effect.root",
+    "$props",
+    "$bindable",
+    "$inspect",
+    "$inspect.trace",
+    "$host",
+};
+
 const ExportLet = struct {
     name: []const u8,
     offset: u32, // Position in source for error reporting
 };
 
 pub fn runDiagnostics(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    try checkInvalidRuneUsage(allocator, ast, diagnostics);
+    try checkUnusedExportLet(allocator, ast, diagnostics);
+}
+
+/// Detects rune calls ($state, $derived, etc.) in template expressions.
+/// Runes must be used in script blocks, not directly in the template.
+fn checkInvalidRuneUsage(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    for (ast.nodes.items) |node| {
+        const expr_content = switch (node.kind) {
+            // Template expressions like {$state(0)}
+            .expression,
+            // Control flow block conditions: {#if $state(true)}, {#each $state(items)}
+            .if_block,
+            .each_block,
+            .await_block,
+            .key_block,
+            => ast.source[node.start..node.end],
+            else => continue,
+        };
+
+        for (RUNES) |rune| {
+            if (containsRuneCall(expr_content, rune)) |rune_pos| {
+                const loc = computeLineCol(ast.source, node.start + rune_pos);
+                try diagnostics.append(allocator, .{
+                    .source = .svelte,
+                    .severity = .@"error",
+                    .code = "invalid-rune-usage",
+                    .message = try std.fmt.allocPrint(
+                        allocator,
+                        "{s}() can only be used inside a $derived, $effect, or at the top level of a component",
+                        .{rune},
+                    ),
+                    .file_path = ast.file_path,
+                    .start_line = loc.line,
+                    .start_col = loc.col,
+                    .end_line = loc.line,
+                    .end_col = loc.col + @as(u32, @intCast(rune.len)),
+                });
+            }
+        }
+    }
+
+    // Check attribute expressions for rune usage
+    for (ast.attributes.items) |attr| {
+        const value = attr.value orelse continue;
+        if (!std.mem.startsWith(u8, value, "{")) continue;
+
+        for (RUNES) |rune| {
+            if (containsRuneCall(value, rune)) |rune_pos| {
+                const loc = computeLineCol(ast.source, attr.start + rune_pos);
+                try diagnostics.append(allocator, .{
+                    .source = .svelte,
+                    .severity = .@"error",
+                    .code = "invalid-rune-usage",
+                    .message = try std.fmt.allocPrint(
+                        allocator,
+                        "{s}() can only be used inside a $derived, $effect, or at the top level of a component",
+                        .{rune},
+                    ),
+                    .file_path = ast.file_path,
+                    .start_line = loc.line,
+                    .start_col = loc.col,
+                    .end_line = loc.line,
+                    .end_col = loc.col + @as(u32, @intCast(rune.len)),
+                });
+            }
+        }
+    }
+}
+
+/// Checks if text contains a rune call (e.g., "$state(") with proper boundaries.
+/// Returns the position of the rune if found, null otherwise.
+fn containsRuneCall(text: []const u8, rune: []const u8) ?u32 {
+    var search_start: usize = 0;
+
+    while (std.mem.indexOfPos(u8, text, search_start, rune)) |pos| {
+        // Check right boundary: must be followed by (
+        const after_rune = pos + rune.len;
+        if (after_rune >= text.len or text[after_rune] != '(') {
+            search_start = pos + 1;
+            continue;
+        }
+
+        // Check left boundary: must not be part of larger identifier
+        if (pos > 0) {
+            const before = text[pos - 1];
+            if (isIdentChar(before) and before != '$') {
+                search_start = pos + 1;
+                continue;
+            }
+        }
+
+        return @intCast(pos);
+    }
+
+    return null;
+}
+
+fn checkUnusedExportLet(
     allocator: std.mem.Allocator,
     ast: *const Ast,
     diagnostics: *std.ArrayList(Diagnostic),
@@ -494,4 +620,150 @@ test "extract identifiers" {
     try std.testing.expect(refs.contains("foo"));
     try std.testing.expect(refs.contains("bar"));
     try std.testing.expect(!refs.contains("2")); // not an identifier
+}
+
+// ============================================================================
+// invalid-rune-usage tests
+// ============================================================================
+
+test "containsRuneCall: detects rune calls" {
+    try std.testing.expectEqual(@as(?u32, 0), containsRuneCall("$state(0)", "$state"));
+    try std.testing.expectEqual(@as(?u32, 6), containsRuneCall("foo + $state(0)", "$state"));
+    try std.testing.expectEqual(@as(?u32, 0), containsRuneCall("$derived(count * 2)", "$derived"));
+    try std.testing.expectEqual(@as(?u32, 0), containsRuneCall("$effect.pre(() => {})", "$effect.pre"));
+}
+
+test "containsRuneCall: rejects non-rune patterns" {
+    // Not followed by (
+    try std.testing.expectEqual(@as(?u32, null), containsRuneCall("$stateValue", "$state"));
+    try std.testing.expectEqual(@as(?u32, null), containsRuneCall("$state", "$state"));
+
+    // Part of larger identifier (my$state)
+    try std.testing.expectEqual(@as(?u32, null), containsRuneCall("my$state(0)", "$state"));
+
+    // $myStore is not a rune
+    try std.testing.expectEqual(@as(?u32, null), containsRuneCall("$myStore", "$state"));
+}
+
+test "invalid-rune-usage: $state in template expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<p>Count: {$state(0)}</p>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("invalid-rune-usage", diagnostics.items[0].code.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "$state") != null);
+}
+
+test "invalid-rune-usage: $derived in template" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<span>{$derived(count * 2)}</span>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("invalid-rune-usage", diagnostics.items[0].code.?);
+}
+
+test "invalid-rune-usage: rune in if block condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "{#if $state(true)}<p>Yes</p>{/if}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("invalid-rune-usage", diagnostics.items[0].code.?);
+}
+
+test "invalid-rune-usage: rune in each block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "{#each $state([1, 2, 3]) as item}<li>{item}</li>{/each}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+}
+
+test "invalid-rune-usage: rune in attribute expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<div class={$state('active')}>Styled</div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+}
+
+test "invalid-rune-usage: regular store subscription is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<p>Store: {$myStore}</p>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // $myStore is a store subscription, not a rune call - should be fine
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "invalid-rune-usage: variable referencing state is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script>
+        \\  let count = $state(0);
+        \\</script>
+        \\<p>{count}</p>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Using the variable 'count' (not $state) in template is correct
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
