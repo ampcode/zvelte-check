@@ -18,6 +18,7 @@ pub const Lexer = @import("svelte_lexer.zig").Lexer;
 pub const Parser = @import("svelte_parser.zig").Parser;
 pub const transformer = @import("transformer.zig");
 pub const tsgo = @import("tsgo.zig");
+pub const tsconfig = @import("tsconfig.zig");
 pub const source_map = @import("source_map.zig");
 pub const output = @import("output.zig");
 pub const Diagnostic = @import("diagnostic.zig").Diagnostic;
@@ -64,8 +65,30 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
     const stdout = std.fs.File.stdout();
     var msg_buf: [512]u8 = undefined;
 
-    // 1. Scan workspace
-    const files = try workspace.scan(allocator, args.workspace, args.ignore);
+    // 1. Load tsconfig for file filtering (unless --no-tsconfig)
+    const config = if (!args.no_tsconfig)
+        try tsconfig.load(allocator, args.workspace, args.tsconfig)
+    else
+        null;
+
+    // 2. Scan workspace and filter by tsconfig patterns
+    const all_files = try workspace.scan(allocator, args.workspace, args.ignore);
+
+    // Filter files by tsconfig include/exclude patterns
+    const files = if (config) |cfg| blk: {
+        var filtered: std.ArrayList([]const u8) = .empty;
+        for (all_files) |file_path| {
+            // Normalize path for pattern matching (strip ./ prefix)
+            const normalized = if (std.mem.startsWith(u8, file_path, "./"))
+                file_path[2..]
+            else
+                file_path;
+            if (tsconfig.shouldInclude(cfg, normalized)) {
+                try filtered.append(allocator, file_path);
+            }
+        }
+        break :blk try filtered.toOwnedSlice(allocator);
+    } else all_files;
 
     if (files.len == 0) {
         try output.printNoFiles(args.output_format);
