@@ -251,9 +251,9 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Generate $$Events type
     try output.appendSlice(allocator, "export type $$Events = Record<string, any>;\n\n");
 
-    // Generate default export
+    // Generate default export (use internal name to avoid conflicts with user code)
     try output.appendSlice(allocator,
-        \\export default class Component extends SvelteComponentTyped<$$Props, $$Events, $$Slots> {}
+        \\export default class __SvelteComponent__ extends SvelteComponentTyped<$$Props, $$Events, $$Slots> {}
         \\
     );
 
@@ -2950,4 +2950,44 @@ test "transform with module and instance generics" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "type T = unknown;") != null);
     // Should also have the module script content
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type ComboboxItem<T>") != null);
+}
+
+test "transform with renamed $props has only one default export" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\import * as Tooltip from '@sourcegraph/amp-web-ui/components/tooltip'
+        \\let {
+        \\        component: Component,
+        \\        props = {},
+        \\}: {
+        \\        component: any
+        \\        props?: Record<string, any>
+        \\} = $props()
+        \\</script>
+        \\<Tooltip.Provider>
+        \\<Component {...props} />
+        \\</Tooltip.Provider>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "thread-expansion-test-wrapper.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Count export default occurrences - should be exactly 1
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, virtual.content, i, "export default")) |pos| {
+        count += 1;
+        i = pos + 1;
+    }
+    if (count != 1) {
+        std.debug.print("\n=== Generated virtual file ===\n{s}\n=== End ===\n", .{virtual.content});
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
