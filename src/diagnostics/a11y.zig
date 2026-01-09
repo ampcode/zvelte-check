@@ -179,9 +179,9 @@ fn checkImgAlt(
 
     if (!has_alt and !has_role_presentation) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
-            .severity = .@"error",
+            .severity = .warning,
             .code = "a11y_missing_attribute",
-            .message = "<img> element must have an alt attribute",
+            .message = "<img> element should have an alt attribute",
         });
     }
 }
@@ -194,20 +194,28 @@ fn checkImgRedundantAlt(
     diagnostics: *std.ArrayList(Diagnostic),
     ignore_codes: []const []const u8,
 ) !void {
-    const alt = getAttrValue(attrs, "alt") orelse return;
-    if (alt.len == 0) return;
+    for (attrs) |attr| {
+        if (std.mem.eql(u8, attr.name, "alt")) {
+            // Skip dynamic values - can't analyze runtime content
+            if (isDynamicValue(attr.value)) return;
 
-    var lower_buf: [256]u8 = undefined;
-    const alt_lower = toLowerBounded(alt, &lower_buf);
+            const alt = attr.value orelse return;
+            if (alt.len == 0) return;
 
-    const redundant_words = [_][]const u8{ "image", "photo", "picture" };
-    for (redundant_words) |word| {
-        if (std.mem.indexOf(u8, alt_lower, word) != null) {
-            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
-                .severity = .warning,
-                .code = "a11y_img_redundant_alt",
-                .message = "Alt text should not contain words like \"image\", \"photo\", or \"picture\"",
-            });
+            var lower_buf: [256]u8 = undefined;
+            const alt_lower = toLowerBounded(alt, &lower_buf);
+
+            const redundant_words = [_][]const u8{ "image", "photo", "picture" };
+            for (redundant_words) |word| {
+                if (std.mem.indexOf(u8, alt_lower, word) != null) {
+                    try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
+                        .severity = .warning,
+                        .code = "a11y_img_redundant_alt",
+                        .message = "Alt text should not contain words like \"image\", \"photo\", or \"picture\"",
+                    });
+                    return;
+                }
+            }
             return;
         }
     }
@@ -277,26 +285,15 @@ fn checkInput(
     diagnostics: *std.ArrayList(Diagnostic),
     ignore_codes: []const []const u8,
 ) !void {
-    const input_type = getAttrValue(attrs, "type") orelse "text";
-
-    // Hidden inputs don't need labels
-    if (std.mem.eql(u8, input_type, "hidden")) return;
-
-    // Check for accessible label
-    const has_id = hasAttr(attrs, "id");
-    const has_aria_label = hasAttr(attrs, "aria-label");
-    const has_aria_labelledby = hasAttr(attrs, "aria-labelledby");
-    const has_title = hasAttr(attrs, "title");
-
-    // Note: We can't check for associated <label> elements without full DOM traversal
-    // So we only warn if none of the inline labeling mechanisms are present
-    if (!has_id and !has_aria_label and !has_aria_labelledby and !has_title) {
-        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
-            .severity = .warning,
-            .code = "a11y_label_has_associated_control",
-            .message = "<input> element should have an associated label or aria-label",
-        });
-    }
+    _ = allocator;
+    _ = ast;
+    _ = node;
+    _ = attrs;
+    _ = diagnostics;
+    _ = ignore_codes;
+    // Note: We can't reliably check for associated <label> elements without
+    // full DOM traversal (labels can be wrapper elements or use for="id").
+    // This produces too many false positives, so we skip this check.
 }
 
 fn checkMediaCaptions(
@@ -358,20 +355,15 @@ fn checkHeadingOrder(
     tracker: *HeadingTracker,
     ignore_codes: []const []const u8,
 ) !void {
-    const level = tag[1] - '0'; // h1 -> 1, h2 -> 2, etc.
-
-    if (tracker.last_level > 0 and level > tracker.last_level + 1) {
-        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
-            .severity = .warning,
-            .code = "a11y_heading_order",
-            .message = try std.fmt.allocPrint(
-                allocator,
-                "Heading level jumped from h{d} to h{d}",
-                .{ tracker.last_level, level },
-            ),
-        });
-    }
-
+    _ = allocator;
+    _ = ast;
+    _ = node;
+    _ = diagnostics;
+    _ = ignore_codes;
+    // Note: svelte-check does not check heading order within components
+    // because components may be composed at different levels in a page.
+    // Track the level but don't warn.
+    const level = tag[1] - '0';
     tracker.last_level = level;
 }
 
@@ -383,13 +375,21 @@ fn checkPositiveTabindex(
     diagnostics: *std.ArrayList(Diagnostic),
     ignore_codes: []const []const u8,
 ) !void {
-    if (getAttrValue(attrs, "tabindex")) |tabindex| {
-        if (tabindex.len > 0 and tabindex[0] != '-' and tabindex[0] != '0') {
-            try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
-                .severity = .warning,
-                .code = "a11y_positive_tabindex",
-                .message = "Avoid positive tabindex values",
-            });
+    for (attrs) |attr| {
+        if (std.mem.eql(u8, attr.name, "tabindex")) {
+            // Skip dynamic values - can't know the runtime value
+            if (isDynamicValue(attr.value)) return;
+
+            if (attr.value) |tabindex| {
+                if (tabindex.len > 0 and tabindex[0] != '-' and tabindex[0] != '0') {
+                    try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
+                        .severity = .warning,
+                        .code = "a11y_positive_tabindex",
+                        .message = "Avoid positive tabindex values",
+                    });
+                }
+            }
+            return;
         }
     }
 }
@@ -583,18 +583,19 @@ fn checkInteractiveSupportsFocus(
     const role = getAttrValue(attrs, "role") orelse return;
     if (!isInteractiveRole(role)) return;
 
-    // Check for tabindex
-    if (!hasAttr(attrs, "tabindex")) {
-        try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
-            .severity = .warning,
-            .code = "a11y_interactive_supports_focus",
-            .message = try std.fmt.allocPrint(
-                allocator,
-                "Elements with role=\"{s}\" must have tabindex",
-                .{role},
-            ),
-        });
-    }
+    // Check for focusability: tabindex or contenteditable
+    if (hasAttr(attrs, "tabindex")) return;
+    if (hasAttr(attrs, "contenteditable")) return;
+
+    try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
+        .severity = .warning,
+        .code = "a11y_interactive_supports_focus",
+        .message = try std.fmt.allocPrint(
+            allocator,
+            "Elements with role=\"{s}\" must have tabindex",
+            .{role},
+        ),
+    });
 }
 
 fn checkAriaAttributes(
@@ -769,6 +770,15 @@ fn hasEventHandler(attrs: []const AttributeData, event: []const u8) bool {
             if (std.mem.eql(u8, event_name, event)) return true;
         }
     }
+    return false;
+}
+
+fn isDynamicValue(value: ?[]const u8) bool {
+    const v = value orelse return false;
+    // Pure expression: {expr}
+    if (v.len > 0 and v[0] == '{') return true;
+    // Template with embedded expressions: "text {expr} more"
+    if (std.mem.indexOf(u8, v, "{") != null) return true;
     return false;
 }
 
@@ -1011,4 +1021,27 @@ test "a11y: regular comment does not suppress diagnostic" {
         }
     }
     try std.testing.expect(found_missing_alt);
+}
+
+test "a11y: dynamic values skip checks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    // Dynamic tabindex and alt with template expression should not warn
+    const source = "<div tabindex={condition ? 5 : 0}></div><img src={url} alt=\"Image from {path}\">";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should not have positive_tabindex or img_redundant_alt warnings
+    for (diagnostics.items) |d| {
+        if (d.code) |code| {
+            try std.testing.expect(!std.mem.eql(u8, code, "a11y_positive_tabindex"));
+            try std.testing.expect(!std.mem.eql(u8, code, "a11y_img_redundant_alt"));
+        }
+    }
 }
