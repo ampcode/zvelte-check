@@ -47,4 +47,19 @@ date,thread_id,title,messages,url
 2026-01-09,T-019ba415-c317-716a-ad5a-6195e7ee414a,Oracle review codebase performance and svelte-check,56,https://ampcode.com/threads/T-019ba415-c317-716a-ad5a-6195e7ee414a
 2026-01-09,T-019ba41b-377c-70de-a109-6a56f4d62da6,Disable CSS lint rules for Tailwind,1,https://ampcode.com/threads/T-019ba41b-377c-70de-a109-6a56f4d62da6
 2026-01-09,T-019ba42a-1981-74f9-b04f-bd9324211b05,Collapse dual severity scan into single pass,18,https://ampcode.com/threads/T-019ba42a-1981-74f9-b04f-bd9324211b05
-2026-01-09,T-019ba42a-cbf3-73d4-ba28-86bfe8d0c70b,Normalize hyphenated output values for svelte-check,5,https://ampcode.com/threads/T-019ba42a-cbf3-73d4-ba28-86bfe8d0c70b
+2026-01-09,T-019ba42a-cbf3-73d4-ba28-86bfe8d0c70b,Normalize hyphenated output values for svelte-check,30,https://ampcode.com/threads/T-019ba42a-cbf3-73d4-ba28-86bfe8d0c70b
+2026-01-09,T-019ba42b-f783-7059-bb19-b7fb630a6d34,Implement machine-verbose NDJSON output format,32,https://ampcode.com/threads/T-019ba42b-f783-7059-bb19-b7fb630a6d34
+2026-01-09,T-019ba42d-80c9-77bb-aeea-a5ac6b3dd4c6,Implement diagnostic-sources flag gating,50,https://ampcode.com/threads/T-019ba42d-80c9-77bb-aeea-a5ac6b3dd4c6
+2026-01-09,T-019ba364-61a4-75ee-a329-6f0bfb6c6dec,Analyze 460 semantic TypeScript errors in svelte-check-zig,102,https://ampcode.com/threads/T-019ba364-61a4-75ee-a329-6f0bfb6c6dec
+2026-01-09,T-019ba2db-967a-7728-9a8c-cf83a5c526ab,Audit svelte-check-rs test fixtures for unported cases,164,https://ampcode.com/threads/T-019ba2db-967a-7728-9a8c-cf83a5c526ab
+2026-01-09,T-019ba2d2-aefa-74a9-89b1-7f787322bf5c,Implement missing a11y rules from svelte-check-rs,122,https://ampcode.com/threads/T-019ba2d2-aefa-74a9-89b1-7f787322bf5c
+2026-01-09,T-019ba2bd-365b-70ca-a877-31c0b5b7a93a,Verify svelte-ignore pragma functionality,253,https://ampcode.com/threads/T-019ba2bd-365b-70ca-a877-31c0b5b7a93a
+2026-01-09,T-019ba2ba-91d6-76d9-a472-046e4c377660,Match svelte-check strictness settings,40,https://ampcode.com/threads/T-019ba2ba-91d6-76d9-a472-046e4c377660
+2026-01-09,T-019ba1bd-31a9-7693-b896-ac2550a8c643,Support named exports from svelte files,86,https://ampcode.com/threads/T-019ba1bd-31a9-7693-b896-ac2550a8c643
+2026-01-09,T-019ba14b-8aba-747b-9ac8-a43f18af5f50,Fix duplicate Snippet identifier in transformer,72,https://ampcode.com/threads/T-019ba14b-8aba-747b-9ac8-a43f18af5f50
+2026-01-09,T-019ba144-1f6b-722d-b194-35c7d2d6387e,Verify and close test fixtures porting task,84,https://ampcode.com/threads/T-019ba144-1f6b-722d-b194-35c7d2d6387e
+2026-01-09,T-019ba11f-1e4d-74d8-90dd-e7d67dd07e0f,Verify workspace monorepo package import resolution,62,https://ampcode.com/threads/T-019ba11f-1e4d-74d8-90dd-e7d67dd07e0f
+2026-01-09,T-019ba11a-4df9-731f-88e3-9a9fcc58a13c,Refactor tsgo runner for project context execution,28,https://ampcode.com/threads/T-019ba11a-4df9-731f-88e3-9a9fcc58a13c
+2026-01-09,T-019ba112-7947-702d-a32c-5a52aa6ccbe0,Add import.meta.env ambient type declaration,42,https://ampcode.com/threads/T-019ba112-7947-702d-a32c-5a52aa6ccbe0
+2026-01-09,T-019ba110-2b0d-759c-a82e-f04fef46c9ec,Reduce false positives to under 100,20,https://ampcode.com/threads/T-019ba110-2b0d-759c-a82e-f04fef46c9ec
+2026-01-08,T-019b9ee2-7719-746b-86f7-5ecfcc8f2e46,Svelte-check repo location and performance issues,68,https://ampcode.com/threads/T-019b9ee2-7719-746b-86f7-5ecfcc8f2e46

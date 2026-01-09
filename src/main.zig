@@ -170,14 +170,23 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
     }
 
     // 6. Output
-    try output.print(allocator, args.output_format, all_diagnostics.items, args.threshold);
+    try output.print(allocator, args.output_format, all_diagnostics.items, args.threshold, args.compiler_warnings);
 
-    // 7. Exit code
+    // 7. Exit code - apply compiler warnings to determine exit status
     var has_errors = false;
     var has_warnings = false;
     for (all_diagnostics.items) |d| {
-        if (d.severity == .@"error") has_errors = true;
-        if (d.severity == .warning) has_warnings = true;
+        var severity = d.severity;
+        if (d.code) |code| {
+            if (args.compiler_warnings.get(code)) |behavior| {
+                switch (behavior) {
+                    .ignore => continue,
+                    .@"error" => severity = .@"error",
+                }
+            }
+        }
+        if (severity == .@"error") has_errors = true;
+        if (severity == .warning) has_warnings = true;
         if (has_errors and has_warnings) break;
     }
 

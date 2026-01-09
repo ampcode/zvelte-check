@@ -29,6 +29,7 @@ pub const Args = struct {
     fail_on_warnings: bool,
     threshold: Threshold,
     diagnostic_sources: DiagnosticSources,
+    compiler_warnings: CompilerWarnings,
 };
 
 pub const DiagnosticSources = struct {
@@ -36,6 +37,13 @@ pub const DiagnosticSources = struct {
     svelte: bool = true,
     css: bool = true,
 };
+
+pub const WarningBehavior = enum {
+    ignore,
+    @"error",
+};
+
+pub const CompilerWarnings = std.StringHashMapUnmanaged(WarningBehavior);
 
 pub fn parseArgs(allocator: std.mem.Allocator) !Args {
     var args_iter = try std.process.argsWithAllocator(allocator);
@@ -53,6 +61,7 @@ pub fn parseArgs(allocator: std.mem.Allocator) !Args {
         .fail_on_warnings = false,
         .threshold = .warning,
         .diagnostic_sources = .{},
+        .compiler_warnings = .empty,
     };
 
     while (args_iter.next()) |arg| {
@@ -82,6 +91,9 @@ pub fn parseArgs(allocator: std.mem.Allocator) !Args {
                 if (std.mem.eql(u8, s, "svelte")) result.diagnostic_sources.svelte = true;
                 if (std.mem.eql(u8, s, "css")) result.diagnostic_sources.css = true;
             }
+        } else if (std.mem.eql(u8, arg, "--compiler-warnings")) {
+            const warnings = args_iter.next() orelse return error.MissingArgValue;
+            try parseCompilerWarnings(allocator, warnings, &result.compiler_warnings);
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             std.process.exit(0);
@@ -119,6 +131,28 @@ fn parseCommaSeparated(allocator: std.mem.Allocator, input: []const u8) ![]const
     return list.toOwnedSlice(allocator);
 }
 
+fn parseCompilerWarnings(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    map: *CompilerWarnings,
+) !void {
+    var it = std.mem.splitScalar(u8, input, ',');
+    while (it.next()) |pair| {
+        const trimmed = std.mem.trim(u8, pair, " \t");
+        if (trimmed.len == 0) continue;
+
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
+            const code = trimmed[0..colon];
+            const behavior_str = trimmed[colon + 1 ..];
+            const behavior = std.meta.stringToEnum(WarningBehavior, behavior_str) orelse
+                return error.InvalidWarningBehavior;
+            try map.put(allocator, code, behavior);
+        } else {
+            return error.InvalidWarningFormat;
+        }
+    }
+}
+
 fn printHelp() void {
     const help =
         \\svelte-check-zig - Fast Svelte diagnostics
@@ -135,6 +169,7 @@ fn printHelp() void {
         \\    --fail-on-warnings       Exit with error on warnings
         \\    --threshold <LEVEL>      Minimum severity: error, warning
         \\    --diagnostic-sources     Which diagnostics: js,svelte,css
+        \\    --compiler-warnings      Code:behavior pairs (code:ignore, code:error)
         \\    -h, --help               Show this help
         \\    -v, --version            Show version
         \\
@@ -166,4 +201,38 @@ test "parseOutputFormat accepts hyphenated and underscore forms" {
 
     // Invalid
     try std.testing.expectEqual(null, parseOutputFormat("invalid"));
+}
+
+test "parseCompilerWarnings parses code:behavior pairs" {
+    const allocator = std.testing.allocator;
+
+    var map: CompilerWarnings = .empty;
+    defer map.deinit(allocator);
+
+    try parseCompilerWarnings(allocator, "a11y-click-events-have-key-events:ignore", &map);
+    try std.testing.expectEqual(.ignore, map.get("a11y-click-events-have-key-events").?);
+
+    try parseCompilerWarnings(allocator, "css-unused-selector:error", &map);
+    try std.testing.expectEqual(.@"error", map.get("css-unused-selector").?);
+}
+
+test "parseCompilerWarnings handles multiple pairs" {
+    const allocator = std.testing.allocator;
+
+    var map: CompilerWarnings = .empty;
+    defer map.deinit(allocator);
+
+    try parseCompilerWarnings(allocator, "a11y-foo:ignore,a11y-bar:error", &map);
+    try std.testing.expectEqual(.ignore, map.get("a11y-foo").?);
+    try std.testing.expectEqual(.@"error", map.get("a11y-bar").?);
+}
+
+test "parseCompilerWarnings rejects invalid format" {
+    const allocator = std.testing.allocator;
+
+    var map: CompilerWarnings = .empty;
+    defer map.deinit(allocator);
+
+    try std.testing.expectError(error.InvalidWarningFormat, parseCompilerWarnings(allocator, "no-colon", &map));
+    try std.testing.expectError(error.InvalidWarningBehavior, parseCompilerWarnings(allocator, "code:badvalue", &map));
 }

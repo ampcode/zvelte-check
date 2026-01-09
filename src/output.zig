@@ -9,19 +9,33 @@ pub fn print(
     format: cli.OutputFormat,
     diagnostics: []const Diagnostic,
     threshold: cli.Threshold,
+    compiler_warnings: cli.CompilerWarnings,
 ) !void {
     const stdout = std.fs.File.stdout();
 
-    // Filter by threshold
+    // Apply compiler warnings and filter by threshold
     var filtered: std.ArrayList(Diagnostic) = .empty;
     defer filtered.deinit(allocator);
 
     for (diagnostics) |d| {
+        var diag = d;
+
+        // Apply compiler warning behaviors
+        if (d.code) |code| {
+            if (compiler_warnings.get(code)) |behavior| {
+                switch (behavior) {
+                    .ignore => continue,
+                    .@"error" => diag.severity = .@"error",
+                }
+            }
+        }
+
+        // Filter by threshold
         const include = switch (threshold) {
-            .@"error" => d.severity == .@"error",
+            .@"error" => diag.severity == .@"error",
             .warning => true,
         };
-        if (include) try filtered.append(allocator, d);
+        if (include) try filtered.append(allocator, diag);
     }
 
     switch (format) {
