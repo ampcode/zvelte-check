@@ -148,7 +148,9 @@ fn writeTempTsconfig(
     try file.writeAll("    \"noEmit\": true,\n");
     try file.writeAll("    \"skipLibCheck\": true,\n");
     try file.writeAll("    \"allowJs\": true,\n");
-    try file.writeAll("    \"checkJs\": true\n");
+    try file.writeAll("    \"checkJs\": true,\n");
+    try file.writeAll("    \"noUnusedLocals\": false,\n");
+    try file.writeAll("    \"noUnusedParameters\": false\n");
     try file.writeAll("  },\n");
 
     // Include our virtual files and SvelteKit stubs
