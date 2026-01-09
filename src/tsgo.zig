@@ -13,6 +13,25 @@ const LineTable = @import("source_map.zig").LineTable;
 const generated_tsconfig = ".svelte-check-tsconfig.json";
 const generated_stubs = ".svelte-check-stubs.d.ts";
 
+pub const TsgoNotFoundError = error{TsgoNotFound};
+
+/// Finds the tsgo binary. Checks node_modules/.bin/tsgo first (for pnpm/npm installs),
+/// then falls back to "tsgo" in PATH.
+fn findTsgoBinary(allocator: std.mem.Allocator, workspace_dir: std.fs.Dir) ![]const u8 {
+    // Check node_modules/.bin/tsgo first
+    const node_modules_tsgo = "node_modules/.bin/tsgo";
+    if (workspace_dir.access(node_modules_tsgo, .{})) {
+        // Return absolute path for the binary
+        const real_path = workspace_dir.realpathAlloc(allocator, node_modules_tsgo) catch {
+            return "tsgo"; // Fall back to PATH
+        };
+        return real_path;
+    } else |_| {}
+
+    // Fall back to tsgo in PATH
+    return "tsgo";
+}
+
 pub fn check(
     allocator: std.mem.Allocator,
     virtual_files: []const VirtualFile,
@@ -52,11 +71,14 @@ pub fn check(
     try writeGeneratedTsconfig(workspace_dir, workspace_path, tsconfig_path, virtual_files);
     try generated_files.append(allocator, try allocator.dupe(u8, generated_tsconfig));
 
+    // Find tsgo binary: check node_modules/.bin first, then PATH
+    const tsgo_path = try findTsgoBinary(allocator, workspace_dir);
+
     // Build tsgo command
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
-    try args.append(allocator, "tsgo");
+    try args.append(allocator, tsgo_path);
     try args.append(allocator, "--noEmit");
     try args.append(allocator, "--project");
 
@@ -70,7 +92,12 @@ pub fn check(
     child.stdout_behavior = .Pipe;
     child.cwd = workspace_path;
 
-    try child.spawn();
+    child.spawn() catch |err| {
+        if (err == error.FileNotFound) {
+            return TsgoNotFoundError.TsgoNotFound;
+        }
+        return err;
+    };
 
     // Collect stdout/stderr concurrently to avoid pipe deadlock
     var stdout_buf: std.ArrayList(u8) = .empty;
@@ -79,7 +106,14 @@ pub fn check(
     defer stderr_buf.deinit(allocator);
 
     try child.collectOutput(allocator, &stdout_buf, &stderr_buf, 10 * 1024 * 1024);
-    const result = try child.wait();
+
+    // Wait can also return FileNotFound if spawn was deferred
+    const result = child.wait() catch |err| {
+        if (err == error.FileNotFound) {
+            return TsgoNotFoundError.TsgoNotFound;
+        }
+        return err;
+    };
 
     const stdout = stdout_buf.items;
     const stderr = stderr_buf.items;

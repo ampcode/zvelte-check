@@ -150,7 +150,17 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
 
     // 5. Run tsgo
     if (!args.no_tsconfig) {
-        const ts_diagnostics = try tsgo.check(allocator, virtual_files.items, args.workspace, args.tsconfig);
+        const ts_diagnostics = tsgo.check(allocator, virtual_files.items, args.workspace, args.tsconfig) catch |err| {
+            if (err == tsgo.TsgoNotFoundError.TsgoNotFound) {
+                const stderr = std.fs.File.stderr();
+                try stderr.writeAll("error: tsgo not found\n\n");
+                try stderr.writeAll("tsgo is required for TypeScript checking. Install it with:\n");
+                try stderr.writeAll("  pnpm add -D @aspect-build/tsgo\n\n");
+                try stderr.writeAll("Or skip TypeScript checking with --no-tsconfig\n");
+                return 1;
+            }
+            return err;
+        };
 
         for (ts_diagnostics) |d| {
             try all_diagnostics.append(allocator, d);
