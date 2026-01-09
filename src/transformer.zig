@@ -76,7 +76,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Svelte 5 rune type declarations
     try output.appendSlice(allocator,
         \\// Svelte 5 rune type stubs
-        \\declare function $state<T>(initial: T): T;
+        \\declare function $state<T = undefined>(initial?: T): T;
         \\declare namespace $state {
         \\  function raw<T>(initial: T): T;
         \\  function snapshot<T>(state: T): T;
