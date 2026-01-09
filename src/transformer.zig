@@ -769,6 +769,73 @@ fn emitSnippetParamDeclarations(
 
         const start = i;
 
+        // Check for destructuring patterns (object or array)
+        if (params[i] == '{' or params[i] == '[') {
+            const open_char = params[i];
+            const close_char: u8 = if (open_char == '{') '}' else ']';
+            i += 1;
+            var depth: u32 = 1;
+            while (i < params.len and depth > 0) {
+                if (params[i] == open_char) depth += 1;
+                if (params[i] == close_char) depth -= 1;
+                i += 1;
+            }
+
+            const pattern = std.mem.trim(u8, params[start..i], " \t\n\r");
+
+            // Check for type annotation after destructuring
+            while (i < params.len and std.ascii.isWhitespace(params[i])) : (i += 1) {}
+            var type_annotation: ?[]const u8 = null;
+            if (i < params.len and params[i] == ':') {
+                i += 1;
+                const type_start = i;
+                var type_depth: u32 = 0;
+                while (i < params.len) {
+                    const c = params[i];
+                    if (c == '<' or c == '(' or c == '[' or c == '{') type_depth += 1;
+                    if (c == '>' or c == ')' or c == ']' or c == '}') {
+                        if (type_depth > 0) {
+                            type_depth -= 1;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    if (type_depth == 0 and (c == ',' or c == '=')) break;
+                    i += 1;
+                }
+                type_annotation = std.mem.trim(u8, params[type_start..i], " \t\n\r");
+            }
+
+            // Skip default value if present
+            while (i < params.len and std.ascii.isWhitespace(params[i])) : (i += 1) {}
+            if (i < params.len and params[i] == '=') {
+                i += 1;
+                var eq_depth: u32 = 0;
+                while (i < params.len) {
+                    const c = params[i];
+                    if (c == '(' or c == '[' or c == '{') eq_depth += 1;
+                    if ((c == ')' or c == ']' or c == '}') and eq_depth > 0) eq_depth -= 1;
+                    if (eq_depth == 0 and c == ',') break;
+                    i += 1;
+                }
+            }
+
+            // Emit destructuring pattern declaration
+            try output.appendSlice(allocator, "var ");
+            try output.appendSlice(allocator, pattern);
+            try output.appendSlice(allocator, ": ");
+            if (type_annotation) |t| {
+                try output.appendSlice(allocator, t);
+            } else {
+                try output.appendSlice(allocator, "any");
+            }
+            try output.appendSlice(allocator, ";\n");
+
+            // Skip comma
+            if (i < params.len and params[i] == ',') i += 1;
+            continue;
+        }
+
         // Find end of parameter name (stop at : for type, , for next, ) for end)
         while (i < params.len) {
             const c = params[i];
@@ -2555,6 +2622,35 @@ test "each block with object destructuring" {
 
     // Should handle object destructuring correctly
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { id, value } = (items)[0];") != null);
+}
+
+test "snippet with object destructuring param" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\    let count = $state(0);
+        \\</script>
+        \\
+        \\{#snippet child({ wrapperProps, props, open })}
+        \\    <div {...wrapperProps}>
+        \\        <span>{open}</span>
+        \\    </div>
+        \\{/snippet}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should handle object destructuring as a single pattern
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { wrapperProps, props, open }: any;") != null);
+    // Should NOT have broken syntax
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { wrapperProps: any;") == null);
 }
 
 test "const tag with template literal" {
