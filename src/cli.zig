@@ -28,13 +28,13 @@ pub const Args = struct {
     ignore: []const []const u8,
     fail_on_warnings: bool,
     threshold: Threshold,
-    diagnostic_sources: struct {
-        js: bool,
-        svelte: bool,
-        css: bool,
-    },
+    diagnostic_sources: DiagnosticSources,
+};
 
-    // No deinit needed - arena handles cleanup
+pub const DiagnosticSources = struct {
+    js: bool = true,
+    svelte: bool = true,
+    css: bool = true,
 };
 
 pub fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -52,7 +52,7 @@ pub fn parseArgs(allocator: std.mem.Allocator) !Args {
         .ignore = &.{},
         .fail_on_warnings = false,
         .threshold = .warning,
-        .diagnostic_sources = .{ .js = true, .svelte = true, .css = true },
+        .diagnostic_sources = .{},
     };
 
     while (args_iter.next()) |arg| {

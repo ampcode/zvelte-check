@@ -115,10 +115,24 @@ pub const Ast = struct {
 
     // No deinit needed - arena handles cleanup
 
-    pub fn runDiagnostics(self: *const Ast, allocator: std.mem.Allocator, diagnostics: *std.ArrayList(Diagnostic)) !void {
-        try a11y.runDiagnostics(allocator, self, diagnostics);
-        try css.runDiagnostics(allocator, self, diagnostics);
-        try component.runDiagnostics(allocator, self, diagnostics);
+    pub const DiagnosticSources = struct {
+        svelte: bool = true,
+        css: bool = true,
+    };
+
+    pub fn runDiagnostics(
+        self: *const Ast,
+        allocator: std.mem.Allocator,
+        diagnostics: *std.ArrayList(Diagnostic),
+        sources: DiagnosticSources,
+    ) !void {
+        if (sources.svelte) {
+            try a11y.runDiagnostics(allocator, self, diagnostics);
+            try component.runDiagnostics(allocator, self, diagnostics);
+        }
+        if (sources.css) {
+            try css.runDiagnostics(allocator, self, diagnostics);
+        }
     }
 };
 

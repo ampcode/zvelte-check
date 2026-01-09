@@ -35,6 +35,7 @@ const FileResult = struct {
 const ProcessContext = struct {
     backing_allocator: std.mem.Allocator,
     results: []FileResult,
+    diagnostic_sources: cli.DiagnosticSources,
 };
 
 pub fn main() !void {
@@ -96,6 +97,7 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
     var ctx: ProcessContext = .{
         .backing_allocator = backing_allocator,
         .results = results,
+        .diagnostic_sources = args.diagnostic_sources,
     };
 
     // Use thread pool for parallel processing
@@ -148,8 +150,8 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
         try stdout.writeAll("\n");
     }
 
-    // 5. Run tsgo
-    if (!args.no_tsconfig) {
+    // 5. Run tsgo (skip when js diagnostics disabled or --no-tsconfig)
+    if (!args.no_tsconfig and args.diagnostic_sources.js) {
         const ts_diagnostics = tsgo.check(allocator, virtual_files.items, args.workspace, args.tsconfig) catch |err| {
             if (err == tsgo.TsgoNotFoundError.TsgoNotFound) {
                 const stderr = std.fs.File.stderr();
@@ -205,7 +207,10 @@ fn processFileInner(ctx: *ProcessContext, file_path: []const u8, index: usize) !
 
     // Svelte diagnostics (a11y, CSS) - collect into local list
     var diag_list: std.ArrayList(Diagnostic) = .empty;
-    try ast.runDiagnostics(allocator, &diag_list);
+    try ast.runDiagnostics(allocator, &diag_list, .{
+        .svelte = ctx.diagnostic_sources.svelte,
+        .css = ctx.diagnostic_sources.css,
+    });
 
     // Transform to TS
     const virtual = try transformer.transform(allocator, ast);
