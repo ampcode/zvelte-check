@@ -108,6 +108,8 @@ pub fn parseArgsFromIterator(allocator: std.mem.Allocator, args_iter: anytype) !
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             printVersion();
             std.process.exit(0);
+        } else {
+            return error.UnknownArgument;
         }
     }
 

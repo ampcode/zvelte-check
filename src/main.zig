@@ -55,7 +55,16 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const args = try cli.parseArgs(allocator);
+    const args = cli.parseArgs(allocator) catch |err| {
+        const stderr = std.fs.File.stderr();
+        switch (err) {
+            error.UnknownArgument => stderr.writeAll("error: unknown argument\n\nRun with --help for usage.\n") catch {},
+            error.MissingArgValue => stderr.writeAll("error: missing value for argument\n") catch {},
+            error.WatchModeNotSupported => stderr.writeAll("error: watch mode is not supported\n") catch {},
+            else => stderr.writeAll("error: invalid arguments\n") catch {},
+        }
+        std.process.exit(1);
+    };
 
     const exit_code = try run(backing_allocator, allocator, args);
     std.process.exit(exit_code);
