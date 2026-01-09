@@ -59,7 +59,7 @@ pub fn parseArgs(allocator: std.mem.Allocator) !Args {
             result.workspace = args_iter.next() orelse return error.MissingArgValue;
         } else if (std.mem.eql(u8, arg, "--output")) {
             const fmt = args_iter.next() orelse return error.MissingArgValue;
-            result.output_format = std.meta.stringToEnum(OutputFormat, fmt) orelse return error.InvalidOutputFormat;
+            result.output_format = parseOutputFormat(fmt) orelse return error.InvalidOutputFormat;
         } else if (std.mem.eql(u8, arg, "--tsconfig")) {
             result.tsconfig = args_iter.next() orelse return error.MissingArgValue;
         } else if (std.mem.eql(u8, arg, "--no-tsconfig")) {
@@ -93,6 +93,19 @@ pub fn parseArgs(allocator: std.mem.Allocator) !Args {
     return result;
 }
 
+/// Parses output format, accepting both underscore (human_verbose) and
+/// hyphenated (human-verbose) forms for svelte-check compatibility.
+fn parseOutputFormat(fmt: []const u8) ?OutputFormat {
+    // Direct match first
+    if (std.meta.stringToEnum(OutputFormat, fmt)) |f| return f;
+
+    // Normalize hyphens to underscores for svelte-check compat
+    if (std.mem.eql(u8, fmt, "human-verbose")) return .human_verbose;
+    if (std.mem.eql(u8, fmt, "machine-verbose")) return .human_verbose; // machine-verbose maps to human_verbose
+
+    return null;
+}
+
 fn parseCommaSeparated(allocator: std.mem.Allocator, input: []const u8) ![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, input, ',');
@@ -114,7 +127,7 @@ fn printHelp() void {
         \\
         \\OPTIONS:
         \\    --workspace <PATH>       Working directory (default: .)
-        \\    --output <FORMAT>        Output: human, human_verbose, machine, json
+        \\    --output <FORMAT>        Output: human, human-verbose, machine, json
         \\    --tsconfig <PATH>        Path to tsconfig.json
         \\    --no-tsconfig            Skip TypeScript checking
         \\    --ignore <PATTERNS>      Comma-separated glob patterns to ignore
@@ -137,4 +150,19 @@ test "parseArgs defaults" {
     const allocator = std.testing.allocator;
     var iter = try std.process.argsWithAllocator(allocator);
     defer iter.deinit();
+}
+
+test "parseOutputFormat accepts hyphenated and underscore forms" {
+    // Underscore forms (our native format)
+    try std.testing.expectEqual(.human, parseOutputFormat("human"));
+    try std.testing.expectEqual(.human_verbose, parseOutputFormat("human_verbose"));
+    try std.testing.expectEqual(.machine, parseOutputFormat("machine"));
+    try std.testing.expectEqual(.json, parseOutputFormat("json"));
+
+    // Hyphenated forms (svelte-check compat)
+    try std.testing.expectEqual(.human_verbose, parseOutputFormat("human-verbose"));
+    try std.testing.expectEqual(.human_verbose, parseOutputFormat("machine-verbose"));
+
+    // Invalid
+    try std.testing.expectEqual(null, parseOutputFormat("invalid"));
 }
