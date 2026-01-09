@@ -155,6 +155,9 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         try output.appendSlice(allocator, "\n\n");
     }
 
+    // Extract and emit template expressions for type checking
+    try emitTemplateExpressions(allocator, &ast, &output, &mappings);
+
     // Extract props from instance script
     var props: std.ArrayList(PropInfo) = .empty;
     defer props.deinit(allocator);
@@ -593,6 +596,346 @@ fn extractSlots(allocator: std.mem.Allocator, ast: *const Ast, slots: *std.Array
             });
         }
     }
+}
+
+const ExprInfo = struct {
+    expr: []const u8,
+    offset: u32,
+};
+
+/// Extracts template expressions from the AST and emits them as TypeScript
+/// statements for type-checking. Handles:
+/// - {#if condition} → void (condition);
+/// - {#each items as item} → void (items); declare let item: typeof items[number];
+/// - {#await promise} → void (promise);
+/// - {#key expr} → void (expr);
+/// - {@render snippet(args)} → void (snippet(args));
+///
+/// Plain expressions like {variable} are NOT emitted separately because they
+/// often reference loop bindings that would be out of scope in the generated TS.
+fn emitTemplateExpressions(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    output: *std.ArrayList(u8),
+    mappings: *std.ArrayList(SourceMap.Mapping),
+) !void {
+    var has_expressions = false;
+
+    for (ast.nodes.items) |node| {
+        // Only emit controlling expressions from block statements.
+        // Skip plain expressions {foo} since they may reference loop bindings
+        // that are out of scope in the flat TS output.
+        const expr_info = switch (node.kind) {
+            .if_block => extractIfExpression(ast.source, node.start, node.end),
+            .each_block => extractEachExpression(ast.source, node.start, node.end),
+            .await_block => extractAwaitExpression(ast.source, node.start, node.end),
+            .key_block => extractKeyExpression(ast.source, node.start, node.end),
+            .render => extractRenderExpression(ast.source, node.start, node.end),
+            else => null,
+        };
+
+        if (expr_info) |info| {
+            if (!has_expressions) {
+                try output.appendSlice(allocator, "// Template expressions\n");
+                has_expressions = true;
+            }
+
+            // Add source mapping for the expression
+            try mappings.append(allocator, .{
+                .svelte_offset = node.start + info.offset,
+                .ts_offset = @intCast(output.items.len),
+                .len = @intCast(info.expr.len),
+            });
+
+            // Emit as a statement: void (expr);
+            // Using void ensures any expression is valid as a statement
+            try output.appendSlice(allocator, "void (");
+
+            // Transform store subscriptions in template expressions
+            const transformed = try transformStoreSubscriptions(allocator, info.expr);
+            try output.appendSlice(allocator, transformed);
+
+            try output.appendSlice(allocator, ");\n");
+        }
+    }
+
+    if (has_expressions) {
+        try output.appendSlice(allocator, "\n");
+    }
+}
+
+/// Extracts the condition expression from {#if condition}
+fn extractIfExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
+    const content = source[start..end];
+    // Format: {#if condition}
+    const prefix = "{#if ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const expr_start = idx + prefix.len;
+
+    // Find closing brace, respecting template literals and nested braces
+    const expr_end = findExpressionEnd(content, expr_start);
+    const expr = std.mem.trim(u8, content[expr_start..expr_end], " \t\n\r");
+    if (expr.len == 0) return null;
+    return .{ .expr = expr, .offset = @intCast(expr_start) };
+}
+
+/// Extracts the iterable expression from {#each items as item}
+fn extractEachExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
+    const content = source[start..end];
+    // Format: {#each expr as ...}
+    const prefix = "{#each ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const expr_start = idx + prefix.len;
+
+    // Find " as " keyword, respecting strings and nested structures
+    const as_pos = findAsKeyword(content[expr_start..]) orelse return null;
+    const expr = std.mem.trim(u8, content[expr_start .. expr_start + as_pos], " \t\n\r");
+    if (expr.len == 0) return null;
+    return .{ .expr = expr, .offset = @intCast(expr_start) };
+}
+
+/// Finds the position of " as " keyword in an each expression,
+/// respecting strings, template literals, and nested structures.
+fn findAsKeyword(expr: []const u8) ?usize {
+    var i: usize = 0;
+    var paren_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
+    var brace_depth: u32 = 0;
+
+    while (i < expr.len) {
+        const c = expr[i];
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            const quote = c;
+            i += 1;
+            while (i < expr.len) {
+                if (expr[i] == '\\' and i + 1 < expr.len) {
+                    i += 2;
+                    continue;
+                }
+                if (expr[i] == quote) {
+                    i += 1;
+                    break;
+                }
+                if (quote == '`' and expr[i] == '$' and i + 1 < expr.len and expr[i + 1] == '{') {
+                    i += 2;
+                    var depth: u32 = 1;
+                    while (i < expr.len and depth > 0) {
+                        if (expr[i] == '{') depth += 1;
+                        if (expr[i] == '}') depth -= 1;
+                        if (depth > 0) i += 1;
+                    }
+                    if (i < expr.len) i += 1;
+                    continue;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Track nesting
+        if (c == '(') paren_depth += 1;
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+        if (c == '[') bracket_depth += 1;
+        if (c == ']' and bracket_depth > 0) bracket_depth -= 1;
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+
+        // Check for " as " only at depth 0
+        if (paren_depth == 0 and bracket_depth == 0 and brace_depth == 0) {
+            if (i + 4 <= expr.len and std.mem.eql(u8, expr[i .. i + 4], " as ")) {
+                return i;
+            }
+        }
+
+        i += 1;
+    }
+    return null;
+}
+
+/// Extracts the promise expression from {#await promise}
+fn extractAwaitExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
+    const content = source[start..end];
+    // Format: {#await expr} or {#await expr then value}
+    const prefix = "{#await ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const expr_start = idx + prefix.len;
+
+    // Find expression end (closing brace)
+    const expr_end = findExpressionEnd(content, expr_start);
+    var expr = std.mem.trim(u8, content[expr_start..expr_end], " \t\n\r");
+
+    // Check for " then " and extract only the promise part before it
+    // Need to handle: "getData() then result" → "getData()"
+    if (findThenKeyword(expr)) |then_pos| {
+        expr = std.mem.trim(u8, expr[0..then_pos], " \t\n\r");
+    }
+
+    if (expr.len == 0) return null;
+    return .{ .expr = expr, .offset = @intCast(expr_start) };
+}
+
+/// Finds the position of " then" keyword in an await expression,
+/// respecting strings and template literals.
+fn findThenKeyword(expr: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < expr.len) {
+        const c = expr[i];
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            const quote = c;
+            i += 1;
+            while (i < expr.len) {
+                if (expr[i] == '\\' and i + 1 < expr.len) {
+                    i += 2;
+                    continue;
+                }
+                if (expr[i] == quote) {
+                    i += 1;
+                    break;
+                }
+                if (quote == '`' and expr[i] == '$' and i + 1 < expr.len and expr[i + 1] == '{') {
+                    i += 2;
+                    var depth: u32 = 1;
+                    while (i < expr.len and depth > 0) {
+                        if (expr[i] == '{') depth += 1;
+                        if (expr[i] == '}') depth -= 1;
+                        if (depth > 0) i += 1;
+                    }
+                    if (i < expr.len) i += 1;
+                    continue;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Check for " then" (with space before)
+        if (i > 0 and i + 5 <= expr.len) {
+            if (std.mem.eql(u8, expr[i .. i + 5], " then")) {
+                // Check it's followed by space or end
+                if (i + 5 == expr.len or std.ascii.isWhitespace(expr[i + 5])) {
+                    return i;
+                }
+            }
+        }
+
+        i += 1;
+    }
+    return null;
+}
+
+/// Extracts the key expression from {#key expr}
+fn extractKeyExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
+    const content = source[start..end];
+    // Format: {#key expr}
+    const prefix = "{#key ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const expr_start = idx + prefix.len;
+
+    // Find closing brace, respecting template literals and nested braces
+    const expr_end = findExpressionEnd(content, expr_start);
+    const expr = std.mem.trim(u8, content[expr_start..expr_end], " \t\n\r");
+    if (expr.len == 0) return null;
+    return .{ .expr = expr, .offset = @intCast(expr_start) };
+}
+
+/// Finds the end of a template expression, respecting strings and nested braces.
+fn findExpressionEnd(content: []const u8, start_pos: usize) usize {
+    var i = start_pos;
+    var brace_depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Handle strings
+        if (c == '"' or c == '\'') {
+            const quote = c;
+            i += 1;
+            while (i < content.len) {
+                if (content[i] == '\\' and i + 1 < content.len) {
+                    i += 2;
+                    continue;
+                }
+                if (content[i] == quote) {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Handle template literals
+        if (c == '`') {
+            i += 1;
+            while (i < content.len) {
+                if (content[i] == '\\' and i + 1 < content.len) {
+                    i += 2;
+                    continue;
+                }
+                if (content[i] == '`') {
+                    i += 1;
+                    break;
+                }
+                // Handle ${...} in template literals
+                if (content[i] == '$' and i + 1 < content.len and content[i + 1] == '{') {
+                    i += 2;
+                    var template_depth: u32 = 1;
+                    while (i < content.len and template_depth > 0) {
+                        if (content[i] == '{') template_depth += 1;
+                        if (content[i] == '}') template_depth -= 1;
+                        if (template_depth > 0) i += 1;
+                    }
+                    if (i < content.len) i += 1;
+                    continue;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Track nested braces (for objects, function calls, etc.)
+        if (c == '(' or c == '[' or c == '{') {
+            brace_depth += 1;
+            i += 1;
+            continue;
+        }
+        if ((c == ')' or c == ']') and brace_depth > 0) {
+            brace_depth -= 1;
+            i += 1;
+            continue;
+        }
+
+        // End at } only when at depth 0
+        if (c == '}') {
+            if (brace_depth == 0) {
+                return i;
+            }
+            brace_depth -= 1;
+        }
+
+        i += 1;
+    }
+
+    return i;
+}
+
+/// Extracts expression from {@render snippet(args)}
+fn extractRenderExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
+    const content = source[start..end];
+    // Format: {@render expr}
+    const prefix = "{@render ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const expr_start = idx + prefix.len;
+
+    // Find closing brace, respecting template literals and nested braces
+    const expr_end = findExpressionEnd(content, expr_start);
+    const expr = std.mem.trim(u8, content[expr_start..expr_end], " \t\n\r");
+    if (expr.len == 0) return null;
+    return .{ .expr = expr, .offset = @intCast(expr_start) };
 }
 
 fn skipString(content: []const u8, start: usize) usize {
@@ -1569,4 +1912,36 @@ test "transform reactive statement preserves function calls" {
     defer allocator.free(result);
 
     try std.testing.expectEqualStrings("  $: console.log(x);", result);
+}
+
+test "transform template expressions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let items = [1, 2, 3];
+        \\  let condition = true;
+        \\</script>
+        \\{#if condition}
+        \\  <p>Yes</p>
+        \\{/if}
+        \\{#each items as item}
+        \\  <p>{item}</p>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should have template expressions section
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "// Template expressions") != null);
+    // Should have the if condition check
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void (condition)") != null);
+    // Should have the each iterable check
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void (items)") != null);
 }
