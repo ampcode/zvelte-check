@@ -10,6 +10,7 @@ pub const OutputFormat = enum {
     human,
     human_verbose,
     machine,
+    machine_verbose,
     json,
 };
 
@@ -101,7 +102,7 @@ fn parseOutputFormat(fmt: []const u8) ?OutputFormat {
 
     // Normalize hyphens to underscores for svelte-check compat
     if (std.mem.eql(u8, fmt, "human-verbose")) return .human_verbose;
-    if (std.mem.eql(u8, fmt, "machine-verbose")) return .human_verbose; // machine-verbose maps to human_verbose
+    if (std.mem.eql(u8, fmt, "machine-verbose")) return .machine_verbose;
 
     return null;
 }
@@ -161,7 +162,7 @@ test "parseOutputFormat accepts hyphenated and underscore forms" {
 
     // Hyphenated forms (svelte-check compat)
     try std.testing.expectEqual(.human_verbose, parseOutputFormat("human-verbose"));
-    try std.testing.expectEqual(.human_verbose, parseOutputFormat("machine-verbose"));
+    try std.testing.expectEqual(.machine_verbose, parseOutputFormat("machine-verbose"));
 
     // Invalid
     try std.testing.expectEqual(null, parseOutputFormat("invalid"));

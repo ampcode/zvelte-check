@@ -28,6 +28,7 @@ pub fn print(
         .human => try printHuman(stdout, filtered.items),
         .human_verbose => try printHumanVerbose(stdout, filtered.items),
         .machine => try printMachine(stdout, filtered.items),
+        .machine_verbose => try printMachineVerbose(stdout, filtered.items),
         .json => try printJson(stdout, filtered.items),
     }
 
@@ -119,6 +120,50 @@ fn printMachine(file: std.fs.File, diagnostics: []const Diagnostic) !void {
     try file.writeAll(completed);
 }
 
+/// NDJSON format compatible with svelte-check's machine-verbose output.
+/// Each line is a JSON object with: timestamp, filename, start/end positions,
+/// message, code, hint, and source.
+fn printMachineVerbose(file: std.fs.File, diagnostics: []const Diagnostic) !void {
+    const timestamp = std.time.milliTimestamp();
+    var buf: [2048]u8 = undefined;
+
+    for (diagnostics) |d| {
+        const code_str = d.code orelse "";
+        const hint = codeToHint(d.code);
+        const source_str = switch (d.source) {
+            .js => "js",
+            .svelte => "svelte",
+            .css => "css",
+        };
+
+        const line = std.fmt.bufPrint(&buf,
+            \\{{"timestamp":{d},"filename":"{s}","start":{{"line":{d},"column":{d}}},"end":{{"line":{d},"column":{d}}},"message":"{s}","code":"{s}","hint":"{s}","source":"{s}"}}
+            \\
+        , .{
+            timestamp,
+            d.file_path,
+            d.start_line,
+            d.start_col,
+            d.end_line,
+            d.end_col,
+            d.message, // TODO: escape JSON special chars
+            code_str,
+            hint,
+            source_str,
+        }) catch continue;
+        try file.writeAll(line);
+    }
+}
+
+/// Map diagnostic codes to human-friendly hints
+fn codeToHint(code: ?[]const u8) []const u8 {
+    const c = code orelse return "";
+    if (std.mem.startsWith(u8, c, "a11y-")) return "Accessibility";
+    if (std.mem.startsWith(u8, c, "css-")) return "CSS";
+    if (std.mem.startsWith(u8, c, "ts")) return "TypeScript";
+    return "";
+}
+
 fn printJson(file: std.fs.File, diagnostics: []const Diagnostic) !void {
     var buf: [2048]u8 = undefined;
 
@@ -163,6 +208,7 @@ pub fn printNoFiles(format: cli.OutputFormat) !void {
             const completed = std.fmt.bufPrint(&buf, "{d} COMPLETED 0 FILES 0 ERRORS 0 WARNINGS 0 FILES_WITH_PROBLEMS\n", .{timestamp}) catch return;
             try stdout.writeAll(completed);
         },
+        .machine_verbose => {}, // NDJSON outputs nothing when no files
         .json => try stdout.writeAll("[]\n"),
     }
 }
