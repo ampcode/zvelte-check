@@ -98,7 +98,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         \\
         \\// Svelte store auto-subscription stub
         \\// $storeName syntax in Svelte auto-subscribes to the store
-        \\declare function __svelte_store_get<T>(store: { subscribe: (fn: (value: T) => void) => any }): T;
+        \\declare function __svelte_store_get<T>(store: { subscribe: (fn: (value: T) => void) => any } | null | undefined): T | undefined;
         \\
         \\
     );
