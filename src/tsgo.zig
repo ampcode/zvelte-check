@@ -37,8 +37,11 @@ pub fn check(
 
     // Write transformed .svelte.ts files alongside .svelte sources
     for (virtual_files) |vf| {
-        try writeVirtualFile(workspace_dir, vf);
-        try generated_files.append(allocator, try allocator.dupe(u8, vf.virtual_path));
+        // Strip workspace prefix from virtual_path to get relative path
+        const relative_path = stripWorkspacePrefix(vf.virtual_path, workspace_path);
+
+        try writeVirtualFile(workspace_dir, relative_path, vf.content);
+        try generated_files.append(allocator, try allocator.dupe(u8, relative_path));
     }
 
     // Write SvelteKit ambient type stubs
@@ -46,7 +49,7 @@ pub fn check(
     try generated_files.append(allocator, try allocator.dupe(u8, generated_stubs));
 
     // Generate tsconfig that extends project config and includes only our files
-    try writeGeneratedTsconfig(allocator, workspace_dir, tsconfig_path, virtual_files);
+    try writeGeneratedTsconfig(workspace_dir, workspace_path, tsconfig_path, virtual_files);
     try generated_files.append(allocator, try allocator.dupe(u8, generated_tsconfig));
 
     // Build tsgo command
@@ -101,10 +104,26 @@ pub fn check(
 }
 
 /// Writes a transformed .svelte.ts file alongside its .svelte source.
-fn writeVirtualFile(workspace_dir: std.fs.Dir, vf: VirtualFile) !void {
-    const file = try workspace_dir.createFile(vf.virtual_path, .{});
+/// `relative_path` should be relative to workspace_dir (not include workspace prefix).
+fn writeVirtualFile(workspace_dir: std.fs.Dir, relative_path: []const u8, content: []const u8) !void {
+    const file = try workspace_dir.createFile(relative_path, .{});
     defer file.close();
-    try file.writeAll(vf.content);
+    try file.writeAll(content);
+}
+
+/// Strips workspace prefix from a path to get a relative path.
+/// If workspace_path is empty or path doesn't start with it, returns the original path.
+fn stripWorkspacePrefix(path: []const u8, workspace_path: []const u8) []const u8 {
+    if (workspace_path.len == 0) return path;
+    if (!std.mem.startsWith(u8, path, workspace_path)) return path;
+
+    // Calculate how much to skip: workspace path + separator
+    var skip_len = workspace_path.len;
+    if (!std.mem.endsWith(u8, workspace_path, "/") and skip_len < path.len and path[skip_len] == '/') {
+        skip_len += 1;
+    }
+
+    return if (skip_len < path.len) path[skip_len..] else path;
 }
 
 /// Cleans up generated .svelte.ts files and tsconfig.
@@ -117,8 +136,8 @@ fn cleanupGeneratedFiles(workspace_dir: std.fs.Dir, paths: []const []const u8) v
 /// Generates a tsconfig that extends the project's config.
 /// Includes only transformed .svelte.ts files and our type stubs.
 fn writeGeneratedTsconfig(
-    allocator: std.mem.Allocator,
     workspace_dir: std.fs.Dir,
+    workspace_path: []const u8,
     tsconfig_path: ?[]const u8,
     virtual_files: []const VirtualFile,
 ) !void {
@@ -156,8 +175,11 @@ fn writeGeneratedTsconfig(
     try file.writeAll("\"");
 
     for (virtual_files) |vf| {
+        // Strip workspace prefix from virtual_path to get relative path
+        const relative_path = stripWorkspacePrefix(vf.virtual_path, workspace_path);
+
         try file.writeAll(",\n    \"");
-        try file.writeAll(vf.virtual_path);
+        try file.writeAll(relative_path);
         try file.writeAll("\"");
     }
 
@@ -166,14 +188,6 @@ fn writeGeneratedTsconfig(
     // Exclude node_modules to avoid scanning everything
     try file.writeAll("  \"exclude\": [\"node_modules\"]\n");
     try file.writeAll("}\n");
-
-    // Debug: log generated config path
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (workspace_dir.realpath(generated_tsconfig, &path_buf)) |real_path| {
-        _ = real_path;
-        // Could add logging here if needed
-    } else |_| {}
-    _ = allocator;
 }
 
 /// Writes SvelteKit virtual module type stubs to the workspace.
@@ -488,8 +502,8 @@ test "writeGeneratedTsconfig generates valid config" {
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
     }};
 
-    // Test with no project tsconfig
-    try writeGeneratedTsconfig(allocator, workspace_dir, null, &virtual_files);
+    // Test with no project tsconfig (empty string as workspace path since paths are already relative)
+    try writeGeneratedTsconfig(workspace_dir, "", null, &virtual_files);
 
     // Read generated config
     const content = try workspace_dir.readFileAlloc(allocator, generated_tsconfig, 10 * 1024);
@@ -524,8 +538,8 @@ test "writeGeneratedTsconfig extends project config when available" {
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
     }};
 
-    // Test with project tsconfig auto-detection
-    try writeGeneratedTsconfig(allocator, workspace_dir, null, &virtual_files);
+    // Test with project tsconfig auto-detection (empty string as workspace path since paths are already relative)
+    try writeGeneratedTsconfig(workspace_dir, "", null, &virtual_files);
 
     // Read generated config
     const content = try workspace_dir.readFileAlloc(allocator, generated_tsconfig, 10 * 1024);
