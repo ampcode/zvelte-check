@@ -1,6 +1,6 @@
 # Performance Benchmark
 
-Comparison of svelte-check-zig vs official svelte-check on a real SvelteKit project.
+Comparison of zvelte-check vs official svelte-check on a real SvelteKit project.
 
 ## Test Environment
 
@@ -11,7 +11,7 @@ Comparison of svelte-check-zig vs official svelte-check on a real SvelteKit proj
 
 ## Results
 
-| Metric | svelte-check-zig | svelte-check | Speedup |
+| Metric | zvelte-check | svelte-check | Speedup |
 |--------|------------------|--------------|---------|
 | Wall time | **1.1s** | 7.9s | **7.2x faster** |
 | CPU time | 2.1s | 14.8s | 7x less CPU |
@@ -19,7 +19,7 @@ Comparison of svelte-check-zig vs official svelte-check on a real SvelteKit proj
 
 ## Notes
 
-### svelte-check-zig
+### zvelte-check
 - Parallel file processing via thread pool
 - Native Zig binary with minimal startup overhead
 - Uses tsgo for TypeScript checking (Go-based, fast startup)

@@ -1,4 +1,4 @@
-//! svelte-check-zig: A fast Svelte diagnostic tool
+//! zvelte-check: A fast Svelte diagnostic tool
 //!
 //! Pipeline:
 //! 1. Scan workspace for .svelte files

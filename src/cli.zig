@@ -165,10 +165,10 @@ fn parseCompilerWarnings(
 
 fn printHelp() void {
     const help =
-        \\svelte-check-zig - Fast Svelte diagnostics
+        \\zvelte-check - Fast Svelte diagnostics
         \\
         \\USAGE:
-        \\    svelte-check-zig [OPTIONS]
+        \\    zvelte-check [OPTIONS]
         \\
         \\OPTIONS:
         \\    --workspace <PATH>       Working directory (default: .)
@@ -188,7 +188,7 @@ fn printHelp() void {
 }
 
 fn printVersion() void {
-    std.fs.File.stdout().writeAll("svelte-check-zig 0.1.0\n") catch {};
+    std.fs.File.stdout().writeAll("zvelte-check 0.1.0\n") catch {};
 }
 
 test "parseArgs defaults" {

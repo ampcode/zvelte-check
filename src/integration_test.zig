@@ -1,6 +1,6 @@
 //! Integration test harness
 //!
-//! Runs the full svelte-check-zig binary on test fixture directories and
+//! Runs the full zvelte-check binary on test fixture directories and
 //! compares output against expected diagnostics. Parses expected diagnostics
 //! from fixture file comments in the format:
 //!   Expected: line N, code: CODE, message: MESSAGE

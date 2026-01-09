@@ -2,7 +2,7 @@
 
 ## Project Scope
 
-This is a fast Svelte diagnostic tool (svelte-check replacement) written in Zig.
+This is zvelte-check, a fast Svelte diagnostic tool (svelte-check replacement) written in Zig.
 
 **In scope:**
 - All svelte-check diagnostics (a11y, CSS, TypeScript/JavaScript)
