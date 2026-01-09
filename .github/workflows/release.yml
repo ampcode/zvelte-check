@@ -1,0 +1,215 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2.1.0
+        with:
+          version: 0.15.2
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            artifact: zvelte-check-linux-x86_64
+          - target: aarch64-linux-gnu
+            artifact: zvelte-check-linux-aarch64
+          - target: x86_64-macos
+            artifact: zvelte-check-darwin-x86_64
+          - target: aarch64-macos
+            artifact: zvelte-check-darwin-aarch64
+          - target: x86_64-windows-gnu
+            artifact: zvelte-check-windows-x86_64
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2.1.0
+        with:
+          version: 0.15.2
+
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Package (Unix)
+        if: "!contains(matrix.target, 'windows')"
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/zvelte-check dist/
+          cd dist
+          tar -czvf ../${{ matrix.artifact }}.tar.gz zvelte-check
+
+      - name: Package (Windows)
+        if: contains(matrix.target, 'windows')
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/zvelte-check.exe dist/
+          cd dist
+          zip ../${{ matrix.artifact }}.zip zvelte-check.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            *.tar.gz
+            *.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Read release notes
+        id: notes
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          NOTES_FILE="docs/releases/${VERSION}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            echo "Release notes found at $NOTES_FILE"
+            {
+              echo "BODY<<EOF"
+              cat "$NOTES_FILE"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          else
+            echo "No release notes found at $NOTES_FILE"
+            echo "BODY=Release $VERSION" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.version.outputs.VERSION }}
+          body: ${{ steps.notes.outputs.BODY }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/checksums.txt
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "Updating Homebrew tap to version ${VERSION}"
+
+          # Get SHA256 for each platform
+          SHA256_DARWIN_ARM64=$(grep darwin-aarch64 artifacts/checksums.txt | cut -d' ' -f1)
+          SHA256_DARWIN_X86_64=$(grep darwin-x86_64 artifacts/checksums.txt | cut -d' ' -f1)
+          SHA256_LINUX_ARM64=$(grep linux-aarch64 artifacts/checksums.txt | cut -d' ' -f1)
+          SHA256_LINUX_X86_64=$(grep linux-x86_64 artifacts/checksums.txt | cut -d' ' -f1)
+
+          # Generate updated formula
+          cat > zvelte-check.rb << EOF
+          class ZvelteCheck < Formula
+            desc "Fast Svelte diagnostic tool written in Zig"
+            homepage "https://github.com/ampcode/zvelte-check"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/ampcode/zvelte-check/releases/download/v#{version}/zvelte-check-darwin-aarch64.tar.gz"
+                sha256 "${SHA256_DARWIN_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/ampcode/zvelte-check/releases/download/v#{version}/zvelte-check-darwin-x86_64.tar.gz"
+                sha256 "${SHA256_DARWIN_X86_64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/ampcode/zvelte-check/releases/download/v#{version}/zvelte-check-linux-aarch64.tar.gz"
+                sha256 "${SHA256_LINUX_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/ampcode/zvelte-check/releases/download/v#{version}/zvelte-check-linux-x86_64.tar.gz"
+                sha256 "${SHA256_LINUX_X86_64}"
+              end
+            end
+
+            def install
+              bin.install "zvelte-check"
+            end
+
+            test do
+              assert_match "zvelte-check", shell_output("#{bin}/zvelte-check --help", 2)
+            end
+          end
+          EOF
+
+          # Push to homebrew-tap repository
+          FORMULA_CONTENT=$(base64 -w0 zvelte-check.rb)
+
+          # Get current file SHA (if exists)
+          CURRENT_SHA=$(curl -sSf -H "Authorization: token ${HOMEBREW_TAP_TOKEN}" \
+            "https://api.github.com/repos/ampcode/homebrew-tap/contents/Formula/zvelte-check.rb" \
+            | jq -r '.sha // empty' || echo "")
+
+          # Prepare request body
+          if [ -n "$CURRENT_SHA" ]; then
+            REQUEST_BODY=$(jq -n \
+              --arg message "Update zvelte-check to ${VERSION}" \
+              --arg content "$FORMULA_CONTENT" \
+              --arg sha "$CURRENT_SHA" \
+              '{message: $message, content: $content, sha: $sha}')
+          else
+            REQUEST_BODY=$(jq -n \
+              --arg message "Add zvelte-check formula ${VERSION}" \
+              --arg content "$FORMULA_CONTENT" \
+              '{message: $message, content: $content}')
+          fi
+
+          # Update/create the formula file
+          curl -sSf -X PUT \
+            -H "Authorization: token ${HOMEBREW_TAP_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/ampcode/homebrew-tap/contents/Formula/zvelte-check.rb" \
+            -d "$REQUEST_BODY"
+
+          echo "Successfully updated homebrew-tap with version ${VERSION}"

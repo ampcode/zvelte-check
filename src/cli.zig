@@ -5,6 +5,9 @@
 //! --fail-on-warnings, --threshold, --diagnostic-sources
 
 const std = @import("std");
+const build_options = @import("build_options");
+
+pub const version = build_options.version;
 
 pub const OutputFormat = enum {
     human,
@@ -188,7 +191,7 @@ fn printHelp() void {
 }
 
 fn printVersion() void {
-    std.fs.File.stdout().writeAll("zvelte-check 0.1.0\n") catch {};
+    std.fs.File.stdout().writeAll("zvelte-check " ++ version ++ "\n") catch {};
 }
 
 test "parseArgs defaults" {
