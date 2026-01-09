@@ -121,6 +121,38 @@ fn parseSelectors(
             continue;
         }
 
+        // Skip string literals (don't extract selectors from paths/URLs in strings)
+        if (c == '"' or c == '\'') {
+            const quote = c;
+            i += 1;
+            while (i < css.len) {
+                if (css[i] == '\\' and i + 1 < css.len) {
+                    i += 2;
+                } else if (css[i] == quote) {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Skip url() contents (don't extract selectors from URLs)
+        if (i + 4 <= css.len and std.mem.eql(u8, css[i..][0..4], "url(")) {
+            i += 4;
+            var depth: u32 = 1;
+            while (i < css.len and depth > 0) {
+                if (css[i] == '(') {
+                    depth += 1;
+                } else if (css[i] == ')') {
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
         // Track :global()
         if (i + 7 <= css.len and std.mem.eql(u8, css[i..][0..7], ":global")) {
             in_global = true;
@@ -456,5 +488,29 @@ test "css: comment handling" {
     try runDiagnostics(allocator, &ast, &diagnostics);
 
     // Should not warn about commented-out selector
+    try std.testing.expect(diagnostics.items.len == 0);
+}
+
+test "css: url and import paths ignored" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<div>content</div>
+        \\<style>
+        \\@import url("https://fonts.googleapis.com/css");
+        \\@reference "../../../app.css";
+        \\div { background: url("image.png"); }
+        \\</style>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should not warn about .googleapis, .com, .css, .png from URLs/paths
     try std.testing.expect(diagnostics.items.len == 0);
 }
