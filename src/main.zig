@@ -171,13 +171,13 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
     try output.print(allocator, args.output_format, all_diagnostics.items, args.threshold);
 
     // 7. Exit code
-    const has_errors = for (all_diagnostics.items) |d| {
-        if (d.severity == .@"error") break true;
-    } else false;
-
-    const has_warnings = for (all_diagnostics.items) |d| {
-        if (d.severity == .warning) break true;
-    } else false;
+    var has_errors = false;
+    var has_warnings = false;
+    for (all_diagnostics.items) |d| {
+        if (d.severity == .@"error") has_errors = true;
+        if (d.severity == .warning) has_warnings = true;
+        if (has_errors and has_warnings) break;
+    }
 
     if (has_errors) return 1;
     if (has_warnings and args.fail_on_warnings) return 1;
