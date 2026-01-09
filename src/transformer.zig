@@ -912,7 +912,9 @@ fn emitSnippetParamDeclarations(
                             continue;
                         }
                     }
-                    if (depth == 0 and (c == ',' or c == '=')) break;
+                    // Stop at comma or standalone = (but not => for arrow function types)
+                    if (depth == 0 and c == ',') break;
+                    if (depth == 0 and c == '=' and (i + 1 >= params.len or params[i + 1] != '>')) break;
                     i += 1;
                 }
                 type_annotation = std.mem.trim(u8, params[type_start..i], " \t\n\r");
