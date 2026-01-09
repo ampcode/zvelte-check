@@ -1045,3 +1045,217 @@ test "a11y: dynamic values skip checks" {
         }
     }
 }
+
+test "a11y: dynamic alt attribute suppresses missing-alt warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    // Dynamic alt value should not warn about missing alt
+    const source = "<img src=\"photo.jpg\" alt={dynamicAlt}>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should have no a11y_missing_attribute warning (alt is present, just dynamic)
+    for (diagnostics.items) |d| {
+        if (d.code) |code| {
+            try std.testing.expect(!std.mem.eql(u8, code, "a11y_missing_attribute"));
+        }
+    }
+}
+
+test "a11y: dynamic src with static alt is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<img src={imageSrc} alt=\"A photo\">";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // No warnings expected
+    for (diagnostics.items) |d| {
+        if (d.code) |code| {
+            try std.testing.expect(!std.mem.eql(u8, code, "a11y_missing_attribute"));
+        }
+    }
+}
+
+test "a11y: dynamic src without alt still warns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<img src={imageSrc}>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should warn about missing alt even with dynamic src
+    var found = false;
+    for (diagnostics.items) |d| {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y_missing_attribute")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "a11y: img with role=presentation valid without alt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<img src=\"decorative.jpg\" role=\"presentation\">";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // No missing-alt warning with role=presentation
+    for (diagnostics.items) |d| {
+        if (d.code) |code| {
+            try std.testing.expect(!std.mem.eql(u8, code, "a11y_missing_attribute"));
+        }
+    }
+}
+
+test "a11y: empty alt for decorative images is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<img src=\"icon.svg\" alt=\"\">";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Empty alt is valid for decorative images
+    for (diagnostics.items) |d| {
+        if (d.code) |code| {
+            try std.testing.expect(!std.mem.eql(u8, code, "a11y_missing_attribute"));
+        }
+    }
+}
+
+test "a11y: dynamic href with static content is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<a href={linkHref}>Click here</a>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Dynamic href is valid
+    for (diagnostics.items) |d| {
+        if (d.code) |code| {
+            try std.testing.expect(!std.mem.eql(u8, code, "a11y_invalid_attribute"));
+        }
+    }
+}
+
+test "a11y: nested elements with violations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    // Nested div structure with a11y violations
+    const source =
+        \\<div>
+        \\  <section>
+        \\    <img src="photo.jpg">
+        \\    <a>Missing href</a>
+        \\  </section>
+        \\</div>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should find both violations in nested context
+    var found_img = false;
+    var found_anchor = false;
+    for (diagnostics.items) |d| {
+        if (d.code) |code| {
+            if (std.mem.eql(u8, code, "a11y_missing_attribute")) found_img = true;
+            if (std.mem.eql(u8, code, "a11y_invalid_attribute")) found_anchor = true;
+        }
+    }
+    try std.testing.expect(found_img);
+    try std.testing.expect(found_anchor);
+}
+
+test "a11y: multiple images with mixed validity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<img src="a.jpg" alt="Valid">
+        \\<img src="b.jpg">
+        \\<img src={c} alt={dynamicAlt}>
+        \\<img src="d.jpg" role="none">
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Only second img (b.jpg) should warn
+    var missing_count: usize = 0;
+    for (diagnostics.items) |d| {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y_missing_attribute")) {
+            missing_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), missing_count);
+}
+
+test "a11y: template expression in alt skips redundant check" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    // "image" word in template shouldn't trigger redundant-alt
+    const source = "<img src=\"photo.jpg\" alt=\"An image of {subject}\">";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should skip redundant check for template expressions
+    for (diagnostics.items) |d| {
+        if (d.code) |code| {
+            try std.testing.expect(!std.mem.eql(u8, code, "a11y_img_redundant_alt"));
+        }
+    }
+}
