@@ -776,8 +776,15 @@ fn emitSnippetParamDeclarations(
             i += 1;
         }
 
-        const param_name = std.mem.trim(u8, params[start..i], " \t\n\r");
+        var param_name = std.mem.trim(u8, params[start..i], " \t\n\r");
         if (param_name.len > 0) {
+            // Check if parameter is optional (ends with ?)
+            var is_optional = false;
+            if (param_name.len > 0 and param_name[param_name.len - 1] == '?') {
+                is_optional = true;
+                param_name = param_name[0 .. param_name.len - 1];
+            }
+
             // Check if there's a type annotation
             var type_annotation: ?[]const u8 = null;
             if (i < params.len and params[i] == ':') {
@@ -819,6 +826,11 @@ fn emitSnippetParamDeclarations(
             try output.appendSlice(allocator, ": ");
             if (type_annotation) |t| {
                 try output.appendSlice(allocator, t);
+                if (is_optional) {
+                    try output.appendSlice(allocator, " | undefined");
+                }
+            } else if (is_optional) {
+                try output.appendSlice(allocator, "any | undefined");
             } else {
                 try output.appendSlice(allocator, "any");
             }
@@ -879,11 +891,12 @@ fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInf
     const bindings = std.mem.trim(u8, content[binding_start..binding_end], " \t\n\r");
     if (bindings.len == 0) return null;
 
-    // Split on comma to get item and optional index
+    // Split on comma to get item and optional index, respecting brackets
     var item_binding: []const u8 = bindings;
     var index_binding: ?[]const u8 = null;
 
-    if (std.mem.indexOf(u8, bindings, ",")) |comma_pos| {
+    // Find comma at top level (not inside brackets)
+    if (findTopLevelComma(bindings)) |comma_pos| {
         item_binding = std.mem.trim(u8, bindings[0..comma_pos], " \t\n\r");
         const after_comma = std.mem.trim(u8, bindings[comma_pos + 1 ..], " \t\n\r");
         // Index might be followed by (key) - extract just the identifier
@@ -902,23 +915,76 @@ fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInf
     };
 }
 
+/// Finds the position of a comma at the top level (not inside brackets)
+fn findTopLevelComma(text: []const u8) ?usize {
+    var i: usize = 0;
+    var bracket_depth: u32 = 0;
+    var brace_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+
+    while (i < text.len) {
+        const c = text[i];
+        switch (c) {
+            '[' => bracket_depth += 1,
+            ']' => {
+                if (bracket_depth > 0) bracket_depth -= 1;
+            },
+            '{' => brace_depth += 1,
+            '}' => {
+                if (brace_depth > 0) brace_depth -= 1;
+            },
+            '(' => paren_depth += 1,
+            ')' => {
+                if (paren_depth > 0) paren_depth -= 1;
+            },
+            ',' => {
+                if (bracket_depth == 0 and brace_depth == 0 and paren_depth == 0) {
+                    return i;
+                }
+            },
+            else => {},
+        }
+        i += 1;
+    }
+    return null;
+}
+
 /// Finds the end of each block bindings (before key expression or closing brace)
+/// Respects nested braces and brackets for destructuring patterns.
 fn findEachBindingEnd(content: []const u8, start: usize) usize {
     var i = start;
     var paren_depth: u32 = 0;
+    var brace_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
 
     while (i < content.len) {
         const c = content[i];
 
-        if (c == '(') {
-            // Only stop at top-level ( which is the key expression
-            if (paren_depth == 0) {
-                return i;
-            }
-            paren_depth += 1;
+        switch (c) {
+            '[' => bracket_depth += 1,
+            ']' => {
+                if (bracket_depth > 0) bracket_depth -= 1;
+            },
+            '{' => brace_depth += 1,
+            '}' => {
+                // End at } only when at depth 0
+                if (brace_depth == 0 and bracket_depth == 0 and paren_depth == 0) {
+                    return i;
+                }
+                if (brace_depth > 0) brace_depth -= 1;
+            },
+            '(' => {
+                // Stop at top-level ( which is the key expression
+                if (paren_depth == 0 and brace_depth == 0 and bracket_depth == 0) {
+                    return i;
+                }
+                paren_depth += 1;
+            },
+            ')' => {
+                if (paren_depth > 0) paren_depth -= 1;
+            },
+            else => {},
         }
-        if (c == ')' and paren_depth > 0) paren_depth -= 1;
-        if (c == '}' and paren_depth == 0) return i;
 
         i += 1;
     }
@@ -968,10 +1034,10 @@ fn extractConstBinding(source: []const u8, start: u32, end: u32) ?ConstBindingIn
     const name = std.mem.trim(u8, content[binding_start .. binding_start + eq_pos], " \t\n\r");
     if (name.len == 0) return null;
 
-    // Find expression (until closing brace)
+    // Find expression (until closing brace), respecting nested braces and template literals
     const expr_start = binding_start + eq_pos + 1;
-    const expr_end = std.mem.indexOf(u8, content[expr_start..], "}") orelse return null;
-    const expr = std.mem.trim(u8, content[expr_start .. expr_start + expr_end], " \t\n\r");
+    const expr_end = findExpressionEnd(content, expr_start);
+    const expr = std.mem.trim(u8, content[expr_start..expr_end], " \t\n\r");
     if (expr.len == 0) return null;
 
     return .{
@@ -2409,4 +2475,111 @@ test "transform const binding" {
 
     // Should have const declaration (TypeScript infers the type)
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var doubled = item * 2;") != null);
+}
+
+test "debug Svelte5EdgeCases optional param" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\    let count = $state(0);
+        \\</script>
+        \\
+        \\{#snippet optionalParam(name?: string)}
+        \\    <p>Hello {name ?? 'World'}</p>
+        \\{/snippet}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should generate valid TypeScript with | undefined, not ?
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name: string | undefined;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name?: string;") == null);
+}
+
+test "each block with destructuring pattern" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\    const entries: [string, number][] = [["a", 1]];
+        \\</script>
+        \\
+        \\{#each entries as [k, v]}
+        \\    <p>{k} = {v}</p>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should handle destructuring correctly without breaking
+    // The binding should be "[k, v]" not split incorrectly
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var [k, v] = (entries)[0];") != null);
+    // Should NOT have broken syntax like "var v]"
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var v]") == null);
+}
+
+test "each block with object destructuring" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\    interface Item { id: number; value: number; }
+        \\    let items: Item[] = [];
+        \\</script>
+        \\
+        \\{#each items as { id, value }}
+        \\    <p>{id} = {value}</p>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should handle object destructuring correctly
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { id, value } = (items)[0];") != null);
+}
+
+test "const tag with template literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\    interface Item { id: number; value: number; }
+        \\    let items: Item[] = [];
+        \\</script>
+        \\
+        \\{#each items as item}
+        \\    {@const label = `Item ${item.id}`}
+        \\    <p>{label}</p>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "ConstTag.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Template literal should be complete with closing backtick
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var label = `Item ${item.id}`;") != null);
 }
