@@ -520,6 +520,23 @@ fn shouldSkipSvelteTypeError(message: []const u8) bool {
     for (svelte_types) |pattern| {
         if (std.mem.eql(u8, message, pattern)) return true;
     }
+
+    // Skip "Property X does not exist on type 'never'" errors
+    // These are false positives from $state(null) patterns where TypeScript
+    // incorrectly narrows the type to 'never' after truthiness checks in
+    // closures like $effect or onMount callbacks.
+    if (std.mem.indexOf(u8, message, "does not exist on type 'never'") != null) {
+        return true;
+    }
+
+    // Skip "Variable X is used before being assigned" errors
+    // These are false positives from bind:this patterns where variables
+    // are declared without initializers but get assigned by Svelte's
+    // runtime binding system (e.g., let canvas: HTMLCanvasElement with bind:this={canvas})
+    if (std.mem.indexOf(u8, message, "is used before being assigned") != null) {
+        return true;
+    }
+
     return false;
 }
 
