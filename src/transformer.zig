@@ -621,6 +621,12 @@ const SnippetParamInfo = struct {
     offset: u32,
 };
 
+const SnippetNameInfo = struct {
+    name: []const u8,
+    params: ?[]const u8,
+    offset: u32,
+};
+
 /// Extracts template expressions from the AST and emits them as TypeScript
 /// statements for type-checking. Handles:
 /// - {#if condition} → void (condition);
@@ -665,12 +671,21 @@ fn emitTemplateExpressions(
                 }
             },
             .snippet => {
-                if (extractSnippetParams(ast.source, node.start, node.end)) |info| {
+                if (extractSnippetName(ast.source, node.start, node.end)) |info| {
                     if (!has_expressions) {
                         try output.appendSlice(allocator, "// Template expressions\n");
                         has_expressions = true;
                     }
-                    try emitSnippetParamDeclarations(allocator, output, info.params);
+
+                    // Emit snippet variable declaration: var snippetName: any = null;
+                    try output.appendSlice(allocator, "var ");
+                    try output.appendSlice(allocator, info.name);
+                    try output.appendSlice(allocator, ": any = null;\n");
+
+                    // Emit param declarations if present
+                    if (info.params) |params| {
+                        try emitSnippetParamDeclarations(allocator, output, params);
+                    }
                 }
             },
             .const_tag => {
@@ -1088,6 +1103,47 @@ fn extractSnippetParams(source: []const u8, start: u32, end: u32) ?SnippetParamI
     return .{
         .params = params,
         .offset = @intCast(params_start),
+    };
+}
+
+/// Extracts snippet name and params from {#snippet name(params)}
+fn extractSnippetName(source: []const u8, start: u32, end: u32) ?SnippetNameInfo {
+    const content = source[start..end];
+    // Format: {#snippet name(params)}
+    const prefix = "{#snippet ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const name_start = idx + prefix.len;
+
+    // Find opening paren or closing brace (for snippets without params)
+    var name_end = name_start;
+    while (name_end < content.len) {
+        const c = content[name_end];
+        if (c == '(' or c == '}' or std.ascii.isWhitespace(c)) break;
+        name_end += 1;
+    }
+
+    const name = std.mem.trim(u8, content[name_start..name_end], " \t\n\r");
+    if (name.len == 0) return null;
+
+    // Check for params
+    var params: ?[]const u8 = null;
+    if (name_end < content.len and content[name_end] == '(') {
+        const params_start = name_end + 1;
+        var paren_depth: u32 = 1;
+        var i = params_start;
+        while (i < content.len and paren_depth > 0) {
+            if (content[i] == '(') paren_depth += 1;
+            if (content[i] == ')') paren_depth -= 1;
+            if (paren_depth > 0) i += 1;
+        }
+        const p = std.mem.trim(u8, content[params_start..i], " \t\n\r");
+        if (p.len > 0) params = p;
+    }
+
+    return .{
+        .name = name,
+        .params = params,
+        .offset = @intCast(name_start),
     };
 }
 
