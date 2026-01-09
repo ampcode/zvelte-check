@@ -1007,45 +1007,96 @@ fn filterSvelteImports(allocator: std.mem.Allocator, content: []const u8) ![]con
 
     var i: usize = 0;
     while (i < content.len) {
-        // Find start of current line
         const line_start = i;
 
-        // Find end of line
         var line_end = i;
         while (line_end < content.len and content[line_end] != '\n') : (line_end += 1) {}
 
         const line = content[line_start..line_end];
         const trimmed = std.mem.trim(u8, line, " \t\r");
 
-        // Check if this is a TYPE import from 'svelte' or "svelte"
-        // We only filter type imports to avoid duplicating Snippet, SvelteComponent, etc.
-        // Regular imports (onMount, onDestroy, tick) are preserved
-        const is_svelte_type_import = blk: {
-            // Must be "import type" to be filtered
-            if (!std.mem.startsWith(u8, trimmed, "import type")) break :blk false;
+        // Check import source - we filter types from 'svelte' and './$types'
+        const is_svelte_import = std.mem.indexOf(u8, trimmed, "from 'svelte'") != null or
+            std.mem.indexOf(u8, trimmed, "from \"svelte\"") != null;
+        const is_types_import = std.mem.indexOf(u8, trimmed, "from './$types'") != null or
+            std.mem.indexOf(u8, trimmed, "from \"./$types\"") != null;
+        const should_filter = is_svelte_import or is_types_import;
 
-            // Look for from 'svelte' or from "svelte"
-            if (std.mem.indexOf(u8, trimmed, "from 'svelte'")) |_| break :blk true;
-            if (std.mem.indexOf(u8, trimmed, "from \"svelte\"")) |_| break :blk true;
-
-            break :blk false;
-        };
-
-        if (!is_svelte_type_import) {
-            try result.appendSlice(allocator, content[line_start..line_end]);
+        if (should_filter and std.mem.startsWith(u8, trimmed, "import")) {
+            // Case 1: `import type { ... } from ...` - filter entire line
+            if (std.mem.startsWith(u8, trimmed, "import type")) {
+                // Skip this line entirely
+            } else if (try filterMixedImport(allocator, trimmed)) |filtered_line| {
+                // Case 2: `import { type X, y } from ...` - remove type specifiers
+                try result.appendSlice(allocator, filtered_line);
+            } else {
+                // No types to filter, keep line as-is
+                try result.appendSlice(allocator, line);
+            }
+        } else {
+            try result.appendSlice(allocator, line);
         }
 
-        // Move past newline
         i = line_end;
         if (i < content.len and content[i] == '\n') {
-            if (!is_svelte_type_import) {
-                try result.append(allocator, '\n');
-            }
+            try result.append(allocator, '\n');
             i += 1;
         }
     }
 
     return try result.toOwnedSlice(allocator);
+}
+
+/// Filters type specifiers from mixed imports like `import { type Snippet, tick } from 'svelte'`.
+/// Returns the filtered line, or null if no changes were made.
+fn filterMixedImport(allocator: std.mem.Allocator, line: []const u8) !?[]const u8 {
+    // Find the import specifier list: { ... }
+    const brace_start = std.mem.indexOf(u8, line, "{") orelse return null;
+    const brace_end = std.mem.indexOf(u8, line, "}") orelse return null;
+    if (brace_start >= brace_end) return null;
+
+    const specifiers = line[brace_start + 1 .. brace_end];
+
+    // Parse specifiers and filter out "type X" ones
+    var filtered_specs: std.ArrayList([]const u8) = .empty;
+    defer filtered_specs.deinit(allocator);
+
+    var has_changes = false;
+    var spec_iter = std.mem.splitScalar(u8, specifiers, ',');
+    while (spec_iter.next()) |spec_raw| {
+        const spec = std.mem.trim(u8, spec_raw, " \t\r\n");
+        if (spec.len == 0) continue;
+
+        // Check if this is a type specifier: "type X" or "type X as Y"
+        if (std.mem.startsWith(u8, spec, "type ")) {
+            has_changes = true;
+            // Skip this specifier
+        } else {
+            try filtered_specs.append(allocator, spec);
+        }
+    }
+
+    if (!has_changes) return null;
+
+    // Rebuild the import line
+    var new_line: std.ArrayList(u8) = .empty;
+    defer new_line.deinit(allocator);
+
+    if (filtered_specs.items.len == 0) {
+        // All specifiers were types - skip the entire import
+        return "";
+    }
+
+    try new_line.appendSlice(allocator, line[0 .. brace_start + 1]);
+    try new_line.append(allocator, ' ');
+    for (filtered_specs.items, 0..) |spec, idx| {
+        if (idx > 0) try new_line.appendSlice(allocator, ", ");
+        try new_line.appendSlice(allocator, spec);
+    }
+    try new_line.appendSlice(allocator, " ");
+    try new_line.appendSlice(allocator, line[brace_end..]);
+
+    return try new_line.toOwnedSlice(allocator);
 }
 
 /// Transforms Svelte store auto-subscriptions ($storeName) to __svelte_store_get(storeName).
