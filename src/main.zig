@@ -87,11 +87,19 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
     const files = if (config) |cfg| blk: {
         var filtered: std.ArrayList([]const u8) = .empty;
         for (all_files) |file_path| {
-            // Normalize path for pattern matching (strip ./ prefix)
-            const normalized = if (std.mem.startsWith(u8, file_path, "./"))
-                file_path[2..]
+            // Normalize path for pattern matching:
+            // 1. Strip workspace prefix to get relative path
+            // 2. Strip ./ prefix if present
+            const relative = if (std.mem.startsWith(u8, file_path, args.workspace))
+                file_path[args.workspace.len..]
             else
                 file_path;
+            const normalized = if (std.mem.startsWith(u8, relative, "/"))
+                relative[1..]
+            else if (std.mem.startsWith(u8, relative, "./"))
+                relative[2..]
+            else
+                relative;
             if (tsconfig.shouldInclude(cfg, normalized)) {
                 try filtered.append(allocator, file_path);
             }
