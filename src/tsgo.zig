@@ -294,6 +294,13 @@ fn writeSvelteKitStubs(tmp_dir: std.fs.Dir) !void {
         \\  export function read(asset: string): Response;
         \\}
         \\
+        \\// Generic .svelte file type declaration
+        \\// Allows tsgo to resolve imports like `import Component from './Button.svelte'`
+        \\declare module "*.svelte" {
+        \\  import { SvelteComponentTyped } from "svelte";
+        \\  export default class extends SvelteComponentTyped<Record<string, any>, Record<string, any>, Record<string, any>> {}
+        \\}
+        \\
         \\declare module "$app/types" {
         \\  // Re-export common SvelteKit types
         \\  export type Navigation = {
