@@ -43,7 +43,9 @@ pub fn runDiagnostics(
             continue;
         }
 
-        if (node.kind != .element and node.kind != .component) {
+        // Only check HTML elements, not Svelte components
+        // Components are responsible for their own a11y
+        if (node.kind != .element) {
             prev_comment = null;
             continue;
         }
@@ -79,7 +81,7 @@ fn checkElement(
     if (std.mem.eql(u8, tag, "marquee") or std.mem.eql(u8, tag, "blink")) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
-            .code = "a11y-distracting-elements",
+            .code = "a11y_distracting_elements",
             .message = try std.fmt.allocPrint(
                 allocator,
                 "<{s}> element is distracting and should be avoided",
@@ -123,7 +125,7 @@ fn checkElement(
     if (hasAttr(attrs, "autofocus")) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
-            .code = "a11y-autofocus",
+            .code = "a11y_autofocus",
             .message = "Avoid using autofocus",
         });
     }
@@ -132,7 +134,7 @@ fn checkElement(
     if (hasAttr(attrs, "accesskey")) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
-            .code = "a11y-accesskey",
+            .code = "a11y_accesskey",
             .message = "Avoid using accesskey",
         });
     }
@@ -178,7 +180,7 @@ fn checkImgAlt(
     if (!has_alt and !has_role_presentation) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .@"error",
-            .code = "a11y-missing-alt",
+            .code = "a11y_missing_attribute",
             .message = "<img> element must have an alt attribute",
         });
     }
@@ -203,7 +205,7 @@ fn checkImgRedundantAlt(
         if (std.mem.indexOf(u8, alt_lower, word) != null) {
             try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
-                .code = "a11y-img-redundant-alt",
+                .code = "a11y_img_redundant_alt",
                 .message = "Alt text should not contain words like \"image\", \"photo\", or \"picture\"",
             });
             return;
@@ -224,7 +226,7 @@ fn checkAnchor(
     if (!has_href) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
-            .code = "a11y-missing-href",
+            .code = "a11y_invalid_attribute",
             .message = "<a> element should have an href attribute",
         });
     }
@@ -234,13 +236,13 @@ fn checkAnchor(
         if (href.len == 0) {
             try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
-                .code = "a11y-invalid-href",
+                .code = "a11y_invalid_attribute",
                 .message = "<a> element has empty href",
             });
         } else if (std.mem.startsWith(u8, href, "javascript:")) {
             try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
-                .code = "a11y-invalid-href",
+                .code = "a11y_invalid_attribute",
                 .message = "<a> element should not use javascript: URLs",
             });
         }
@@ -291,7 +293,7 @@ fn checkInput(
     if (!has_id and !has_aria_label and !has_aria_labelledby and !has_title) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
-            .code = "a11y-missing-label",
+            .code = "a11y_label_has_associated_control",
             .message = "<input> element should have an associated label or aria-label",
         });
     }
@@ -316,7 +318,7 @@ fn checkMediaCaptions(
     if (!has_captions) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
-            .code = "a11y-media-has-caption",
+            .code = "a11y_media_has_caption",
             .message = try std.fmt.allocPrint(
                 allocator,
                 "<{s}> element should have a <track> with captions",
@@ -361,7 +363,7 @@ fn checkHeadingOrder(
     if (tracker.last_level > 0 and level > tracker.last_level + 1) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
-            .code = "a11y-heading-order",
+            .code = "a11y_heading_order",
             .message = try std.fmt.allocPrint(
                 allocator,
                 "Heading level jumped from h{d} to h{d}",
@@ -385,7 +387,7 @@ fn checkPositiveTabindex(
         if (tabindex.len > 0 and tabindex[0] != '-' and tabindex[0] != '0') {
             try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
-                .code = "a11y-positive-tabindex",
+                .code = "a11y_positive_tabindex",
                 .message = "Avoid positive tabindex values",
             });
         }
@@ -408,7 +410,7 @@ fn checkRedundantRoles(
         if (std.mem.eql(u8, role, ir)) {
             try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
-                .code = "a11y-no-redundant-roles",
+                .code = "a11y_no_redundant_roles",
                 .message = try std.fmt.allocPrint(
                     allocator,
                     "<{s}> has implicit role \"{s}\"",
@@ -436,7 +438,7 @@ fn checkRoleRequiredProps(
         if (!hasAttr(attrs, prop)) {
             try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
-                .code = "a11y-role-has-required-aria-props",
+                .code = "a11y_role_has_required_aria_props",
                 .message = try std.fmt.allocPrint(
                     allocator,
                     "role=\"{s}\" requires {s}",
@@ -470,7 +472,7 @@ fn checkClickKeyEvents(
     if (!has_keyboard) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
-            .code = "a11y-click-events-have-key-events",
+            .code = "a11y_click_events_have_key_events",
             .message = "Elements with on:click must have a keyboard event handler",
         });
     }
@@ -492,7 +494,7 @@ fn checkMouseKeyEvents(
         if (!has_focus) {
             try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
-                .code = "a11y-mouse-events-have-key-events",
+                .code = "a11y_mouse_events_have_key_events",
                 .message = "on:mouseenter or on:mouseover must be accompanied by on:focus",
             });
         }
@@ -503,7 +505,7 @@ fn checkMouseKeyEvents(
         if (!has_blur) {
             try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
-                .code = "a11y-mouse-events-have-key-events",
+                .code = "a11y_mouse_events_have_key_events",
                 .message = "on:mouseleave or on:mouseout must be accompanied by on:blur",
             });
         }
@@ -533,7 +535,7 @@ fn checkNoninteractiveTabindex(
             // tabindex="0" or positive
             try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
-                .code = "a11y-no-noninteractive-tabindex",
+                .code = "a11y_no_noninteractive_tabindex",
                 .message = "Non-interactive elements should not have tabindex",
             });
         }
@@ -559,7 +561,7 @@ fn checkStaticElementInteractions(
     if (hasEventHandler(attrs, "click")) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
-            .code = "a11y-no-static-element-interactions",
+            .code = "a11y_no_static_element_interactions",
             .message = "Static elements with event handlers require a role",
         });
     }
@@ -585,7 +587,7 @@ fn checkInteractiveSupportsFocus(
     if (!hasAttr(attrs, "tabindex")) {
         try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
             .severity = .warning,
-            .code = "a11y-interactive-supports-focus",
+            .code = "a11y_interactive_supports_focus",
             .message = try std.fmt.allocPrint(
                 allocator,
                 "Elements with role=\"{s}\" must have tabindex",
@@ -612,7 +614,7 @@ fn checkAriaAttributes(
         if (!isValidAriaAttribute(aria_name)) {
             try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                 .severity = .warning,
-                .code = "a11y-unknown-aria",
+                .code = "a11y_unknown_aria_attribute",
                 .message = try std.fmt.allocPrint(
                     allocator,
                     "Unknown ARIA attribute: {s}",
@@ -627,7 +629,7 @@ fn checkAriaAttributes(
                 if (hasAttr(attrs, "tabindex") or hasAttr(attrs, "href")) {
                     try addDiagnostic(allocator, ast, node, diagnostics, ignore_codes, .{
                         .severity = .warning,
-                        .code = "a11y-hidden-focusable",
+                        .code = "a11y_hidden",
                         .message = "aria-hidden should not be used on focusable elements",
                     });
                 }
@@ -841,7 +843,7 @@ test "a11y: img without alt" {
     try runDiagnostics(allocator, &ast, &diagnostics);
 
     try std.testing.expect(diagnostics.items.len == 1);
-    try std.testing.expectEqualStrings("a11y-missing-alt", diagnostics.items[0].code.?);
+    try std.testing.expectEqualStrings("a11y_missing_attribute", diagnostics.items[0].code.?);
 }
 
 test "a11y: img with alt" {
@@ -860,7 +862,7 @@ test "a11y: img with alt" {
     // Should have no a11y-missing-alt
     var found_missing_alt = false;
     for (diagnostics.items) |d| {
-        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-missing-alt")) {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y_missing_attribute")) {
             found_missing_alt = true;
             break;
         }
@@ -884,7 +886,7 @@ test "a11y: anchor without href" {
     try std.testing.expect(diagnostics.items.len >= 1);
     var found = false;
     for (diagnostics.items) |d| {
-        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-missing-href")) {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y_invalid_attribute")) {
             found = true;
             break;
         }
@@ -907,7 +909,7 @@ test "a11y: distracting elements" {
 
     var count: usize = 0;
     for (diagnostics.items) |d| {
-        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-distracting-elements")) {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y_distracting_elements")) {
             count += 1;
         }
     }
@@ -929,7 +931,7 @@ test "a11y: redundant roles" {
 
     var found = false;
     for (diagnostics.items) |d| {
-        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-no-redundant-roles")) {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y_no_redundant_roles")) {
             found = true;
             break;
         }
@@ -943,7 +945,7 @@ test "a11y: svelte-ignore suppresses diagnostic" {
     const allocator = arena.allocator();
 
     const Parser = @import("../svelte_parser.zig").Parser;
-    const source = "<!-- svelte-ignore a11y-missing-alt -->\n<img src=\"test.png\">";
+    const source = "<!-- svelte-ignore a11y_missing_attribute -->\n<img src=\"test.png\">";
     var parser = Parser.init(allocator, source, "test.svelte");
     const ast = try parser.parse();
 
@@ -953,7 +955,7 @@ test "a11y: svelte-ignore suppresses diagnostic" {
     // Should have no a11y-missing-alt diagnostic due to svelte-ignore
     var found_missing_alt = false;
     for (diagnostics.items) |d| {
-        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-missing-alt")) {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y_missing_attribute")) {
             found_missing_alt = true;
             break;
         }
@@ -967,7 +969,7 @@ test "a11y: svelte-ignore with multiple codes" {
     const allocator = arena.allocator();
 
     const Parser = @import("../svelte_parser.zig").Parser;
-    const source = "<!-- svelte-ignore a11y-distracting-elements a11y-autofocus -->\n<marquee autofocus>Text</marquee>";
+    const source = "<!-- svelte-ignore a11y_distracting_elements a11y_autofocus -->\n<marquee autofocus>Text</marquee>";
     var parser = Parser.init(allocator, source, "test.svelte");
     const ast = try parser.parse();
 
@@ -979,8 +981,8 @@ test "a11y: svelte-ignore with multiple codes" {
     var found_autofocus = false;
     for (diagnostics.items) |d| {
         if (d.code != null) {
-            if (std.mem.eql(u8, d.code.?, "a11y-distracting-elements")) found_distracting = true;
-            if (std.mem.eql(u8, d.code.?, "a11y-autofocus")) found_autofocus = true;
+            if (std.mem.eql(u8, d.code.?, "a11y_distracting_elements")) found_distracting = true;
+            if (std.mem.eql(u8, d.code.?, "a11y_autofocus")) found_autofocus = true;
         }
     }
     try std.testing.expect(!found_distracting);
@@ -1003,7 +1005,7 @@ test "a11y: regular comment does not suppress diagnostic" {
     // Should have a11y-missing-alt since no svelte-ignore
     var found_missing_alt = false;
     for (diagnostics.items) |d| {
-        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y-missing-alt")) {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y_missing_attribute")) {
             found_missing_alt = true;
             break;
         }

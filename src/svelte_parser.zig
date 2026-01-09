@@ -814,7 +814,7 @@ test "parse svelte-ignore comment" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const source = "<!-- svelte-ignore a11y-missing-alt a11y-autofocus -->\n<img src=\"test.png\">";
+    const source = "<!-- svelte-ignore a11y_missing_attribute a11y_autofocus -->\n<img src=\"test.png\">";
     var parser = Parser.init(allocator, source, "test.svelte");
     const ast = try parser.parse();
 
@@ -823,8 +823,8 @@ test "parse svelte-ignore comment" {
 
     // Should have extracted the ignore codes
     try std.testing.expectEqual(@as(usize, 2), ast.ignore_codes.items.len);
-    try std.testing.expectEqualStrings("a11y-missing-alt", ast.ignore_codes.items[0]);
-    try std.testing.expectEqualStrings("a11y-autofocus", ast.ignore_codes.items[1]);
+    try std.testing.expectEqualStrings("a11y_missing_attribute", ast.ignore_codes.items[0]);
+    try std.testing.expectEqualStrings("a11y_autofocus", ast.ignore_codes.items[1]);
 
     // Comment data should reference the correct range in ignore_codes
     const comment = ast.comments.items[0];

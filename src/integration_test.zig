@@ -13,7 +13,7 @@
 //! Each fixture file can contain comments documenting expected diagnostics:
 //!
 //! ```svelte
-//! <!-- Expected: line 5, code: a11y-missing-alt -->
+//! <!-- Expected: line 5, code: a11y_missing_attribute -->
 //! <img src="/photo.jpg">
 //!
 //! <!-- Expected: line 10, code: TS2322, message: Type 'string' is not assignable -->
@@ -21,7 +21,7 @@
 //! ```
 //!
 //! - `line N` (required): The line number where the diagnostic should appear
-//! - `code: CODE` (optional): The diagnostic code (e.g., TS2322, a11y-missing-alt)
+//! - `code: CODE` (optional): The diagnostic code (e.g., TS2322, a11y_missing_attribute)
 //! - `message: MSG` (optional): A substring that should appear in the message
 //!
 //! ## Running Integration Tests
@@ -306,7 +306,7 @@ test "parse expected diagnostics" {
     const allocator = arena.allocator();
 
     const source =
-        \\<!-- Expected: line 5, code: a11y-missing-alt -->
+        \\<!-- Expected: line 5, code: a11y_missing_attribute -->
         \\<img src="/photo.jpg">
         \\
         \\<!-- Expected: line 10, code: TS2322, message: Type 'string' is not assignable -->
@@ -318,7 +318,7 @@ test "parse expected diagnostics" {
     try std.testing.expectEqual(@as(usize, 2), expected.len);
 
     try std.testing.expectEqual(@as(u32, 5), expected[0].line);
-    try std.testing.expectEqualStrings("a11y-missing-alt", expected[0].code.?);
+    try std.testing.expectEqualStrings("a11y_missing_attribute", expected[0].code.?);
     try std.testing.expect(expected[0].message_pattern == null);
 
     try std.testing.expectEqual(@as(u32, 10), expected[1].line);
@@ -354,7 +354,7 @@ test "parse actual diagnostics" {
 test "diagnostic matching" {
     const expected: ExpectedDiagnostic = .{
         .line = 5,
-        .code = "a11y-missing-alt",
+        .code = "a11y_missing_attribute",
         .message_pattern = "alt attribute",
     };
 
@@ -363,7 +363,7 @@ test "diagnostic matching" {
         .line = 5,
         .col = 1,
         .severity = "warning",
-        .message = "[a11y-missing-alt] <img> element should have an alt attribute",
+        .message = "[a11y_missing_attribute] <img> element should have an alt attribute",
     };
 
     const wrong_line: ActualDiagnostic = .{
@@ -371,7 +371,7 @@ test "diagnostic matching" {
         .line = 6,
         .col = 1,
         .severity = "warning",
-        .message = "[a11y-missing-alt] <img> element should have an alt attribute",
+        .message = "[a11y_missing_attribute] <img> element should have an alt attribute",
     };
 
     const wrong_code: ActualDiagnostic = .{
