@@ -673,7 +673,7 @@ fn emitGenericTypeDeclarations(
             // Skip whitespace after "extends"
             while (i < generics.len and std.ascii.isWhitespace(generics[i])) : (i += 1) {}
 
-            // Parse constraint type (until comma or end, handling < > for generics)
+            // Parse constraint type (until comma, = for default, or end, handling < > for generics)
             const constraint_start = i;
             var angle_depth: u32 = 0;
             while (i < generics.len) {
@@ -682,12 +682,30 @@ fn emitGenericTypeDeclarations(
                     angle_depth += 1;
                 } else if (c == '>') {
                     if (angle_depth > 0) angle_depth -= 1;
-                } else if (c == ',' and angle_depth == 0) {
+                } else if ((c == ',' or c == '=') and angle_depth == 0) {
                     break;
                 }
                 i += 1;
             }
             constraint = std.mem.trim(u8, generics[constraint_start..i], " \t\n\r");
+
+            // Skip default type parameter if present (= DefaultType)
+            if (i < generics.len and generics[i] == '=') {
+                i += 1;
+                // Skip the default value (until comma or end, handling < >)
+                angle_depth = 0;
+                while (i < generics.len) {
+                    const c = generics[i];
+                    if (c == '<') {
+                        angle_depth += 1;
+                    } else if (c == '>') {
+                        if (angle_depth > 0) angle_depth -= 1;
+                    } else if (c == ',' and angle_depth == 0) {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
         }
 
         // Emit type declaration
@@ -2859,6 +2877,28 @@ test "emit generic type declarations - complex constraint" {
     try emitGenericTypeDeclarations(allocator, &output, "T extends Record<string, number>");
 
     try std.testing.expectEqualStrings("type T = Record<string, number>;\n", output.items);
+}
+
+test "emit generic type declarations - with default type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var output: std.ArrayList(u8) = .empty;
+    try emitGenericTypeDeclarations(allocator, &output, "T extends SomeType = SomeType");
+
+    try std.testing.expectEqualStrings("type T = SomeType;\n", output.items);
+}
+
+test "emit generic type declarations - default type with complex generics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var output: std.ArrayList(u8) = .empty;
+    try emitGenericTypeDeclarations(allocator, &output, "ToolDef extends ToolDefinition = ToolDefinition");
+
+    try std.testing.expectEqualStrings("type ToolDef = ToolDefinition;\n", output.items);
 }
 
 test "transform with generics attribute" {
