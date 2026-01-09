@@ -1999,6 +1999,33 @@ test "transform module script" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "VERSION") != null);
 }
 
+test "module script exports type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script module lang="ts">
+        \\  export type MyVariant = 'primary' | 'secondary';
+        \\  export const myVariants = ['primary', 'secondary'] as const;
+        \\</script>
+        \\<script lang="ts">
+        \\  let { variant = 'primary' }: { variant: MyVariant } = $props();
+        \\</script>
+        \\<button>{variant}</button>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Module script exports should be visible at file top level
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type MyVariant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export const myVariants") != null);
+}
+
 test "extract export lets" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
