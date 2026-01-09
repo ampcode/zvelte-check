@@ -15,18 +15,29 @@ const generated_stubs = ".svelte-check-stubs.d.ts";
 
 pub const TsgoNotFoundError = error{TsgoNotFound};
 
-/// Finds the tsgo binary. Checks node_modules/.bin/tsgo first (for pnpm/npm installs),
-/// then falls back to "tsgo" in PATH.
-fn findTsgoBinary(allocator: std.mem.Allocator, workspace_dir: std.fs.Dir) ![]const u8 {
-    // Check node_modules/.bin/tsgo first
-    const node_modules_tsgo = "node_modules/.bin/tsgo";
-    if (workspace_dir.access(node_modules_tsgo, .{})) {
-        // Return absolute path for the binary
-        const real_path = workspace_dir.realpathAlloc(allocator, node_modules_tsgo) catch {
-            return "tsgo"; // Fall back to PATH
+/// Finds the tsgo binary. Walks up from workspace looking for node_modules/.bin/tsgo
+/// (handles monorepos), then falls back to "tsgo" in PATH.
+fn findTsgoBinary(allocator: std.mem.Allocator, workspace_path: []const u8) ![]const u8 {
+    var search_path = workspace_path;
+
+    while (true) {
+        const tsgo_path = std.fs.path.join(allocator, &.{ search_path, "node_modules/.bin/tsgo" }) catch {
+            break;
         };
-        return real_path;
-    } else |_| {}
+
+        if (std.fs.cwd().access(tsgo_path, .{})) {
+            return tsgo_path;
+        } else |_| {
+            allocator.free(tsgo_path);
+        }
+
+        // Move to parent directory
+        const parent = std.fs.path.dirname(search_path);
+        if (parent == null or std.mem.eql(u8, parent.?, search_path)) {
+            break;
+        }
+        search_path = parent.?;
+    }
 
     // Fall back to tsgo in PATH
     return "tsgo";
@@ -71,8 +82,8 @@ pub fn check(
     try writeGeneratedTsconfig(workspace_dir, workspace_path, tsconfig_path, virtual_files);
     try generated_files.append(allocator, try allocator.dupe(u8, generated_tsconfig));
 
-    // Find tsgo binary: check node_modules/.bin first, then PATH
-    const tsgo_path = try findTsgoBinary(allocator, workspace_dir);
+    // Find tsgo binary: walk up from workspace looking for node_modules/.bin, then PATH
+    const tsgo_path = try findTsgoBinary(allocator, workspace_path);
 
     // Build tsgo command
     var args: std.ArrayList([]const u8) = .empty;
