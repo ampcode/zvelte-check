@@ -1423,3 +1423,244 @@ test "parse svelte:options with immutable and accessors" {
     try std.testing.expect(found_immutable);
     try std.testing.expect(found_accessors);
 }
+
+// ============================================================================
+// Void element tests (self-closing HTML elements)
+// ============================================================================
+
+test "parse void element br" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<p>Line 1<br>Line 2</p>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_br = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "br")) {
+                found_br = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_br);
+}
+
+test "parse void element hr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<div><hr></div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_hr = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "hr")) {
+                found_hr = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_hr);
+}
+
+test "parse void element img with attributes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<img src=\"photo.jpg\" alt=\"A photo\">";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_img = false;
+    var found_src = false;
+    var found_alt = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "img")) {
+                found_img = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "src")) {
+                        found_src = true;
+                        try std.testing.expectEqualStrings("photo.jpg", attr.value.?);
+                    }
+                    if (std.mem.eql(u8, attr.name, "alt")) {
+                        found_alt = true;
+                        try std.testing.expectEqualStrings("A photo", attr.value.?);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_img);
+    try std.testing.expect(found_src);
+    try std.testing.expect(found_alt);
+}
+
+test "parse void element input with type and value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<input type=\"text\" value=\"hello\">";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_input = false;
+    var found_type = false;
+    var found_value = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "input")) {
+                found_input = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "type")) {
+                        found_type = true;
+                        try std.testing.expectEqualStrings("text", attr.value.?);
+                    }
+                    if (std.mem.eql(u8, attr.name, "value")) {
+                        found_value = true;
+                        try std.testing.expectEqualStrings("hello", attr.value.?);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_input);
+    try std.testing.expect(found_type);
+    try std.testing.expect(found_value);
+}
+
+test "parse void element meta" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<svelte:head><meta name=\"description\" content=\"A test page\"></svelte:head>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_meta = false;
+    var found_name = false;
+    var found_content = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "meta")) {
+                found_meta = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "name")) {
+                        found_name = true;
+                        try std.testing.expectEqualStrings("description", attr.value.?);
+                    }
+                    if (std.mem.eql(u8, attr.name, "content")) {
+                        found_content = true;
+                        try std.testing.expectEqualStrings("A test page", attr.value.?);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_meta);
+    try std.testing.expect(found_name);
+    try std.testing.expect(found_content);
+}
+
+test "parse void element link" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<svelte:head><link rel=\"stylesheet\" href=\"styles.css\"></svelte:head>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_link = false;
+    var found_rel = false;
+    var found_href = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "link")) {
+                found_link = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "rel")) {
+                        found_rel = true;
+                        try std.testing.expectEqualStrings("stylesheet", attr.value.?);
+                    }
+                    if (std.mem.eql(u8, attr.name, "href")) {
+                        found_href = true;
+                        try std.testing.expectEqualStrings("styles.css", attr.value.?);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_link);
+    try std.testing.expect(found_rel);
+    try std.testing.expect(found_href);
+}
+
+test "parse void element with self-closing syntax" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<input type=\"checkbox\" />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_input = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "input")) {
+                found_input = true;
+                try std.testing.expect(elem.is_self_closing);
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_input);
+}
+
+test "parse multiple void elements in sequence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<br><hr><br>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var br_count: u32 = 0;
+    var hr_count: u32 = 0;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "br")) {
+                br_count += 1;
+            }
+            if (std.mem.eql(u8, elem.tag_name, "hr")) {
+                hr_count += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 2), br_count);
+    try std.testing.expectEqual(@as(u32, 1), hr_count);
+}
