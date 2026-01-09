@@ -330,6 +330,25 @@ fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
         \\  };
         \\}
         \\
+        \\// SvelteKit $env/* virtual module types
+        \\declare module "$env/static/private" {
+        \\  const env: Record<string, string>;
+        \\  export = env;
+        \\}
+        \\
+        \\declare module "$env/static/public" {
+        \\  const env: Record<string, string>;
+        \\  export = env;
+        \\}
+        \\
+        \\declare module "$env/dynamic/private" {
+        \\  export const env: Record<string, string | undefined>;
+        \\}
+        \\
+        \\declare module "$env/dynamic/public" {
+        \\  export const env: Record<string, string | undefined>;
+        \\}
+        \\
         \\// Vite import.meta.env ambient types
         \\interface ImportMetaEnv {
         \\  readonly MODE: string;
