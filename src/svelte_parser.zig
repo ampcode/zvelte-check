@@ -309,9 +309,24 @@ pub const Parser = struct {
             return Node.NONE;
         }
 
-        const tag_name = self.current.slice(self.source);
-        const is_component = tag_name.len > 0 and tag_name[0] >= 'A' and tag_name[0] <= 'Z';
+        const tag_name_start = self.current.start;
+        var tag_name_end = self.current.end;
+        const initial_name = self.current.slice(self.source);
         self.advance();
+
+        // Handle svelte: special tags (svelte:head, svelte:body, etc.)
+        // These are parsed as identifier + colon + identifier
+        if (std.mem.eql(u8, initial_name, "svelte") and self.current.kind == .colon) {
+            self.advance(); // consume :
+            if (self.current.kind == .identifier) {
+                tag_name_end = self.current.end;
+                self.advance();
+            }
+        }
+
+        const tag_name = self.source[tag_name_start..tag_name_end];
+        const is_component = (tag_name.len > 0 and tag_name[0] >= 'A' and tag_name[0] <= 'Z') or
+            std.mem.startsWith(u8, tag_name, "svelte:");
 
         // Handle generic type parameters: <Component<T> /> or <Component<T, U> />
         if (is_component and self.current.kind == .lt) {
@@ -1104,4 +1119,307 @@ test "parse component with generics" {
         }
     }
     try std.testing.expect(found_component);
+}
+
+// ============================================================================
+// Special svelte: tag tests
+// ============================================================================
+
+test "parse svelte:head" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<svelte:head><title>My App</title></svelte:head>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_svelte_head = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "svelte:head")) {
+                found_svelte_head = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_svelte_head);
+}
+
+test "parse svelte:body with event handler" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<svelte:body on:keydown={handleKeydown} />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_svelte_body = false;
+    var found_on_keydown = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "svelte:body")) {
+                found_svelte_body = true;
+                // Check attributes
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "on:keydown")) {
+                        found_on_keydown = true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_svelte_body);
+    try std.testing.expect(found_on_keydown);
+}
+
+test "parse svelte:window with bind" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<svelte:window bind:innerWidth={width} on:resize={handleResize} />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_svelte_window = false;
+    var found_bind = false;
+    var found_on_resize = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "svelte:window")) {
+                found_svelte_window = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "bind:innerWidth")) {
+                        found_bind = true;
+                    }
+                    if (std.mem.eql(u8, attr.name, "on:resize")) {
+                        found_on_resize = true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_svelte_window);
+    try std.testing.expect(found_bind);
+    try std.testing.expect(found_on_resize);
+}
+
+test "parse svelte:document" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<svelte:document on:visibilitychange={handleVisibility} />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_svelte_document = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "svelte:document")) {
+                found_svelte_document = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_svelte_document);
+}
+
+test "parse svelte:element with dynamic tag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<svelte:element this={tag}>Content</svelte:element>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_svelte_element = false;
+    var found_this_attr = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "svelte:element")) {
+                found_svelte_element = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "this")) {
+                        found_this_attr = true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_svelte_element);
+    try std.testing.expect(found_this_attr);
+}
+
+test "parse svelte:component with dynamic component" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<svelte:component this={MyComponent} prop={value} />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_svelte_component = false;
+    var found_this_attr = false;
+    var found_prop_attr = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "svelte:component")) {
+                found_svelte_component = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "this")) {
+                        found_this_attr = true;
+                    }
+                    if (std.mem.eql(u8, attr.name, "prop")) {
+                        found_prop_attr = true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_svelte_component);
+    try std.testing.expect(found_this_attr);
+    try std.testing.expect(found_prop_attr);
+}
+
+test "parse svelte:self for recursive component" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "{#if depth > 0}<svelte:self depth={depth - 1} />{/if}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_svelte_self = false;
+    var found_depth_attr = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "svelte:self")) {
+                found_svelte_self = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "depth")) {
+                        found_depth_attr = true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_svelte_self);
+    try std.testing.expect(found_depth_attr);
+}
+
+test "parse svelte:fragment for slot content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<Component>
+        \\  <svelte:fragment slot="header">
+        \\    <h1>Title</h1>
+        \\  </svelte:fragment>
+        \\</Component>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_svelte_fragment = false;
+    var found_slot_attr = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "svelte:fragment")) {
+                found_svelte_fragment = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "slot")) {
+                        found_slot_attr = true;
+                        try std.testing.expectEqualStrings("header", attr.value.?);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_svelte_fragment);
+    try std.testing.expect(found_slot_attr);
+}
+
+test "parse svelte:options" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<svelte:options runes={true} />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_svelte_options = false;
+    var found_runes_attr = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "svelte:options")) {
+                found_svelte_options = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "runes")) {
+                        found_runes_attr = true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_svelte_options);
+    try std.testing.expect(found_runes_attr);
+}
+
+test "parse svelte:options with immutable and accessors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<svelte:options immutable accessors />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_svelte_options = false;
+    var found_immutable = false;
+    var found_accessors = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "svelte:options")) {
+                found_svelte_options = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "immutable")) {
+                        found_immutable = true;
+                    }
+                    if (std.mem.eql(u8, attr.name, "accessors")) {
+                        found_accessors = true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_svelte_options);
+    try std.testing.expect(found_immutable);
+    try std.testing.expect(found_accessors);
 }
