@@ -338,6 +338,14 @@ fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
         \\  export default class extends SvelteComponentTyped<Record<string, any>, Record<string, any>, Record<string, any>> {}
         \\}
         \\
+        \\// unplugin-icons virtual module stubs
+        \\// Allows tsgo to resolve imports like `import Icon from '~icons/lucide/check'`
+        \\declare module "~icons/*" {
+        \\  import { SvelteComponent } from "svelte";
+        \\  const component: typeof SvelteComponent;
+        \\  export default component;
+        \\}
+        \\
         \\declare module "$app/types" {
         \\  // Re-export common SvelteKit types
         \\  export type Navigation = {
