@@ -820,14 +820,17 @@ fn emitSnippetParamDeclarations(
                 }
             }
 
-            // Emit destructuring pattern declaration
+            // Emit destructuring pattern declaration with initializer
+            // TypeScript requires destructuring declarations to have an initializer
             try output.appendSlice(allocator, "var ");
             try output.appendSlice(allocator, pattern);
             try output.appendSlice(allocator, ": ");
             if (type_annotation) |t| {
                 try output.appendSlice(allocator, t);
+                try output.appendSlice(allocator, " = {} as ");
+                try output.appendSlice(allocator, t);
             } else {
-                try output.appendSlice(allocator, "any");
+                try output.appendSlice(allocator, "any = {} as any");
             }
             try output.appendSlice(allocator, ";\n");
 
@@ -2647,8 +2650,8 @@ test "snippet with object destructuring param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should handle object destructuring as a single pattern
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { wrapperProps, props, open }: any;") != null);
+    // Should handle object destructuring as a single pattern with initializer
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { wrapperProps, props, open }: any = {} as any;") != null);
     // Should NOT have broken syntax
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { wrapperProps: any;") == null);
 }
