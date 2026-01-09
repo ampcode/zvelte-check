@@ -326,24 +326,54 @@ fn checkMediaCaptions(
 }
 
 fn hasTrackWithCaptions(ast: *const Ast, parent_node: Node) bool {
-    // Look for track children with kind="captions" or kind="subtitles"
-    var child_idx = parent_node.first_child;
-    while (child_idx != Node.NONE and child_idx < ast.nodes.items.len) {
-        const child = ast.nodes.items[child_idx];
-        if (child.kind == .element) {
-            const child_elem = ast.elements.items[child.data];
+    // The parser produces a flat AST where element.end is the opening tag end.
+    // To find children, we need to locate the closing tag in the source.
+    const elem = ast.elements.items[parent_node.data];
+    const tag_name = elem.tag_name;
+
+    // Find closing tag position: </video> or </audio>
+    const closing_tag_start = findClosingTag(ast.source, parent_node.end, tag_name);
+
+    // Look for track elements between opening and closing tags
+    for (ast.nodes.items) |node| {
+        // Track must start at or after opening tag end and before closing tag
+        if (node.start < parent_node.end) continue;
+        if (closing_tag_start != null and node.start >= closing_tag_start.?) continue;
+
+        if (node.kind == .element) {
+            const child_elem = ast.elements.items[node.data];
             if (std.mem.eql(u8, child_elem.tag_name, "track")) {
-                const child_attrs = ast.attributes.items[child_elem.attrs_start..child_elem.attrs_end];
-                if (hasAttrValue(child_attrs, "kind", "captions") or
-                    hasAttrValue(child_attrs, "kind", "subtitles"))
+                const attrs = ast.attributes.items[child_elem.attrs_start..child_elem.attrs_end];
+                // Accept track with kind="captions" or kind="subtitles"
+                // Also accept track without kind attr (defaults to subtitles)
+                if (hasAttrValue(attrs, "kind", "captions") or
+                    hasAttrValue(attrs, "kind", "subtitles") or
+                    !hasAttr(attrs, "kind"))
                 {
                     return true;
                 }
             }
         }
-        child_idx = child.next_sibling;
     }
     return false;
+}
+
+fn findClosingTag(source: []const u8, start: u32, tag_name: []const u8) ?u32 {
+    // Search for </tagname> starting from position
+    var i: u32 = start;
+    while (i + 2 + tag_name.len < source.len) {
+        if (source[i] == '<' and source[i + 1] == '/') {
+            const tag_start = i + 2;
+            const tag_end = tag_start + tag_name.len;
+            if (tag_end <= source.len and
+                std.mem.eql(u8, source[tag_start..tag_end], tag_name))
+            {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return null;
 }
 
 fn checkHeadingOrder(
@@ -1718,10 +1748,6 @@ test "issue #12: redundant alt case insensitive" {
 // Video/audio with <track kind="captions"> should not warn.
 
 test "issue #13: video with captions track is valid" {
-    // TODO: Child element traversal needed to detect <track> inside <video>.
-    // Current implementation doesn't traverse children to find caption tracks.
-    if (true) return error.SkipZigTest;
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1766,6 +1792,28 @@ test "issue #13: video without captions warns" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "issue #867: video with inline track should not warn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    // Reproduction case from issue: self-closing track inside video
+    const source = "<video src=\"/video.mp4\" controls><track kind=\"captions\" /></video>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should have no media caption warning
+    for (diagnostics.items) |d| {
+        if (d.code) |code| {
+            try std.testing.expect(!std.mem.eql(u8, code, "a11y_media_has_caption"));
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
