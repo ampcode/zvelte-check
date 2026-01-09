@@ -18,7 +18,13 @@ pub const TsgoNotFoundError = error{TsgoNotFound};
 /// Finds the tsgo binary. Walks up from workspace looking for node_modules/.bin/tsgo
 /// (handles monorepos), then falls back to "tsgo" in PATH.
 fn findTsgoBinary(allocator: std.mem.Allocator, workspace_path: []const u8) ![]const u8 {
-    var search_path = workspace_path;
+    // Resolve to absolute path so we can walk up parent directories
+    const abs_path = std.fs.cwd().realpathAlloc(allocator, workspace_path) catch {
+        return "tsgo";
+    };
+    defer allocator.free(abs_path);
+
+    var search_path: []const u8 = abs_path;
 
     while (true) {
         const tsgo_path = std.fs.path.join(allocator, &.{ search_path, "node_modules/.bin/tsgo" }) catch {
