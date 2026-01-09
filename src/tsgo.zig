@@ -202,13 +202,18 @@ fn writeGeneratedTsconfig(
     }
 
     // Compiler options optimized for Svelte checking
+    // Disable strict null checks and implicit any since Svelte's reactivity patterns
+    // often produce false positives (e.g., $state(null) with later narrowing, or
+    // callback parameters that Svelte infers at runtime).
     try w.writeAll("  \"compilerOptions\": {\n");
     try w.writeAll("    \"noEmit\": true,\n");
     try w.writeAll("    \"skipLibCheck\": true,\n");
     try w.writeAll("    \"allowJs\": true,\n");
     try w.writeAll("    \"checkJs\": true,\n");
     try w.writeAll("    \"noUnusedLocals\": false,\n");
-    try w.writeAll("    \"noUnusedParameters\": false\n");
+    try w.writeAll("    \"noUnusedParameters\": false,\n");
+    try w.writeAll("    \"strictNullChecks\": false,\n");
+    try w.writeAll("    \"noImplicitAny\": false\n");
     try w.writeAll("  },\n");
 
     // Include our generated files plus all .ts files they may import
@@ -487,6 +492,10 @@ fn parseTsgoOutput(
                 break v;
             }
         } else null;
+
+        // Only report errors from .svelte.ts files we generated.
+        // Skip errors from other .ts files that tsgo checked transitively.
+        if (vf == null) continue;
 
         // Map TS position back to Svelte position
         var svelte_line = ts_line;
