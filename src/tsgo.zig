@@ -390,6 +390,94 @@ fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
         \\  readonly env: ImportMetaEnv;
         \\}
         \\
+        \\// SvelteKit ./$types virtual module
+        \\// Generated per-route by SvelteKit, provides typed load functions and data
+        \\declare module "./$types" {
+        \\  import type { RequestEvent, ServerLoadEvent, LoadEvent } from "@sveltejs/kit";
+        \\
+        \\  // Data types returned by load functions
+        \\  export type PageData = Record<string, any>;
+        \\  export type LayoutData = Record<string, any>;
+        \\
+        \\  // Page load function types
+        \\  export type PageLoad<
+        \\    Params extends Record<string, string> = Record<string, string>,
+        \\    Data extends Record<string, any> = Record<string, any>,
+        \\    ParentData extends Record<string, any> = Record<string, any>
+        \\  > = (event: {
+        \\    params: Params;
+        \\    url: URL;
+        \\    route: { id: string | null };
+        \\    fetch: typeof fetch;
+        \\    data: Data;
+        \\    parent: () => Promise<ParentData>;
+        \\    depends: (...deps: string[]) => void;
+        \\    untrack: <T>(fn: () => T) => T;
+        \\  }) => any | Promise<any>;
+        \\
+        \\  export type PageServerLoad<
+        \\    Params extends Record<string, string> = Record<string, string>,
+        \\    ParentData extends Record<string, any> = Record<string, any>
+        \\  > = (event: {
+        \\    params: Params;
+        \\    url: URL;
+        \\    route: { id: string | null };
+        \\    fetch: typeof fetch;
+        \\    cookies: { get: (name: string, opts?: any) => string | undefined; getAll: (opts?: any) => Array<{ name: string; value: string }>; set: (name: string, value: string, opts?: any) => void; delete: (name: string, opts?: any) => void; serialize: (name: string, value: string, opts?: any) => string };
+        \\    request: Request;
+        \\    locals: App.Locals;
+        \\    platform: App.Platform;
+        \\    parent: () => Promise<ParentData>;
+        \\    depends: (...deps: string[]) => void;
+        \\    untrack: <T>(fn: () => T) => T;
+        \\    setHeaders: (headers: Record<string, string>) => void;
+        \\    isDataRequest: boolean;
+        \\    isSubRequest: boolean;
+        \\  }) => any | Promise<any>;
+        \\
+        \\  // Layout load function types
+        \\  export type LayoutLoad<
+        \\    Params extends Record<string, string> = Record<string, string>,
+        \\    Data extends Record<string, any> = Record<string, any>,
+        \\    ParentData extends Record<string, any> = Record<string, any>
+        \\  > = PageLoad<Params, Data, ParentData>;
+        \\
+        \\  export type LayoutServerLoad<
+        \\    Params extends Record<string, string> = Record<string, string>,
+        \\    ParentData extends Record<string, any> = Record<string, any>
+        \\  > = PageServerLoad<Params, ParentData>;
+        \\
+        \\  // Form action types
+        \\  export type Actions<
+        \\    Params extends Record<string, string> = Record<string, string>
+        \\  > = Record<string, (event: {
+        \\    params: Params;
+        \\    url: URL;
+        \\    route: { id: string | null };
+        \\    fetch: typeof fetch;
+        \\    cookies: { get: (name: string, opts?: any) => string | undefined; getAll: (opts?: any) => Array<{ name: string; value: string }>; set: (name: string, value: string, opts?: any) => void; delete: (name: string, opts?: any) => void; serialize: (name: string, value: string, opts?: any) => string };
+        \\    request: Request;
+        \\    locals: App.Locals;
+        \\    platform: App.Platform;
+        \\  }) => any | Promise<any>>;
+        \\
+        \\  export type ActionData = Record<string, any> | null;
+        \\
+        \\  // Entry point types (for +page.ts, +layout.ts entry generation)
+        \\  export type EntryGenerator = () => Array<Record<string, string>> | Promise<Array<Record<string, string>>>;
+        \\  export const prerender: boolean | 'auto';
+        \\  export const ssr: boolean;
+        \\  export const csr: boolean;
+        \\  export const trailingSlash: 'never' | 'always' | 'ignore';
+        \\}
+        \\
+        \\// SvelteKit App namespace for locals and platform
+        \\declare namespace App {
+        \\  interface Locals {}
+        \\  interface Platform {}
+        \\  interface PageState {}
+        \\}
+        \\
     );
 }
 
