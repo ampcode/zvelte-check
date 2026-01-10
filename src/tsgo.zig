@@ -16,6 +16,14 @@ const generated_stubs = stub_dir ++ "/stubs.d.ts";
 
 pub const TsgoNotFoundError = error{TsgoNotFound};
 
+/// VirtualFile with pre-computed LineTables for efficient diagnostic mapping.
+/// Avoids O(N × file_size) rebuilding of line tables per diagnostic.
+const CachedVirtualFile = struct {
+    vf: VirtualFile,
+    ts_line_table: LineTable,
+    svelte_line_table: LineTable,
+};
+
 /// Finds the tsgo binary. Walks up from workspace looking for node_modules/.bin/tsgo
 /// (handles monorepos), then falls back to "tsgo" in PATH.
 fn findTsgoBinary(allocator: std.mem.Allocator, workspace_path: []const u8) ![]const u8 {
@@ -144,9 +152,22 @@ pub fn check(
     };
 
     if (exited_with_error or has_output) {
-        try parseTsgoOutput(allocator, stdout, virtual_files, &diagnostics);
+        // Pre-compute line tables for all virtual files once, avoiding O(N × file_size)
+        // rebuilding per diagnostic line
+        var cached_files: std.ArrayList(CachedVirtualFile) = .empty;
+        defer cached_files.deinit(allocator);
+
+        for (virtual_files) |vf| {
+            try cached_files.append(allocator, .{
+                .vf = vf,
+                .ts_line_table = try LineTable.init(allocator, vf.content),
+                .svelte_line_table = try LineTable.init(allocator, vf.source_map.svelte_source),
+            });
+        }
+
+        try parseTsgoOutput(allocator, stdout, cached_files.items, &diagnostics);
         if (stderr.len > 0) {
-            try parseTsgoOutput(allocator, stderr, virtual_files, &diagnostics);
+            try parseTsgoOutput(allocator, stderr, cached_files.items, &diagnostics);
         }
     }
 
@@ -476,7 +497,7 @@ fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
 fn parseTsgoOutput(
     allocator: std.mem.Allocator,
     output: []const u8,
-    virtual_files: []const VirtualFile,
+    cached_files: []const CachedVirtualFile,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !void {
     // tsgo output format: file(line,col): error TSxxxx: message
@@ -501,34 +522,31 @@ fn parseTsgoOutput(
         const ts_line = std.fmt.parseInt(u32, line_str, 10) catch continue;
         const ts_col = std.fmt.parseInt(u32, col_str, 10) catch continue;
 
-        // Find corresponding virtual file by matching .svelte.ts path
-        const vf: ?VirtualFile = for (virtual_files) |v| {
-            if (std.mem.endsWith(u8, file_path, v.virtual_path)) {
-                break v;
+        // Find corresponding cached file by matching .svelte.ts path
+        const cached: ?CachedVirtualFile = for (cached_files) |cf| {
+            if (std.mem.endsWith(u8, file_path, cf.vf.virtual_path)) {
+                break cf;
             }
         } else null;
 
         // Only report errors from .svelte.ts files we generated.
         // Skip errors from other .ts files that tsgo checked transitively.
-        if (vf == null) continue;
+        if (cached == null) continue;
 
         // Map TS position back to Svelte position
         var svelte_line = ts_line;
         var svelte_col = ts_col;
         var original_path: []const u8 = file_path;
 
-        if (vf) |v| {
-            original_path = v.original_path;
+        if (cached) |cf| {
+            original_path = cf.vf.original_path;
 
-            // Build line table for generated TS to convert line/col → offset
-            const ts_table = try LineTable.init(allocator, v.content);
-
-            if (ts_table.lineColToOffset(ts_line, ts_col)) |ts_offset| {
+            // Use pre-computed line table to convert line/col → offset
+            if (cf.ts_line_table.lineColToOffset(ts_line, ts_col)) |ts_offset| {
                 // Map TS offset to Svelte offset
-                if (v.source_map.tsToSvelte(ts_offset)) |svelte_offset| {
-                    // Build line table for Svelte source to convert offset → line/col
-                    const svelte_table = try LineTable.init(allocator, v.source_map.svelte_source);
-                    const pos = svelte_table.offsetToLineCol(svelte_offset);
+                if (cf.vf.source_map.tsToSvelte(ts_offset)) |svelte_offset| {
+                    // Use pre-computed Svelte line table to convert offset → line/col
+                    const pos = cf.svelte_line_table.offsetToLineCol(svelte_offset);
                     // Convert from 0-based to 1-based
                     svelte_line = pos.line + 1;
                     svelte_col = pos.col + 1;
@@ -607,14 +625,20 @@ test "parse tsgo output" {
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
 
-    const virtual_files = [_]VirtualFile{.{
+    const vf: VirtualFile = .{
         .original_path = "src/routes/+page.svelte",
         .virtual_path = "src/routes/+page.svelte.ts",
         .content = "",
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
+    };
+
+    const cached_files = [_]CachedVirtualFile{.{
+        .vf = vf,
+        .ts_line_table = try LineTable.init(allocator, vf.content),
+        .svelte_line_table = try LineTable.init(allocator, vf.source_map.svelte_source),
     }};
 
-    try parseTsgoOutput(allocator, tsgo_output, &virtual_files, &diagnostics);
+    try parseTsgoOutput(allocator, tsgo_output, &cached_files, &diagnostics);
 
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings("src/routes/+page.svelte", diagnostics.items[0].file_path);

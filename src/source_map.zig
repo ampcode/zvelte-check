@@ -16,7 +16,10 @@ pub const SourceMap = struct {
 
     pub fn tsToSvelte(self: *const SourceMap, ts_offset: u32) ?u32 {
         for (self.mappings) |m| {
-            if (ts_offset >= m.ts_offset and ts_offset < m.ts_offset + m.len) {
+            // Early exit: mappings are monotonic by ts_offset, so if we've
+            // passed the target offset, no later mapping can match
+            if (ts_offset < m.ts_offset) return null;
+            if (ts_offset < m.ts_offset + m.len) {
                 const delta = ts_offset - m.ts_offset;
                 return m.svelte_offset + delta;
             }
