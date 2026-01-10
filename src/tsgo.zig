@@ -10,8 +10,9 @@ const Diagnostic = @import("diagnostic.zig").Diagnostic;
 const SourceMap = @import("source_map.zig").SourceMap;
 const LineTable = @import("source_map.zig").LineTable;
 
-const generated_tsconfig = ".svelte-check-tsconfig.json";
-const generated_stubs = ".svelte-check-stubs.d.ts";
+const stub_dir = ".zvelte-check";
+const generated_tsconfig = stub_dir ++ "/tsconfig.json";
+const generated_stubs = stub_dir ++ "/stubs.d.ts";
 
 pub const TsgoNotFoundError = error{TsgoNotFound};
 
@@ -61,32 +62,26 @@ pub fn check(
     var workspace_dir = try std.fs.cwd().openDir(workspace_path, .{});
     defer workspace_dir.close();
 
-    // Track generated files for cleanup
-    var generated_files: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (generated_files.items) |path| {
-            allocator.free(path);
-        }
-        generated_files.deinit(allocator);
-    }
-    errdefer cleanupGeneratedFiles(workspace_dir, generated_files.items);
+    // Create stub directory for all generated files (avoids polluting source tree)
+    try workspace_dir.makePath(stub_dir);
+    errdefer cleanupStubDir(workspace_dir);
 
-    // Write transformed .svelte.ts files alongside .svelte sources
+    // Write transformed .svelte.ts files into stub directory
     for (virtual_files) |vf| {
         // Strip workspace prefix from virtual_path to get relative path
         const relative_path = stripWorkspacePrefix(vf.virtual_path, workspace_path);
 
-        try writeVirtualFile(workspace_dir, relative_path, vf.content);
-        try generated_files.append(allocator, try allocator.dupe(u8, relative_path));
+        // Write to stub_dir/<relative_path> (e.g., .zvelte-check/src/routes/+page.svelte.ts)
+        const stub_path = try std.fs.path.join(allocator, &.{ stub_dir, relative_path });
+        defer allocator.free(stub_path);
+        try writeVirtualFile(workspace_dir, stub_path, vf.content);
     }
 
     // Write SvelteKit ambient type stubs
     try writeSvelteKitStubs(workspace_dir);
-    try generated_files.append(allocator, try allocator.dupe(u8, generated_stubs));
 
     // Generate tsconfig that extends project config and includes only our files
     try writeGeneratedTsconfig(workspace_dir, workspace_path, tsconfig_path, virtual_files);
-    try generated_files.append(allocator, try allocator.dupe(u8, generated_tsconfig));
 
     // Find tsgo binary: walk up from workspace looking for node_modules/.bin, then PATH
     const tsgo_path = try findTsgoBinary(allocator, workspace_path);
@@ -135,8 +130,8 @@ pub fn check(
     const stdout = stdout_buf.items;
     const stderr = stderr_buf.items;
 
-    // Clean up generated files before parsing output
-    cleanupGeneratedFiles(workspace_dir, generated_files.items);
+    // Clean up stub directory before parsing output
+    cleanupStubDir(workspace_dir);
 
     // Parse tsgo output
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
@@ -158,9 +153,13 @@ pub fn check(
     return diagnostics.toOwnedSlice(allocator);
 }
 
-/// Writes a transformed .svelte.ts file alongside its .svelte source.
-/// `relative_path` should be relative to workspace_dir (not include workspace prefix).
+/// Writes a transformed .svelte.ts file to the stub directory.
+/// `relative_path` should be relative to workspace_dir (e.g., .zvelte-check/src/routes/+page.svelte.ts).
 fn writeVirtualFile(workspace_dir: std.fs.Dir, relative_path: []const u8, content: []const u8) !void {
+    // Create parent directories if needed (for nested paths like src/routes/+page.svelte.ts)
+    if (std.fs.path.dirname(relative_path)) |parent| {
+        try workspace_dir.makePath(parent);
+    }
     const file = try workspace_dir.createFile(relative_path, .{});
     defer file.close();
     try file.writeAll(content);
@@ -181,11 +180,9 @@ fn stripWorkspacePrefix(path: []const u8, workspace_path: []const u8) []const u8
     return if (skip_len < path.len) path[skip_len..] else path;
 }
 
-/// Cleans up generated .svelte.ts files and tsconfig.
-fn cleanupGeneratedFiles(workspace_dir: std.fs.Dir, paths: []const []const u8) void {
-    for (paths) |path| {
-        workspace_dir.deleteFile(path) catch {};
-    }
+/// Cleans up the stub directory containing all generated files.
+fn cleanupStubDir(workspace_dir: std.fs.Dir) void {
+    workspace_dir.deleteTree(stub_dir) catch {};
 }
 
 /// Generates a tsconfig that extends the project's config.
@@ -207,14 +204,15 @@ fn writeGeneratedTsconfig(
     try w.writeAll("{\n");
 
     // Extend project tsconfig if available (for path aliases, baseUrl, etc.)
+    // Use ../ since our tsconfig is in .zvelte-check/ subdirectory
     if (tsconfig_path) |ptsconfig| {
-        try w.writeAll("  \"extends\": \"./");
+        try w.writeAll("  \"extends\": \"../");
         try w.writeAll(ptsconfig);
         try w.writeAll("\",\n");
     } else {
         // Auto-detect tsconfig.json in workspace root
         if (workspace_dir.access("tsconfig.json", .{})) {
-            try w.writeAll("  \"extends\": \"./tsconfig.json\",\n");
+            try w.writeAll("  \"extends\": \"../tsconfig.json\",\n");
         } else |_| {}
     }
 
@@ -234,16 +232,16 @@ fn writeGeneratedTsconfig(
     try w.writeAll("  },\n");
 
     // Include our generated files plus all .ts files they may import
+    // Paths are relative to this tsconfig in .zvelte-check/
     try w.writeAll("  \"include\": [\n");
-    try w.writeAll("    \"");
-    try w.writeAll(generated_stubs);
-    try w.writeAll("\",\n");
-    try w.writeAll("    \"src/**/*.ts\"");
+    try w.writeAll("    \"stubs.d.ts\",\n");
+    try w.writeAll("    \"../src/**/*.ts\"");
 
     for (virtual_files) |vf| {
         // Strip workspace prefix from virtual_path to get relative path
         const relative_path = stripWorkspacePrefix(vf.virtual_path, workspace_path);
 
+        // Include the stub file (already in .zvelte-check/ relative to tsconfig)
         try w.writeAll(",\n    \"");
         try w.writeAll(relative_path);
         try w.writeAll("\"");
@@ -252,7 +250,7 @@ fn writeGeneratedTsconfig(
     try w.writeAll("\n  ],\n");
 
     // Exclude node_modules to avoid scanning everything
-    try w.writeAll("  \"exclude\": [\"node_modules\"]\n");
+    try w.writeAll("  \"exclude\": [\"../node_modules\"]\n");
     try w.writeAll("}\n");
 
     try w.flush();
@@ -634,6 +632,9 @@ test "writeGeneratedTsconfig generates valid config" {
         std.fs.cwd().deleteTree(".zvelte-check-test-workspace") catch {};
     }
 
+    // Create the stub directory (normally done by check())
+    try workspace_dir.makePath(stub_dir);
+
     const virtual_files = [_]VirtualFile{.{
         .original_path = "src/routes/+page.svelte",
         .virtual_path = "src/routes/+page.svelte.ts",
@@ -652,8 +653,8 @@ test "writeGeneratedTsconfig generates valid config" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"include\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "src/routes/+page.svelte.ts") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"exclude\"") != null);
-    // Verify .ts files are included for imports from .svelte files
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"src/**/*.ts\"") != null);
+    // Verify .ts files are included for imports from .svelte files (with ../ prefix)
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"../src/**/*.ts\"") != null);
 }
 
 test "writeGeneratedTsconfig extends project config when available" {
@@ -667,6 +668,9 @@ test "writeGeneratedTsconfig extends project config when available" {
         workspace_dir.close();
         std.fs.cwd().deleteTree(".zvelte-check-test-workspace") catch {};
     }
+
+    // Create the stub directory (normally done by check())
+    try workspace_dir.makePath(stub_dir);
 
     // Create a fake project tsconfig
     const tsconfig_file = try workspace_dir.createFile("tsconfig.json", .{});
@@ -685,6 +689,6 @@ test "writeGeneratedTsconfig extends project config when available" {
     // Read generated config
     const content = try workspace_dir.readFileAlloc(allocator, generated_tsconfig, 10 * 1024);
 
-    // Verify extends is present
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"extends\": \"./tsconfig.json\"") != null);
+    // Verify extends uses ../ prefix (tsconfig is in .zvelte-check/ subdirectory)
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"extends\": \"../tsconfig.json\"") != null);
 }

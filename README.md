@@ -8,6 +8,16 @@ A fast diagnostic tool for Svelte projects.
 - Significantly faster startup and execution
 - Support for Svelte 5+ (runes, snippets, etc.)
 
+## Prerequisites
+
+TypeScript checking requires [tsgo](https://github.com/microsoft/typescript-go):
+
+```bash
+npm install -D @aspect-build/tsgo
+# or
+bun add -D @aspect-build/tsgo
+```
+
 ## Installation
 
 ```bash
@@ -38,6 +48,16 @@ zvelte-check --output json
 --fail-on-warnings       Exit with error on warnings
 --threshold <level>      Minimum severity: warning, error
 ```
+
+## Gitignore
+
+Add `.zvelte-check/` to your project's `.gitignore`:
+
+```bash
+echo '.zvelte-check/' >> .gitignore
+```
+
+This directory contains temporary TypeScript stubs generated during type-checking.
 
 ## License
 
