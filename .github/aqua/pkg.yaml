@@ -1,6 +1,0 @@
-# Test data for aqua registry
-# Place in pkgs/ampcode/zvelte-check/pkg.yaml
-
-packages:
-  - name: ampcode/zvelte-check
-    version: v0.1.0
