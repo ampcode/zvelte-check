@@ -726,7 +726,6 @@ fn getRoleRequiredProps(role: []const u8) []const []const u8 {
         const combobox_props = [_][]const u8{ "aria-controls", "aria-expanded" };
         const option_props = [_][]const u8{"aria-selected"};
         const heading_props = [_][]const u8{"aria-level"};
-        const separator_props = [_][]const u8{"aria-valuenow"};
     };
 
     if (std.mem.eql(u8, role, "checkbox")) return &S.checkbox_props;
@@ -738,7 +737,6 @@ fn getRoleRequiredProps(role: []const u8) []const []const u8 {
     if (std.mem.eql(u8, role, "combobox")) return &S.combobox_props;
     if (std.mem.eql(u8, role, "option")) return &S.option_props;
     if (std.mem.eql(u8, role, "heading")) return &S.heading_props;
-    if (std.mem.eql(u8, role, "separator")) return &S.separator_props;
 
     return &[_][]const u8{};
 }

@@ -36,9 +36,10 @@
 <!-- Expected: line 37, code: a11y-role-has-required-aria-props -->
 <div role="heading">Missing aria-level</div>
 
-<!-- a11y-role-has-required-aria-props: separator (focusable) missing value props -->
-<!-- Expected: line 41, code: a11y-role-has-required-aria-props -->
-<div role="separator" tabindex="0">Focusable separator missing value props</div>
+<!-- Valid: separator has no required props (aria-valuenow is optional) -->
+<div role="separator">Simple separator</div>
+<div role="separator" tabindex="0">Focusable separator</div>
+<div role="separator" tabindex="0" aria-valuenow="50">Focusable separator with optional value</div>
 
 <!-- Valid: checkbox with aria-checked -->
 <div role="checkbox" aria-checked="false">Has required prop</div>
