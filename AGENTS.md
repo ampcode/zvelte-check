@@ -110,6 +110,8 @@ const foo = Type{ .field = value };     // Avoid
 
 **Tests:** Inline in the same file, register in src/main.zig test block
 
+**Bug fixes:** Always add a regression test when fixing a bug. The test should reproduce the original failure and verify the fix.
+
 ## Safety Conventions
 
 Inspired by [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).

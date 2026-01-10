@@ -34,34 +34,32 @@ pub fn runDiagnostics(
 ) !void {
     var heading_tracker: HeadingTracker = .{};
 
-    // Track preceding comment node to check for svelte-ignore
-    var prev_comment: ?CommentData = null;
+    // Track ignore codes from consecutive preceding comments
+    var accumulated_ignore_codes: std.ArrayList([]const u8) = .empty;
 
     for (ast.nodes.items) |node| {
         if (node.kind == .comment) {
-            prev_comment = ast.comments.items[node.data];
+            const comment = ast.comments.items[node.data];
+            const codes = ast.ignore_codes.items[comment.ignore_codes_start..comment.ignore_codes_end];
+            for (codes) |code| {
+                try accumulated_ignore_codes.append(allocator, code);
+            }
             continue;
         }
 
         // Only check HTML elements, not Svelte components
         // Components are responsible for their own a11y
         if (node.kind != .element) {
-            prev_comment = null;
+            accumulated_ignore_codes.clearRetainingCapacity();
             continue;
         }
 
         const elem = ast.elements.items[node.data];
         const attrs = ast.attributes.items[elem.attrs_start..elem.attrs_end];
 
-        // Get ignore codes from preceding comment (if any)
-        const ignore_codes = if (prev_comment) |comment|
-            ast.ignore_codes.items[comment.ignore_codes_start..comment.ignore_codes_end]
-        else
-            &[_][]const u8{};
+        try checkElement(allocator, ast, node, elem, attrs, diagnostics, &heading_tracker, accumulated_ignore_codes.items);
 
-        try checkElement(allocator, ast, node, elem, attrs, diagnostics, &heading_tracker, ignore_codes);
-
-        prev_comment = null;
+        accumulated_ignore_codes.clearRetainingCapacity();
     }
 }
 
@@ -1027,6 +1025,36 @@ test "a11y: svelte-ignore with multiple codes" {
     }
     try std.testing.expect(!found_distracting);
     try std.testing.expect(!found_autofocus);
+}
+
+test "a11y: consecutive svelte-ignore comments are merged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+        \\<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+        \\<div tabindex="0" onclick="foo()"></div>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Both diagnostics from separate comments should be suppressed
+    var found_tabindex = false;
+    var found_interactions = false;
+    for (diagnostics.items) |d| {
+        if (d.code != null) {
+            if (std.mem.eql(u8, d.code.?, "a11y_no_noninteractive_tabindex")) found_tabindex = true;
+            if (std.mem.eql(u8, d.code.?, "a11y_no_noninteractive_element_interactions")) found_interactions = true;
+        }
+    }
+    try std.testing.expect(!found_tabindex);
+    try std.testing.expect(!found_interactions);
 }
 
 test "a11y: regular comment does not suppress diagnostic" {
