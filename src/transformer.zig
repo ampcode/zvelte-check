@@ -51,8 +51,13 @@ const SnippetInfo = struct {
 pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
+    // Pre-size output buffer: source length + overhead for type stubs and component class
+    try output.ensureTotalCapacity(allocator, ast.source.len + 4096);
+
     var mappings: std.ArrayList(SourceMap.Mapping) = .empty;
     defer mappings.deinit(allocator);
+    // Pre-size mappings: typically one mapping per script block plus template expressions
+    try mappings.ensureTotalCapacity(allocator, 16);
 
     // Detect SvelteKit route files
     const route_info = sveltekit.detectRoute(ast.file_path);
@@ -1511,8 +1516,14 @@ fn isIdentChar(c: u8) bool {
 /// Preserves regular imports (onMount, onDestroy, tick, etc.) from svelte.
 /// Returns content with type import lines removed.
 fn filterSvelteImports(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
+    // Early exit: skip if no Svelte imports to filter
+    const has_svelte_import = std.mem.indexOf(u8, content, "from 'svelte'") != null or
+        std.mem.indexOf(u8, content, "from \"svelte\"") != null;
+    if (!has_svelte_import) return content;
+
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
+    try result.ensureTotalCapacity(allocator, content.len);
 
     var i: usize = 0;
     while (i < content.len) {
@@ -1617,8 +1628,12 @@ fn filterMixedImport(allocator: std.mem.Allocator, line: []const u8) !?[]const u
 /// - Runes like `$state`, `$derived`, `$effect`, `$props`, `$bindable`, `$inspect`, `$host`
 /// - Template strings like `${expr}`
 fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
+    // Early exit: skip if no $ character (no stores or runes to process)
+    if (std.mem.indexOfScalar(u8, content, '$') == null) return content;
+
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
+    try result.ensureTotalCapacity(allocator, content.len + 256);
 
     const runes = [_][]const u8{
         "state", "derived", "effect", "props", "bindable", "inspect", "host",
@@ -1770,8 +1785,12 @@ fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8
 /// - Reactive blocks: `$: { ... }` - left as-is (valid labeled statement)
 /// - Reactive expressions: `$: console.log(x)` - left as-is (valid labeled statement)
 fn transformReactiveStatements(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
+    // Early exit: skip if no "$:" pattern (no reactive statements)
+    if (std.mem.indexOf(u8, content, "$:") == null) return content;
+
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
+    try result.ensureTotalCapacity(allocator, content.len);
 
     var i: usize = 0;
     while (i < content.len) {
