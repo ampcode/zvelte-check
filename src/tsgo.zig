@@ -5,6 +5,7 @@
 //! from the workspace root for proper module resolution, then cleans up.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const VirtualFile = @import("transformer.zig").VirtualFile;
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
 const SourceMap = @import("source_map.zig").SourceMap;
@@ -24,8 +25,29 @@ const CachedVirtualFile = struct {
     svelte_line_table: LineTable,
 };
 
-/// Finds the tsgo binary. Walks up from workspace looking for node_modules/.bin/tsgo
-/// (handles monorepos), then falls back to "tsgo" in PATH.
+/// Platform string for @typescript/native-preview package resolution.
+/// Maps Zig's builtin OS/arch to npm's platform naming convention.
+const native_preview_platform: ?[]const u8 = blk: {
+    const os = switch (builtin.os.tag) {
+        .macos => "darwin",
+        .linux => "linux",
+        .windows => "win32",
+        else => break :blk null,
+    };
+    const arch = switch (builtin.cpu.arch) {
+        .aarch64 => "arm64",
+        .x86_64 => "x64",
+        .arm => "arm",
+        else => break :blk null,
+    };
+    break :blk os ++ "-" ++ arch;
+};
+
+/// Finds the tsgo binary. Tries in order:
+/// 1. Native binary directly: node_modules/@typescript/native-preview-{platform}/lib/tsgo (fastest)
+/// 2. Sibling of main package (pnpm): resolve symlink, check ../native-preview-{platform}/lib/tsgo
+/// 3. Bin wrapper: node_modules/.bin/tsgo (slower, spawns Node.js)
+/// 4. PATH: "tsgo" (fallback)
 fn findTsgoBinary(allocator: std.mem.Allocator, workspace_path: []const u8) ![]const u8 {
     // Resolve to absolute path so we can walk up parent directories
     const abs_path = std.fs.cwd().realpathAlloc(allocator, workspace_path) catch {
@@ -36,14 +58,58 @@ fn findTsgoBinary(allocator: std.mem.Allocator, workspace_path: []const u8) ![]c
     var search_path: []const u8 = abs_path;
 
     while (true) {
-        const tsgo_path = std.fs.path.join(allocator, &.{ search_path, "node_modules/.bin/tsgo" }) catch {
+        if (native_preview_platform) |platform| {
+            // Fast path 1: flat node_modules (npm, yarn)
+            const native_path = std.fs.path.join(allocator, &.{
+                search_path,
+                "node_modules/@typescript/native-preview-" ++ platform ++ "/lib/tsgo",
+            }) catch break;
+
+            if (std.fs.cwd().access(native_path, .{})) {
+                return native_path;
+            } else |_| {
+                allocator.free(native_path);
+            }
+
+            // Fast path 2: pnpm - resolve symlink and check sibling package
+            // pnpm stores optionalDeps as siblings in .pnpm store:
+            // .pnpm/@typescript+native-preview@.../node_modules/@typescript/native-preview
+            // .pnpm/@typescript+native-preview-darwin-arm64@.../node_modules/@typescript/native-preview-darwin-arm64
+            // The main package has a symlink to the sibling: ../native-preview-{platform}
+            const main_pkg_path = std.fs.path.join(allocator, &.{
+                search_path,
+                "node_modules/@typescript/native-preview",
+            }) catch break;
+            defer allocator.free(main_pkg_path);
+
+            // Resolve symlink to get real path in .pnpm store
+            if (std.fs.cwd().realpathAlloc(allocator, main_pkg_path)) |real_main_path| {
+                defer allocator.free(real_main_path);
+                // Go up one level (@typescript/) and find sibling platform package
+                if (std.fs.path.dirname(real_main_path)) |parent_dir| {
+                    const sibling_path = std.fs.path.join(allocator, &.{
+                        parent_dir,
+                        "native-preview-" ++ platform ++ "/lib/tsgo",
+                    }) catch break;
+
+                    if (std.fs.cwd().access(sibling_path, .{})) {
+                        return sibling_path;
+                    } else |_| {
+                        allocator.free(sibling_path);
+                    }
+                }
+            } else |_| {}
+        }
+
+        // Slow path: try .bin wrapper (spawns Node.js to resolve and exec binary)
+        const bin_path = std.fs.path.join(allocator, &.{ search_path, "node_modules/.bin/tsgo" }) catch {
             break;
         };
 
-        if (std.fs.cwd().access(tsgo_path, .{})) {
-            return tsgo_path;
+        if (std.fs.cwd().access(bin_path, .{})) {
+            return bin_path;
         } else |_| {
-            allocator.free(tsgo_path);
+            allocator.free(bin_path);
         }
 
         // Move to parent directory
