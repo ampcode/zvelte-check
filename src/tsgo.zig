@@ -904,6 +904,14 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
                 return true;
             }
         }
+
+        // Skip "Right operand of ?? is unreachable" errors
+        // False positives from $derived expressions: tsgo analyzes these statically
+        // without understanding Svelte's reactivity, so it incorrectly thinks the
+        // left operand is never nullish when it actually can be at runtime.
+        if (std.mem.indexOf(u8, message, "Right operand of ?? is unreachable") != null) {
+            return true;
+        }
     }
 
     // Errors to skip for both .svelte and .ts files
