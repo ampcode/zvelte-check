@@ -912,6 +912,13 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         if (std.mem.indexOf(u8, message, "Right operand of ?? is unreachable") != null) {
             return true;
         }
+
+        // Skip "All imports in import declaration are unused" errors
+        // False positives for Svelte component imports that are used in templates.
+        // Our transformer doesn't emit usage for components instantiated in markup.
+        if (std.mem.indexOf(u8, message, "All imports in import declaration are unused") != null) {
+            return true;
+        }
     }
 
     // Errors to skip for both .svelte and .ts files
