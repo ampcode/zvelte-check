@@ -1213,21 +1213,25 @@ fn scanTemplateForEachBlocks(
 fn isJsKeywordOrBuiltin(name: []const u8) bool {
     const keywords = [_][]const u8{
         // JS keywords
-        "if",      "else",    "for",        "while",     "do",         "switch",
-        "case",    "default", "break",      "continue",  "return",     "throw",
-        "try",     "catch",   "finally",    "new",       "delete",     "typeof",
-        "void",    "in",      "instanceof", "this",      "class",      "extends",
-        "super",   "import",  "export",     "from",      "as",         "async",
-        "await",   "yield",   "let",        "const",     "var",        "function",
-        "true",    "false",   "null",       "undefined", "NaN",        "Infinity",
+        "if",        "else",       "for",        "while",     "do",      "switch",
+        "case",      "default",    "break",      "continue",  "return",  "throw",
+        "try",       "catch",      "finally",    "new",       "delete",  "typeof",
+        "void",      "in",         "instanceof", "this",      "class",   "extends",
+        "super",     "import",     "export",     "from",      "as",      "async",
+        "await",     "yield",      "let",        "const",     "var",     "function",
+        "true",      "false",      "null",       "undefined", "NaN",     "Infinity",
+        // Reserved keywords (strict mode and future reserved)
+        "with",      "enum",       "implements", "interface", "package", "private",
+        "protected", "public",     "static",
         // Built-in objects
-        "Array",   "Object",  "String",     "Number",    "Boolean",    "Symbol",
-        "BigInt",  "Math",    "Date",       "RegExp",    "Error",      "JSON",
-        "Promise", "Map",     "Set",        "WeakMap",   "WeakSet",    "Proxy",
-        "Reflect", "console", "window",     "document",  "globalThis",
+            "Array",     "Object",  "String",
+        "Number",    "Boolean",    "Symbol",     "BigInt",    "Math",    "Date",
+        "RegExp",    "Error",      "JSON",       "Promise",   "Map",     "Set",
+        "WeakMap",   "WeakSet",    "Proxy",      "Reflect",   "console", "window",
+        "document",  "globalThis",
         // Svelte keywords in template blocks
-        "each",
-        "snippet", "render",  "html",       "debug",     "key",
+        "each",       "snippet",   "render",  "html",
+        "debug",     "key",
     };
     for (keywords) |kw| {
         if (std.mem.eql(u8, name, kw)) return true;
