@@ -720,6 +720,15 @@ fn shouldSkipSvelteTypeError(message: []const u8) bool {
         return true;
     }
 
+    // Skip "Cannot redeclare block-scoped variable" errors
+    // These are false positives from snippet parameters shadowing outer variables.
+    // In Svelte, {#snippet name({ foo })} creates a new scope where foo shadows
+    // the outer variable, which is valid. Our generated code declares both,
+    // causing TypeScript to complain about redeclaration.
+    if (std.mem.indexOf(u8, message, "Cannot redeclare block-scoped variable") != null) {
+        return true;
+    }
+
     // Skip "Cannot find module './X.remote'" and "./$types" errors
     // SvelteKit remote functions and $types are virtual modules generated at build time
     if (std.mem.indexOf(u8, message, "Cannot find module") != null) {
@@ -730,6 +739,16 @@ fn shouldSkipSvelteTypeError(message: []const u8) bool {
     // Skip "Module '\"*.svelte\"' has no exported member" errors
     // These occur when TypeScript doesn't understand .svelte imports
     if (std.mem.indexOf(u8, message, "Module '\"*.svelte\"'") != null) {
+        return true;
+    }
+
+    // Skip "Cannot use namespace 'X' as a type" errors
+    // These are false positives from libraries like bits-ui that export
+    // namespaces with both component and type members. TypeScript sometimes
+    // gets confused when we use Namespace.TypeMember in Svelte files.
+    if (std.mem.indexOf(u8, message, "Cannot use namespace") != null and
+        std.mem.indexOf(u8, message, "as a type") != null)
+    {
         return true;
     }
 

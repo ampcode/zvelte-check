@@ -103,7 +103,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         \\
         \\// Svelte store auto-subscription stub
         \\// $storeName syntax in Svelte auto-subscribes to the store
-        \\declare function __svelte_store_get<T>(store: { subscribe: (fn: (value: T) => void) => any } | null | undefined): T | undefined;
+        \\// Returns an object with .v property for both reading and assignment
+        \\declare function __svelte_store<T>(store: { subscribe: (fn: (value: T) => void) => any } | null | undefined): { v: T | undefined };
         \\
         \\
     );
@@ -1618,12 +1619,14 @@ fn filterMixedImport(allocator: std.mem.Allocator, line: []const u8) !?[]const u
     return try new_line.toOwnedSlice(allocator);
 }
 
-/// Transforms Svelte store auto-subscriptions ($storeName) to __svelte_store_get(storeName).
+/// Transforms Svelte store auto-subscriptions ($storeName) to __svelte_store(storeName).v.
 /// This allows tsgo to type-check store access patterns without seeing undefined variables.
+/// The .v property allows both reads and assignments (for $store = value syntax).
 /// Handles cases like:
-/// - `$page.url` → `__svelte_store_get(page).url`
-/// - `$count + 1` → `__svelte_store_get(count) + 1`
-/// - `if ($loading)` → `if (__svelte_store_get(loading))`
+/// - `$page.url` → `__svelte_store(page).v.url`
+/// - `$count + 1` → `__svelte_store(count).v + 1`
+/// - `if ($loading)` → `if (__svelte_store(loading).v)`
+/// - `$count = 5` → `__svelte_store(count).v = 5`
 /// Does NOT transform:
 /// - Runes like `$state`, `$derived`, `$effect`, `$props`, `$bindable`, `$inspect`, `$host`
 /// - Template strings like `${expr}`
@@ -1672,10 +1675,11 @@ fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8
                     continue;
                 }
 
-                // Transform $storeName → __svelte_store_get(storeName)
-                try result.appendSlice(allocator, "__svelte_store_get(");
+                // Transform $storeName → __svelte_store(storeName).v
+                // Using .v property allows both reads and assignments
+                try result.appendSlice(allocator, "__svelte_store(");
                 try result.appendSlice(allocator, name);
-                try result.append(allocator, ')');
+                try result.appendSlice(allocator, ").v");
                 i = name_end;
                 continue;
             }
@@ -1721,9 +1725,9 @@ fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8
                                 } else false;
 
                                 if (!is_inner_rune) {
-                                    try result.appendSlice(allocator, "__svelte_store_get(");
+                                    try result.appendSlice(allocator, "__svelte_store(");
                                     try result.appendSlice(allocator, inner_name);
-                                    try result.append(allocator, ')');
+                                    try result.appendSlice(allocator, ").v");
                                     i = inner_name_end;
                                     continue;
                                 }
@@ -2726,7 +2730,7 @@ test "transform store subscription basic" {
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    try std.testing.expectEqualStrings("const url = __svelte_store_get(page).url;", result);
+    try std.testing.expectEqualStrings("const url = __svelte_store(page).v.url;", result);
 }
 
 test "transform store subscription preserves runes" {
@@ -2746,7 +2750,7 @@ test "transform store subscription multiple stores" {
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    try std.testing.expectEqualStrings("if (__svelte_store_get(page).url && __svelte_store_get(navigating)) { console.log(__svelte_store_get(myStore)); }", result);
+    try std.testing.expectEqualStrings("if (__svelte_store(page).v.url && __svelte_store(navigating).v) { console.log(__svelte_store(myStore).v); }", result);
 }
 
 test "transform store subscription skips template literal interpolation marker" {
@@ -2756,7 +2760,7 @@ test "transform store subscription skips template literal interpolation marker" 
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    try std.testing.expectEqualStrings("const msg = `url: ${__svelte_store_get(page).url}`;", result);
+    try std.testing.expectEqualStrings("const msg = `url: ${__svelte_store(page).v.url}`;", result);
 }
 
 test "transform store subscription skips strings" {
@@ -2766,7 +2770,7 @@ test "transform store subscription skips strings" {
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    try std.testing.expectEqualStrings("const str = '$page is a store'; const real = __svelte_store_get(page);", result);
+    try std.testing.expectEqualStrings("const str = '$page is a store'; const real = __svelte_store(page).v;", result);
 }
 
 test "transform store subscription mixed runes and stores" {
@@ -2776,7 +2780,18 @@ test "transform store subscription mixed runes and stores" {
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    try std.testing.expectEqualStrings("let url = $state(__svelte_store_get(page).url);", result);
+    try std.testing.expectEqualStrings("let url = $state(__svelte_store(page).v.url);", result);
+}
+
+test "transform store subscription assignment" {
+    const allocator = std.testing.allocator;
+
+    const input = "$count = 5;";
+    const result = try transformStoreSubscriptions(allocator, input);
+    defer allocator.free(result);
+
+    // Store assignment becomes property assignment which is valid TypeScript
+    try std.testing.expectEqualStrings("__svelte_store(count).v = 5;", result);
 }
 
 test "transform component with store subscriptions" {
@@ -2798,8 +2813,8 @@ test "transform component with store subscriptions" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should have transformed $page to __svelte_store_get(page)
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__svelte_store_get(page).url") != null);
+    // Should have transformed $page to __svelte_store(page).v
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__svelte_store(page).v.url") != null);
     // Should NOT have untransformed $page
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$page.url") == null);
 }
