@@ -896,6 +896,11 @@ fn emitTemplateExpressions(
 ) !void {
     var has_expressions = false;
 
+    // Collect identifiers referenced in template expressions to emit void statements.
+    // This marks variables as "used" so noUnusedLocals works correctly.
+    var template_refs: std.StringHashMapUnmanaged(void) = .empty;
+    defer template_refs.deinit(allocator);
+
     for (ast.nodes.items) |node| {
         switch (node.kind) {
             .snippet => {
@@ -922,13 +927,312 @@ fn emitTemplateExpressions(
                 }
             },
 
+            .expression, .if_block, .await_block, .key_block, .render, .html, .const_tag, .debug_tag => {
+                // Extract identifiers from template expressions
+                const expr = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, expr, &template_refs);
+            },
+
+            .each_block => {
+                // Extract identifiers from each expression and emit binding declarations
+                const expr = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, expr, &template_refs);
+
+                // Parse and emit each block bindings (item, index variables)
+                if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    try emitEachBindingDeclarations(allocator, output, binding, binding.iterable);
+                }
+            },
+
+            .element, .component => {
+                // Extract identifiers from attribute expressions
+                const elem_data = ast.elements.items[node.data];
+
+                // For components, extract the component name (or namespace for Namespace.Component)
+                if (node.kind == .component) {
+                    const tag = elem_data.tag_name;
+                    // Extract first identifier (e.g., "Table" from "Table.Root")
+                    var name_end: usize = 0;
+                    while (name_end < tag.len and (std.ascii.isAlphanumeric(tag[name_end]) or tag[name_end] == '_' or tag[name_end] == '$')) : (name_end += 1) {}
+                    if (name_end > 0) {
+                        try template_refs.put(allocator, tag[0..name_end], {});
+                    }
+                }
+
+                for (ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end]) |attr| {
+                    if (attr.value) |val| {
+                        // Expression values are wrapped in {}
+                        if (val.len > 0 and val[0] == '{') {
+                            try extractIdentifiersFromExpr(allocator, val, &template_refs);
+                        }
+                    }
+                    // Shorthand attributes like {foo} use attr name as expression
+                    if (attr.value == null and attr.name.len > 0 and !std.mem.startsWith(u8, attr.name, "on:") and !std.mem.startsWith(u8, attr.name, "bind:")) {
+                        // This might be a shorthand {foo}
+                        const src = ast.source[attr.start..attr.end];
+                        if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
+                            try extractIdentifiersFromExpr(allocator, src, &template_refs);
+                        }
+                    }
+                }
+            },
+
             else => {},
         }
+    }
+
+    // Fallback: scan template source directly for {#each} patterns not captured by AST
+    // The parser sometimes misses {#each} blocks inside component elements
+    try scanTemplateForEachBlocks(allocator, ast, output, &template_refs, &has_expressions);
+
+    // Emit void statements for template-referenced identifiers
+    // This marks them as "used" for noUnusedLocals checking
+    var iter = template_refs.keyIterator();
+    while (iter.next()) |key| {
+        const name = key.*;
+        // Skip keywords, built-ins, and names declared in template (snippets, each bindings)
+        if (isJsKeywordOrBuiltin(name)) continue;
+
+        if (!has_expressions) {
+            try output.appendSlice(allocator, "// Template expressions\n");
+            has_expressions = true;
+        }
+        try output.appendSlice(allocator, "void ");
+        try output.appendSlice(allocator, name);
+        try output.appendSlice(allocator, ";\n");
     }
 
     if (has_expressions) {
         try output.appendSlice(allocator, "\n");
     }
+}
+
+/// Extracts identifier references from a template expression string.
+/// Handles expressions like {foo}, {foo.bar}, {foo + bar}, onclick={handler}, etc.
+fn extractIdentifiersFromExpr(
+    allocator: std.mem.Allocator,
+    expr: []const u8,
+    refs: *std.StringHashMapUnmanaged(void),
+) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+    while (i < expr.len) {
+        const c = expr[i];
+
+        // Handle strings - for template literals, extract from interpolations
+        if (c == '"' or c == '\'') {
+            i = skipStringLiteral(expr, i);
+            continue;
+        }
+        if (c == '`') {
+            i = try skipStringLiteralAndExtract(allocator, expr, i, refs);
+            continue;
+        }
+
+        // Skip comments
+        if (i + 1 < expr.len and c == '/') {
+            if (expr[i + 1] == '/') {
+                while (i < expr.len and expr[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (expr[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < expr.len and !(expr[i] == '*' and expr[i + 1] == '/')) : (i += 1) {}
+                if (i + 1 < expr.len) i += 2;
+                continue;
+            }
+        }
+
+        // Check for identifier start
+        if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
+            const start = i;
+            while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_' or expr[i] == '$')) : (i += 1) {}
+            const ident = expr[start..i];
+
+            // Skip if preceded by dot (member access) - check char before start
+            if (start > 0 and expr[start - 1] == '.') continue;
+
+            // Store identifier reference
+            if (ident.len > 0) {
+                try refs.put(allocator, ident, {});
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Skips a string literal starting at position i, returning position after closing quote.
+/// For template literals, also extracts identifiers from interpolations.
+fn skipStringLiteralAndExtract(
+    allocator: std.mem.Allocator,
+    expr: []const u8,
+    start: usize,
+    refs: *std.StringHashMapUnmanaged(void),
+) std.mem.Allocator.Error!usize {
+    if (start >= expr.len) return start;
+    const quote = expr[start];
+    var i = start + 1;
+    while (i < expr.len) {
+        if (expr[i] == '\\' and i + 1 < expr.len) {
+            i += 2;
+            continue;
+        }
+        if (expr[i] == quote) {
+            return i + 1;
+        }
+        // Template literal interpolation - extract identifiers from inside
+        if (quote == '`' and expr[i] == '$' and i + 1 < expr.len and expr[i + 1] == '{') {
+            const interp_start = i + 2;
+            i += 2;
+            var depth: u32 = 1;
+            while (i < expr.len and depth > 0) {
+                if (expr[i] == '{') depth += 1;
+                if (expr[i] == '}') depth -= 1;
+                if (depth > 0) i += 1;
+            }
+            const interp_end = i;
+            // Recursively extract identifiers from the interpolation content
+            try extractIdentifiersFromExpr(allocator, expr[interp_start..interp_end], refs);
+            if (i < expr.len) i += 1; // skip closing }
+            continue;
+        }
+        i += 1;
+    }
+    return i;
+}
+
+/// Simple string skip for non-template literals (no identifier extraction needed)
+fn skipStringLiteral(expr: []const u8, start: usize) usize {
+    if (start >= expr.len) return start;
+    const quote = expr[start];
+    var i = start + 1;
+    while (i < expr.len) {
+        if (expr[i] == '\\' and i + 1 < expr.len) {
+            i += 2;
+            continue;
+        }
+        if (expr[i] == quote) {
+            return i + 1;
+        }
+        i += 1;
+    }
+    return i;
+}
+
+/// Scans template source directly for template expressions not captured by AST nodes.
+/// This is a fallback for when the parser misses expressions inside component elements.
+fn scanTemplateForEachBlocks(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    output: *std.ArrayList(u8),
+    template_refs: *std.StringHashMapUnmanaged(void),
+    has_expressions: *bool,
+) !void {
+    // Find template portion (after scripts, before styles)
+    var template_start: usize = 0;
+    var template_end: usize = ast.source.len;
+
+    // Skip script blocks to find template
+    for (ast.scripts.items) |script| {
+        // Find </script> after this script's content
+        if (std.mem.indexOf(u8, ast.source[script.content_end..], "</script>")) |end_offset| {
+            const script_block_end = script.content_end + end_offset + 9;
+            if (script_block_end > template_start) {
+                template_start = script_block_end;
+            }
+        }
+    }
+
+    // Find first <style> tag to limit template_end
+    if (std.mem.indexOf(u8, ast.source[template_start..], "<style")) |style_offset| {
+        template_end = template_start + style_offset;
+    }
+
+    const template = ast.source[template_start..template_end];
+
+    // Scan for ALL {expression} patterns (including {#if}, {#each}, {@render}, plain {expr})
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] != '{') {
+            i += 1;
+            continue;
+        }
+
+        const expr_start = i;
+
+        // Find matching closing brace, respecting nesting
+        var depth: u32 = 1;
+        var j = i + 1;
+        while (j < template.len and depth > 0) {
+            if (template[j] == '{') depth += 1;
+            if (template[j] == '}') depth -= 1;
+            j += 1;
+        }
+
+        const full_expr = template[expr_start..j];
+
+        // Extract identifiers from the expression
+        try extractIdentifiersFromExpr(allocator, full_expr, template_refs);
+
+        // Special handling for {#each} - emit binding declarations
+        if (std.mem.startsWith(u8, full_expr, "{#each ")) {
+            if (extractEachBindings(template, @intCast(expr_start), @intCast(j))) |binding| {
+                if (!has_expressions.*) {
+                    try output.appendSlice(allocator, "// Template expressions\n");
+                    has_expressions.* = true;
+                }
+                try emitEachBindingDeclarations(allocator, output, binding, binding.iterable);
+            }
+        }
+
+        // Special handling for {@const} - emit variable declaration
+        if (std.mem.startsWith(u8, full_expr, "{@const ")) {
+            if (extractConstBinding(template, @intCast(expr_start), @intCast(j))) |binding| {
+                if (!has_expressions.*) {
+                    try output.appendSlice(allocator, "// Template expressions\n");
+                    has_expressions.* = true;
+                }
+                try output.appendSlice(allocator, "var ");
+                try output.appendSlice(allocator, binding.name);
+                try output.appendSlice(allocator, " = ");
+                try output.appendSlice(allocator, binding.expr);
+                try output.appendSlice(allocator, ";\n");
+            }
+        }
+
+        i = j; // move past this expression
+    }
+}
+
+/// Returns true if the identifier is a JavaScript keyword or built-in.
+fn isJsKeywordOrBuiltin(name: []const u8) bool {
+    const keywords = [_][]const u8{
+        // JS keywords
+        "if",      "else",    "for",        "while",     "do",         "switch",
+        "case",    "default", "break",      "continue",  "return",     "throw",
+        "try",     "catch",   "finally",    "new",       "delete",     "typeof",
+        "void",    "in",      "instanceof", "this",      "class",      "extends",
+        "super",   "import",  "export",     "from",      "as",         "async",
+        "await",   "yield",   "let",        "const",     "var",        "function",
+        "true",    "false",   "null",       "undefined", "NaN",        "Infinity",
+        // Built-in objects
+        "Array",   "Object",  "String",     "Number",    "Boolean",    "Symbol",
+        "BigInt",  "Math",    "Date",       "RegExp",    "Error",      "JSON",
+        "Promise", "Map",     "Set",        "WeakMap",   "WeakSet",    "Proxy",
+        "Reflect", "console", "window",     "document",  "globalThis",
+        // Svelte keywords in template blocks
+        "each",
+        "snippet", "render",  "html",       "debug",     "key",
+    };
+    for (keywords) |kw| {
+        if (std.mem.eql(u8, name, kw)) return true;
+    }
+    return false;
 }
 
 /// Emits variable declarations for each block bindings

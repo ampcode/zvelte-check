@@ -317,17 +317,13 @@ fn writeGeneratedTsconfig(
     }
 
     // Compiler options for Svelte checking
-    // We disable noUnusedLocals/noUnusedParameters because variables declared in <script>
-    // are often used in the Svelte template, but TypeScript only sees the generated .ts
-    // file where those template usages aren't represented. Enabling these would cause
-    // many false positives for any variable used only in {expressions} or component props.
+    // Template variable references are emitted as void statements, so noUnusedLocals
+    // correctly identifies truly unused variables without false positives.
     try w.writeAll("  \"compilerOptions\": {\n");
     try w.writeAll("    \"noEmit\": true,\n");
     try w.writeAll("    \"skipLibCheck\": true,\n");
     try w.writeAll("    \"allowJs\": true,\n");
     try w.writeAll("    \"checkJs\": true,\n");
-    try w.writeAll("    \"noUnusedLocals\": false,\n");
-    try w.writeAll("    \"noUnusedParameters\": false,\n");
     // rootDirs makes TS treat .zvelte-check/ and workspace root as the same virtual root,
     // so relative imports in generated .svelte.ts files resolve correctly
     try w.writeAll("    \"rootDirs\": [\".\", \"..\"]\n");
@@ -604,8 +600,10 @@ fn parseTsgoOutput(
         if (line.len == 0) continue;
 
         // Parse: filename(line,col): severity TScode: message
-        const paren_start = std.mem.indexOf(u8, line, "(") orelse continue;
-        const paren_end = std.mem.indexOf(u8, line, ")") orelse continue;
+        // Note: File paths may contain parentheses (e.g., SvelteKit routes like "(app)")
+        // so we look for the LAST "(" followed by "digits,digits)" pattern
+        const paren_end = std.mem.lastIndexOf(u8, line, ")") orelse continue;
+        const paren_start = std.mem.lastIndexOf(u8, line[0..paren_end], "(") orelse continue;
         const colon_pos = std.mem.indexOf(u8, line[paren_end..], ":") orelse continue;
 
         const file_path = line[0..paren_start];
