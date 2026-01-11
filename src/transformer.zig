@@ -569,20 +569,7 @@ fn extractPropsRune(allocator: std.mem.Allocator, content: []const u8, props: *s
             i += 1;
             i = skipWhitespace(content, i);
             const type_start = i;
-            while (i < content.len and (isIdentChar(content[i]) or content[i] == '<' or content[i] == '>')) {
-                if (content[i] == '<') {
-                    // Skip generic params
-                    var depth: u32 = 1;
-                    i += 1;
-                    while (i < content.len and depth > 0) {
-                        if (content[i] == '<') depth += 1;
-                        if (content[i] == '>') depth -= 1;
-                        i += 1;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
+            i = skipPropsTypeAnnotation(content, i);
             const interface_name = std.mem.trim(u8, content[type_start..i], " \t\n\r");
             if (interface_name.len > 0) {
                 return interface_name;
@@ -591,6 +578,111 @@ fn extractPropsRune(allocator: std.mem.Allocator, content: []const u8, props: *s
     }
 
     return null;
+}
+
+/// Skip a complete TypeScript type annotation for $props(), handling:
+/// - Simple identifiers (Props)
+/// - Generic types (Pick<T, K>)
+/// - Intersection types (A & B)
+/// - Union types (A | B)
+/// - Inline object types ({ foo: bar })
+/// - Function types with arrow (=> void)
+/// - Multi-line types (newlines allowed inside brackets)
+/// Stops at = when at depth 0 (for the `= $props()` part).
+fn skipPropsTypeAnnotation(content: []const u8, start: usize) usize {
+    var i = start;
+    var angle_depth: u32 = 0; // < >
+    var brace_depth: u32 = 0; // { }
+    var bracket_depth: u32 = 0; // [ ]
+    var paren_depth: u32 = 0; // ( )
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Handle arrow in function types (=>) - must check before = handling
+        if (c == '=' and i + 1 < content.len and content[i + 1] == '>') {
+            i += 2; // Skip both = and >
+            continue;
+        }
+
+        // Track depths separately for proper bracket matching
+        if (c == '<') {
+            angle_depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == '>') {
+            if (angle_depth > 0) {
+                angle_depth -= 1;
+                i += 1;
+                continue;
+            }
+            // Standalone > not after = - could be comparison or end of type
+            // In type context inside braces, continue; otherwise break
+            if (brace_depth > 0 or paren_depth > 0 or bracket_depth > 0) {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if (c == '{') {
+            brace_depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == '}') {
+            if (brace_depth > 0) {
+                brace_depth -= 1;
+                i += 1;
+                continue;
+            }
+            // Unbalanced } - end of type
+            break;
+        }
+        if (c == '[') {
+            bracket_depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == ']') {
+            if (bracket_depth > 0) {
+                bracket_depth -= 1;
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if (c == '(') {
+            paren_depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == ')') {
+            if (paren_depth > 0) {
+                paren_depth -= 1;
+                i += 1;
+                continue;
+            }
+            break;
+        }
+
+        // Handle strings (for literal types like 'icon' | 'label')
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        const total_depth = angle_depth + brace_depth + bracket_depth + paren_depth;
+
+        // Stop at = when at depth 0 (start of = $props())
+        if (total_depth == 0 and c == '=') {
+            break;
+        }
+
+        i += 1;
+    }
+
+    return i;
 }
 
 /// Skip an expression (for default values in destructuring)
@@ -3034,6 +3126,46 @@ test "extract $props() with multi-line destructuring" {
     // Renamed prop "class: classList" should extract "class" as the prop name
     try std.testing.expectEqualStrings("class", props.items[4].name);
     try std.testing.expect(props.items[4].has_initializer);
+}
+
+test "extract $props() with complex multi-line intersection type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Pattern from action-row.svelte - Pick<...> & {...} with arrow functions
+    const content =
+        \\let {
+        \\    icon,
+        \\    isExpanded = true,
+        \\    hintOnClick = undefined,
+        \\}: Pick<
+        \\    ComponentProps,
+        \\    | 'icon'
+        \\    | 'isExpanded'
+        \\> & {
+        \\    children: Snippet
+        \\    hintOnClick?: () => void
+        \\} = $props()
+    ;
+
+    var props: std.ArrayList(PropInfo) = .empty;
+    const interface_name = try extractPropsRune(allocator, content, &props);
+
+    // Should extract the full complex type including Pick and intersection
+    try std.testing.expect(interface_name != null);
+    try std.testing.expect(std.mem.indexOf(u8, interface_name.?, "Pick<") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interface_name.?, "& {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interface_name.?, "() => void") != null);
+
+    // Should extract the props from destructuring
+    try std.testing.expectEqual(@as(usize, 3), props.items.len);
+    try std.testing.expectEqualStrings("icon", props.items[0].name);
+    try std.testing.expect(!props.items[0].has_initializer);
+    try std.testing.expectEqualStrings("isExpanded", props.items[1].name);
+    try std.testing.expect(props.items[1].has_initializer);
+    try std.testing.expectEqualStrings("hintOnClick", props.items[2].name);
+    try std.testing.expect(props.items[2].has_initializer);
 }
 
 test "transform svelte 5 runes component" {
