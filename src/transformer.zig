@@ -2590,6 +2590,9 @@ test "transform typescript component" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "default: {}") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "extends SvelteComponentTyped<$$Props, $$Events, $$Slots>") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "badType: number = \"not a number\"") != null);
+
+    // Component usages in template should emit void statements
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Button;") != null);
 }
 
 test "extract $props() with interface type" {
@@ -4315,4 +4318,34 @@ test "snippet name shadowing import should not emit var declaration" {
     // The imports should still be present
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import { filter, map } from 'rxjs'") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import Default from './other'") != null);
+}
+
+test "component usages in template emit void statements" {
+    // Verify that components used in templates emit void statements to mark them as used.
+    // This prevents "X is declared but never used" errors for component imports.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  import Button from './Button.svelte';
+        \\  import UserCard from './UserCard.svelte';
+        \\</script>
+        \\
+        \\<div>
+        \\  <Button />
+        \\  <UserCard name="test" />
+        \\</div>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "ComponentTest.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Simple components should emit void statements
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Button;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void UserCard;") != null);
 }
