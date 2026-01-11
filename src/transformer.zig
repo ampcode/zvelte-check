@@ -405,7 +405,7 @@ fn extractPropsRune(allocator: std.mem.Allocator, content: []const u8, props: *s
     }
 
     // Otherwise, look for destructuring pattern before $props
-    // Find the start of the let statement
+    // Find the start of the let statement (may span multiple lines for multi-line destructuring)
     var let_pos: ?usize = null;
     var search_pos: usize = props_call;
     while (search_pos > 0) {
@@ -414,7 +414,8 @@ fn extractPropsRune(allocator: std.mem.Allocator, content: []const u8, props: *s
             let_pos = search_pos;
             break;
         }
-        if (content[search_pos] == '\n' or content[search_pos] == ';') break;
+        // Only break on semicolon (newlines are fine for multi-line destructuring)
+        if (content[search_pos] == ';') break;
     }
 
     if (let_pos == null) return null;
@@ -2181,6 +2182,40 @@ test "extract $props() with $bindable" {
     try std.testing.expect(props.items[0].is_bindable);
     try std.testing.expectEqualStrings("name", props.items[1].name);
     try std.testing.expect(!props.items[1].is_bindable);
+}
+
+test "extract $props() with multi-line destructuring" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Pattern from animated-text.svelte - destructuring spans multiple lines
+    const content =
+        \\let {
+        \\    text,
+        \\    startDelay = 0,
+        \\    fadeOutDelay = undefined,
+        \\    kerningAdjustments = {},
+        \\    class: classList = '',
+        \\} = $props()
+    ;
+
+    var props: std.ArrayList(PropInfo) = .empty;
+    const interface_name = try extractPropsRune(allocator, content, &props);
+
+    try std.testing.expect(interface_name == null);
+    try std.testing.expectEqual(@as(usize, 5), props.items.len);
+    try std.testing.expectEqualStrings("text", props.items[0].name);
+    try std.testing.expect(!props.items[0].has_initializer);
+    try std.testing.expectEqualStrings("startDelay", props.items[1].name);
+    try std.testing.expect(props.items[1].has_initializer);
+    try std.testing.expectEqualStrings("fadeOutDelay", props.items[2].name);
+    try std.testing.expect(props.items[2].has_initializer);
+    try std.testing.expectEqualStrings("kerningAdjustments", props.items[3].name);
+    try std.testing.expect(props.items[3].has_initializer);
+    // Renamed prop "class: classList" should extract "class" as the prop name
+    try std.testing.expectEqualStrings("class", props.items[4].name);
+    try std.testing.expect(props.items[4].has_initializer);
 }
 
 test "transform svelte 5 runes component" {
