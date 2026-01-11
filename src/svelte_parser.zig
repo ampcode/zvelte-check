@@ -367,19 +367,21 @@ pub const Parser = struct {
                     } else if (self.current.kind == .lbrace) {
                         // Expression value {expr} - store as expression marker
                         const expr_start = self.current.start;
+                        var expr_end: u32 = self.current.end;
                         var depth: u32 = 0;
                         while (self.current.kind != .eof) {
                             if (self.current.kind == .lbrace) depth += 1;
                             if (self.current.kind == .rbrace) {
                                 depth -= 1;
                                 if (depth == 0) {
+                                    expr_end = self.current.end; // Include the closing brace
                                     self.advance();
                                     break;
                                 }
                             }
                             self.advance();
                         }
-                        attr_value = self.source[expr_start..self.current.start];
+                        attr_value = self.source[expr_start..expr_end];
                     }
                 }
 
@@ -1542,6 +1544,36 @@ test "parse void element input with type and value" {
     try std.testing.expect(found_input);
     try std.testing.expect(found_type);
     try std.testing.expect(found_value);
+}
+
+test "parse expression attribute value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<Icon icon={Map} />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var found_icon = false;
+    var found_attr = false;
+    for (ast.nodes.items) |node| {
+        // Component nodes also use elements array
+        if (node.kind == .element or node.kind == .component) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "Icon")) {
+                found_icon = true;
+                for (ast.attributes.items[elem.attrs_start..elem.attrs_end]) |attr| {
+                    if (std.mem.eql(u8, attr.name, "icon")) {
+                        found_attr = true;
+                        try std.testing.expectEqualStrings("{Map}", attr.value.?);
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_icon);
+    try std.testing.expect(found_attr);
 }
 
 test "parse void element meta" {

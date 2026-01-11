@@ -1070,8 +1070,10 @@ fn emitTemplateExpressions(
     var iter = template_refs.keyIterator();
     while (iter.next()) |key| {
         const name = key.*;
-        // Skip keywords, built-ins, and names declared in template (snippets, each bindings)
-        if (isJsKeywordOrBuiltin(name)) continue;
+        // Skip keywords and built-ins, UNLESS the name is declared in script.
+        // User imports can shadow built-in names (e.g., `import Map from './icons/map'`),
+        // so if a name is declared in script, we should emit void for it.
+        if (isJsKeywordOrBuiltin(name) and !declared_names.contains(name)) continue;
 
         if (!has_expressions) {
             try output.appendSlice(allocator, "// Template expressions\n");
@@ -4773,6 +4775,32 @@ test "each block with spread of nullable array emits null-safe fallback" {
 
     // The spread should be wrapped with ?? [] for null safety: [...(items ?? [])]
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "[...(items ?? [])]") != null);
+}
+
+test "identifier in attribute expression is marked as used" {
+    // Test that an imported value used in an attribute expression like icon={Map}
+    // is properly detected and emits a void statement.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  import Map from './map';
+        \\</script>
+        \\<Icon icon={Map} />
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // "Map" should appear as void statement since it's used in template
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Map;") != null);
+    // "Icon" should also be marked as used
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Icon;") != null);
 }
 
 test "braces inside string literals in attribute expressions are not counted" {
