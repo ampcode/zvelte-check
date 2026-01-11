@@ -711,6 +711,7 @@ const EachBindingInfo = struct {
     iterable: []const u8,
     item_binding: []const u8,
     index_binding: ?[]const u8,
+    key_expr: ?[]const u8, // Key expression from (key) in keyed each
     offset: u32,
 };
 
@@ -1519,6 +1520,15 @@ fn emitEachBindingDeclarations(
         try output.appendSlice(allocator, idx);
         try output.appendSlice(allocator, " = 0;\n");
     }
+
+    // Emit void statement for key expression to mark it as used.
+    // This handles cases like {#each items as [key, value] (key)} where key
+    // is only used in the key expression, not in the loop body.
+    if (binding.key_expr) |key| {
+        try output.appendSlice(allocator, "void (");
+        try output.appendSlice(allocator, key);
+        try output.appendSlice(allocator, ");\n");
+    }
 }
 
 /// Transforms spread expressions inside an iterable to be null-safe.
@@ -1769,7 +1779,7 @@ fn extractEachExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
     return .{ .expr = expr, .offset = @intCast(expr_start) };
 }
 
-/// Extracts iterable and bindings from {#each items as item, i}
+/// Extracts iterable and bindings from {#each items as item, i (key)}
 fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInfo {
     const content = source[start..end];
     // Format: {#each expr as item, index (key)}
@@ -1787,6 +1797,24 @@ fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInf
     const binding_end = findEachBindingEnd(content, binding_start);
     const bindings = std.mem.trim(u8, content[binding_start..binding_end], " \t\n\r");
     if (bindings.len == 0) return null;
+
+    // Extract key expression if present: (key) after bindings
+    var key_expr: ?[]const u8 = null;
+    if (binding_end < content.len and content[binding_end] == '(') {
+        // Find the matching closing paren
+        var paren_depth: u32 = 1;
+        const key_start = binding_end + 1;
+        var key_end = key_start;
+        while (key_end < content.len and paren_depth > 0) {
+            if (content[key_end] == '(') paren_depth += 1;
+            if (content[key_end] == ')') paren_depth -= 1;
+            if (paren_depth > 0) key_end += 1;
+        }
+        const key = std.mem.trim(u8, content[key_start..key_end], " \t\n\r");
+        if (key.len > 0) {
+            key_expr = key;
+        }
+    }
 
     // Split on comma to get item and optional index, respecting brackets
     var item_binding: []const u8 = bindings;
@@ -1808,6 +1836,7 @@ fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInf
         .iterable = iterable,
         .item_binding = item_binding,
         .index_binding = index_binding,
+        .key_expr = key_expr,
         .offset = @intCast(expr_start),
     };
 }
@@ -4834,4 +4863,31 @@ test "braces inside string literals in attribute expressions are not counted" {
 
     // "getProps" should appear since it's used in the expression
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void getProps;") != null);
+}
+
+test "keyed each with destructured key emits void for key expression" {
+    // When a keyed {#each} uses a destructured variable as the key expression,
+    // that variable should be marked as used. Example:
+    // {#each Object.entries(map) as [key, value] (key)} - key is only used in (key)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let map: Record<string, number> = {};
+        \\</script>
+        \\{#each Object.entries(map) as [key, value] (key)}
+        \\  <p>{value}</p>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // The key expression should be emitted as void (key)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void (key);") != null);
 }
