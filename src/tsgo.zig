@@ -339,6 +339,9 @@ fn writeGeneratedTsconfig(
     // must re-include the source files. Paths are relative to .zvelte-check/ directory.
     try w.writeAll("  \"include\": [\n");
     try w.writeAll("    \"stubs.d.ts\",\n");
+    // Include SvelteKit generated types (contains AppTypes with route literals)
+    try w.writeAll("    \"../.svelte-kit/ambient.d.ts\",\n");
+    try w.writeAll("    \"../.svelte-kit/non-ambient.d.ts\",\n");
     // Include common source directories - these are relative to the .zvelte-check dir
     try w.writeAll("    \"../src/**/*.ts\",\n");
     try w.writeAll("    \"../src/**/*.js\"");
@@ -528,6 +531,17 @@ fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
         \\    state: Record<string, any>;
         \\    form: any;
         \\  };
+        \\  // SvelteKit AppTypes interface for route type resolution
+        \\  // RouteId/RouteParams are generated per-project with all route strings
+        \\  // We use string to avoid never when Extract<> is applied
+        \\  export interface AppTypes {
+        \\    RouteId(): string;
+        \\    RouteParams(): Record<string, Record<string, string>>;
+        \\    LayoutParams(): Record<string, Record<string, string>>;
+        \\    Pathname(): string;
+        \\    ResolvedPathname(): string;
+        \\    Asset(): string;
+        \\  }
         \\}
         \\
         \\// SvelteKit $env/* virtual module types
