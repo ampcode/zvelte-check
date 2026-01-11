@@ -713,14 +713,15 @@ fn parseTsgoOutput(
 
             // Use pre-computed line table to convert line/col → offset
             if (cf.ts_line_table.lineColToOffset(ts_line, ts_col)) |ts_offset| {
-                // Map TS offset to Svelte offset
-                if (cf.vf.source_map.tsToSvelte(ts_offset)) |svelte_offset| {
-                    // Use pre-computed Svelte line table to convert offset → line/col
-                    const pos = cf.svelte_line_table.offsetToLineCol(svelte_offset);
-                    // Convert from 0-based to 1-based
-                    svelte_line = pos.line + 1;
-                    svelte_col = pos.col + 1;
-                }
+                // Map TS offset to Svelte offset with fallback for unmapped regions.
+                // Generated code (template bindings, type stubs) won't have exact mappings,
+                // so we fall back to the nearest preceding mapped position.
+                const svelte_offset = cf.vf.source_map.tsToSvelteFallback(ts_offset);
+                // Use pre-computed Svelte line table to convert offset → line/col
+                const pos = cf.svelte_line_table.offsetToLineCol(svelte_offset);
+                // Convert from 0-based to 1-based
+                svelte_line = pos.line + 1;
+                svelte_col = pos.col + 1;
             }
         } else {
             // This is a regular .ts/.js file - convert relative path to workspace path

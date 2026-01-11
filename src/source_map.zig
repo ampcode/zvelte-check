@@ -27,6 +27,30 @@ pub const SourceMap = struct {
         return null;
     }
 
+    /// Maps a TS offset to a Svelte offset, with fallback for unmapped regions.
+    /// For errors in generated code (template bindings, type stubs), returns
+    /// the nearest preceding mapped position. This prevents line numbers from
+    /// extending beyond the Svelte file's actual length.
+    pub fn tsToSvelteFallback(self: *const SourceMap, ts_offset: u32) u32 {
+        var last_mapped_end: u32 = 0;
+
+        for (self.mappings) |m| {
+            // Exact match within a mapping range
+            if (ts_offset >= m.ts_offset and ts_offset < m.ts_offset + m.len) {
+                const delta = ts_offset - m.ts_offset;
+                return m.svelte_offset + delta;
+            }
+
+            // Track the end of the last mapping we passed (for fallback)
+            if (ts_offset >= m.ts_offset + m.len) {
+                last_mapped_end = m.svelte_offset + m.len;
+            }
+        }
+
+        // Fallback: return end of last mapping, or 0 if before all mappings
+        return if (last_mapped_end > 0) last_mapped_end - 1 else 0;
+    }
+
     pub fn svelteToTs(self: *const SourceMap, svelte_offset: u32) ?u32 {
         for (self.mappings) |m| {
             if (svelte_offset >= m.svelte_offset and svelte_offset < m.svelte_offset + m.len) {
@@ -106,4 +130,27 @@ test "source map lookup" {
 
     const ts_pos = map.svelteToTs(15);
     try std.testing.expectEqual(@as(?u32, 55), ts_pos);
+}
+
+test "source map fallback for unmapped regions" {
+    // Simulates: type stubs at TS 0-50, then script at TS 50-70 maps to Svelte 10-30,
+    // then generated template bindings at TS 70+ with no mapping
+    const map: SourceMap = .{
+        .mappings = &.{
+            .{ .svelte_offset = 10, .ts_offset = 50, .len = 20 },
+        },
+        .svelte_source = "",
+    };
+
+    // Within mapping - exact match
+    const exact = map.tsToSvelteFallback(55);
+    try std.testing.expectEqual(@as(u32, 15), exact);
+
+    // Before any mappings (in type stubs region) - falls back to 0
+    const before = map.tsToSvelteFallback(25);
+    try std.testing.expectEqual(@as(u32, 0), before);
+
+    // After mapping ends (in generated template region) - falls back to end of last mapping
+    const after = map.tsToSvelteFallback(100);
+    try std.testing.expectEqual(@as(u32, 29), after); // 10 + 20 - 1 = 29
 }
