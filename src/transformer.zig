@@ -15,7 +15,7 @@
 //!    - `$props()` destructuring (Svelte 5 style)
 //!    - Interface types referenced in $props<T>()
 //! 8. Extract <slot> elements and snippet props to generate $$Slots interface
-//! 9. Generate component class extending SvelteComponentTyped
+//! 9. Generate component export using Component interface (Svelte 5 style)
 
 const std = @import("std");
 const Ast = @import("svelte_parser.zig").Ast;
@@ -68,8 +68,9 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     try output.appendSlice(allocator, "\n\n");
 
     // Svelte type imports
-    // SvelteComponentTyped must be a regular import (not type-only) since we extend it
-    try output.appendSlice(allocator, "import { SvelteComponentTyped } from \"svelte\";\n");
+    // Import Component for Svelte 5 type compatibility (makes ComponentProps work)
+    // Use a private alias to avoid conflicts with user imports of Component
+    try output.appendSlice(allocator, "import type { Component as __SvelteComponentType__ } from \"svelte\";\n");
     // Note: We don't auto-import Snippet - if users need it, they import it themselves.
     // Auto-importing caused "declared but never used" errors for files that don't use Snippet types.
 
@@ -308,9 +309,32 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Generate $$Events type
     try output.appendSlice(allocator, "export type $$Events = Record<string, any>;\n\n");
 
-    // Generate default export (use internal name to avoid conflicts with user code)
+    // Generate $$Bindings type for bindable props
+    try output.appendSlice(allocator, "export type $$Bindings = ");
+    var has_bindable = false;
+    for (props.items) |prop| {
+        if (prop.is_bindable) {
+            if (has_bindable) {
+                try output.appendSlice(allocator, " | ");
+            }
+            try output.appendSlice(allocator, "\"");
+            try output.appendSlice(allocator, prop.name);
+            try output.appendSlice(allocator, "\"");
+            has_bindable = true;
+        }
+    }
+    if (!has_bindable) {
+        try output.appendSlice(allocator, "\"\"");
+    }
+    try output.appendSlice(allocator, ";\n\n");
+
+    // Generate default export using Component interface (Svelte 5 style)
+    // This makes ComponentProps<typeof Component> work correctly.
+    // The Component interface has the signature: Component<Props, Exports, Bindings>
     try output.appendSlice(allocator,
-        \\export default class __SvelteComponent__ extends SvelteComponentTyped<$$Props, $$Events, $$Slots> {}
+        \\declare const __SvelteComponent__: __SvelteComponentType__<$$Props, {}, $$Bindings>;
+        \\type __SvelteComponent__ = typeof __SvelteComponent__;
+        \\export default __SvelteComponent__;
         \\
     );
 
@@ -2882,7 +2906,7 @@ test "transform simple script" {
 
     try std.testing.expect(virtual.content.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let count = 0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "SvelteComponentTyped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__SvelteComponentType__<$$Props") != null);
 }
 
 test "transform with export let" {
@@ -3017,7 +3041,7 @@ test "transform typescript component" {
     const virtual = try transform(allocator, ast);
 
     // Verify key parts of the generated TypeScript
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import { SvelteComponentTyped }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Component as __SvelteComponentType__ }") != null);
     // Snippet import is conditional - only added when file uses snippets
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") == null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state") != null);
@@ -3026,7 +3050,7 @@ test "transform typescript component" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "count?: number") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Slots") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "default: {}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "extends SvelteComponentTyped<$$Props, $$Events, $$Slots>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__SvelteComponentType__<$$Props, {}, $$Bindings>") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "badType: number = \"not a number\"") != null);
 
     // Component usages in template should emit void statements
@@ -3607,8 +3631,8 @@ test "transform sveltekit +page.svelte route" {
 
     // User's ./$types import should be preserved (not filtered, not auto-generated)
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { PageData } from './$types';") != null);
-    // Should still have Svelte imports
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "SvelteComponentTyped") != null);
+    // Should still have Svelte Component import
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__SvelteComponentType__") != null);
 }
 
 test "transform sveltekit +layout.svelte route" {
@@ -4243,8 +4267,8 @@ test "event handler: on:click directive with function reference" {
     // Event handler function should be preserved in script
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleClick(event: MouseEvent)") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "count++") != null);
-    // Component class should be generated
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "class __SvelteComponent__ extends SvelteComponentTyped") != null);
+    // Component export should be generated
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__SvelteComponent__: __SvelteComponentType__<$$Props") != null);
 }
 
 test "event handler: on:click with inline arrow function" {
