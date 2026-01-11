@@ -202,7 +202,6 @@ pub fn check(
     const stdout = stdout_buf.items;
     const stderr = stderr_buf.items;
 
-    // Clean up stub directory before parsing output
     cleanupStubDir(workspace_dir);
 
     // Parse tsgo output

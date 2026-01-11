@@ -103,8 +103,10 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         \\
         \\// Svelte store auto-subscription stub
         \\// $storeName syntax in Svelte auto-subscribes to the store
-        \\// Returns an object with .v property for both reading and assignment
-        \\declare function __svelte_store<T>(store: { subscribe: (fn: (value: T) => void) => any } | null | undefined): { v: T | undefined };
+        \\// This function extracts the value type from a store's subscribe method
+        \\type SvelteStore<T> = { subscribe: (run: (value: T) => any, invalidate?: any) => any };
+        \\declare function __svelte_store_get<T>(store: SvelteStore<T>): T;
+        \\declare function __svelte_store_get<Store extends SvelteStore<any> | undefined | null>(store: Store): Store extends SvelteStore<infer T> ? T : Store;
         \\
         \\
     );
@@ -1631,13 +1633,11 @@ fn filterMixedImport(allocator: std.mem.Allocator, line: []const u8) !?[]const u
 /// Does NOT transform:
 /// - Runes like `$state`, `$derived`, `$effect`, `$props`, `$bindable`, `$inspect`, `$host`
 /// - Template strings like `${expr}`
-fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
-    // Early exit: skip if no $ character (no stores or runes to process)
-    if (std.mem.indexOfScalar(u8, content, '$') == null) return content;
-
-    var result: std.ArrayList(u8) = .empty;
-    defer result.deinit(allocator);
-    try result.ensureTotalCapacity(allocator, content.len + 256);
+/// Collects unique store names from script content (stores are $name where name is not a rune).
+/// Returns a list of store names (without the $ prefix).
+fn collectStoreNames(allocator: std.mem.Allocator, content: []const u8) ![]const []const u8 {
+    var store_names: std.StringHashMapUnmanaged(void) = .empty;
+    defer store_names.deinit(allocator);
 
     const runes = [_][]const u8{
         "state", "derived", "effect", "props", "bindable", "inspect", "host",
@@ -1645,105 +1645,50 @@ fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8
 
     var i: usize = 0;
     while (i < content.len) {
-        // Check for $ followed by identifier
-        if (content[i] == '$') {
-            // Check it's not inside a template literal ${...}
-            // (We'd need to be at `${`, but we're looking at `$` so check next char isn't `{`)
-            if (i + 1 < content.len and content[i + 1] == '{') {
-                // Template literal interpolation - copy as-is
-                try result.append(allocator, content[i]);
-                i += 1;
-                continue;
-            }
-
-            // Check if next char starts an identifier
-            if (i + 1 < content.len and isIdentStartChar(content[i + 1])) {
-                const name_start = i + 1;
-                var name_end = name_start;
-                while (name_end < content.len and isIdentChar(content[name_end])) : (name_end += 1) {}
-
-                const name = content[name_start..name_end];
-
-                // Check if this is a rune (skip transformation)
-                const is_rune = for (runes) |rune| {
-                    if (std.mem.eql(u8, name, rune)) break true;
-                } else false;
-
-                if (is_rune) {
-                    // Keep $rune as-is
-                    try result.appendSlice(allocator, content[i..name_end]);
-                    i = name_end;
-                    continue;
-                }
-
-                // Transform $storeName → __svelte_store(storeName).v
-                // Using .v property allows both reads and assignments
-                try result.appendSlice(allocator, "__svelte_store(");
-                try result.appendSlice(allocator, name);
-                try result.appendSlice(allocator, ").v");
-                i = name_end;
-                continue;
-            }
-        }
-
-        // Skip strings to avoid transforming $variables inside them
+        // Skip strings
         if (content[i] == '"' or content[i] == '\'' or content[i] == '`') {
             const quote = content[i];
-            try result.append(allocator, quote);
             i += 1;
-
             while (i < content.len) {
                 if (content[i] == '\\' and i + 1 < content.len) {
-                    // Escape sequence - copy both chars
-                    try result.appendSlice(allocator, content[i .. i + 2]);
                     i += 2;
                     continue;
                 }
                 if (content[i] == quote) {
-                    try result.append(allocator, quote);
                     i += 1;
                     break;
                 }
-                // For template literals, handle ${...} interpolations
+                // For template literals, skip ${...} but scan inside for stores
                 if (quote == '`' and content[i] == '$' and i + 1 < content.len and content[i + 1] == '{') {
-                    try result.appendSlice(allocator, "${");
                     i += 2;
-                    // Find matching }
                     var depth: u32 = 1;
                     while (i < content.len and depth > 0) {
                         if (content[i] == '{') depth += 1;
                         if (content[i] == '}') depth -= 1;
                         if (depth > 0) {
-                            // Recursively check for $store inside interpolation
+                            // Check for $store inside interpolation
                             if (content[i] == '$' and i + 1 < content.len and isIdentStartChar(content[i + 1])) {
-                                const inner_name_start = i + 1;
-                                var inner_name_end = inner_name_start;
-                                while (inner_name_end < content.len and isIdentChar(content[inner_name_end])) : (inner_name_end += 1) {}
-                                const inner_name = content[inner_name_start..inner_name_end];
+                                const name_start = i + 1;
+                                var name_end = name_start;
+                                while (name_end < content.len and isIdentChar(content[name_end])) : (name_end += 1) {}
+                                const name = content[name_start..name_end];
 
-                                const is_inner_rune = for (runes) |rune| {
-                                    if (std.mem.eql(u8, inner_name, rune)) break true;
+                                const is_rune = for (runes) |rune| {
+                                    if (std.mem.eql(u8, name, rune)) break true;
                                 } else false;
 
-                                if (!is_inner_rune) {
-                                    try result.appendSlice(allocator, "__svelte_store(");
-                                    try result.appendSlice(allocator, inner_name);
-                                    try result.appendSlice(allocator, ").v");
-                                    i = inner_name_end;
-                                    continue;
+                                if (!is_rune and name.len > 0) {
+                                    try store_names.put(allocator, name, {});
                                 }
+                                i = name_end;
+                                continue;
                             }
-                            try result.append(allocator, content[i]);
                             i += 1;
                         }
                     }
-                    if (i < content.len) {
-                        try result.append(allocator, '}');
-                        i += 1;
-                    }
+                    if (i < content.len and content[i] == '}') i += 1;
                     continue;
                 }
-                try result.append(allocator, content[i]);
                 i += 1;
             }
             continue;
@@ -1751,31 +1696,95 @@ fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8
 
         // Skip single-line comments
         if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
-            while (i < content.len and content[i] != '\n') {
-                try result.append(allocator, content[i]);
-                i += 1;
-            }
+            while (i < content.len and content[i] != '\n') i += 1;
             continue;
         }
 
         // Skip multi-line comments
         if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '*') {
-            try result.appendSlice(allocator, "/*");
             i += 2;
             while (i + 1 < content.len) {
                 if (content[i] == '*' and content[i + 1] == '/') {
-                    try result.appendSlice(allocator, "*/");
                     i += 2;
                     break;
                 }
-                try result.append(allocator, content[i]);
                 i += 1;
             }
             continue;
         }
 
-        try result.append(allocator, content[i]);
+        // Check for $ followed by identifier
+        if (content[i] == '$') {
+            // Skip template literal ${
+            if (i + 1 < content.len and content[i + 1] == '{') {
+                i += 1;
+                continue;
+            }
+
+            if (i + 1 < content.len and isIdentStartChar(content[i + 1])) {
+                const name_start = i + 1;
+                var name_end = name_start;
+                while (name_end < content.len and isIdentChar(content[name_end])) : (name_end += 1) {}
+                const name = content[name_start..name_end];
+
+                const is_rune = for (runes) |rune| {
+                    if (std.mem.eql(u8, name, rune)) break true;
+                } else false;
+
+                if (!is_rune and name.len > 0) {
+                    try store_names.put(allocator, name, {});
+                }
+                i = name_end;
+                continue;
+            }
+        }
+
         i += 1;
+    }
+
+    // Convert to owned slice
+    var result: std.ArrayList([]const u8) = .empty;
+    var iter = store_names.keyIterator();
+    while (iter.next()) |key| {
+        try result.append(allocator, key.*);
+    }
+    return try result.toOwnedSlice(allocator);
+}
+
+/// Transforms store subscriptions by generating variable declarations.
+/// For each unique store usage like $serverStatus, generates:
+///   let $serverStatus = __svelte_store_get(serverStatus);
+/// at the END of the content (after user declarations). The $storeName references
+/// are kept as-is and refer to the declared variable, enabling TypeScript narrowing.
+fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
+    // Early exit: skip if no $ character (no stores or runes to process)
+    if (std.mem.indexOfScalar(u8, content, '$') == null) return content;
+
+    // Collect all unique store names
+    const store_names = try collectStoreNames(allocator, content);
+    defer allocator.free(store_names);
+
+    // If no stores found, return content as-is
+    if (store_names.len == 0) return content;
+
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+    // Estimate: content + declarations (about 60 chars per store)
+    try result.ensureTotalCapacity(allocator, content.len + store_names.len * 60);
+
+    // Append original content first
+    try result.appendSlice(allocator, content);
+
+    // Generate store variable declarations at the end (after user declarations)
+    // Use 'var' instead of 'let' for hoisting - this allows using $storeName
+    // before the declaration line (var is hoisted to function/module scope)
+    try result.appendSlice(allocator, "\n// Store subscriptions\n");
+    for (store_names) |name| {
+        try result.appendSlice(allocator, "var $");
+        try result.appendSlice(allocator, name);
+        try result.appendSlice(allocator, " = __svelte_store_get(");
+        try result.appendSlice(allocator, name);
+        try result.appendSlice(allocator, ");\n");
     }
 
     return try result.toOwnedSlice(allocator);
@@ -2765,7 +2774,9 @@ test "transform store subscription basic" {
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    try std.testing.expectEqualStrings("const url = __svelte_store(page).v.url;", result);
+    // Content is preserved, with var declaration appended at end
+    try std.testing.expect(std.mem.startsWith(u8, result, "const url = $page.url;"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "var $page = __svelte_store_get(page);") != null);
 }
 
 test "transform store subscription preserves runes" {
@@ -2773,8 +2784,8 @@ test "transform store subscription preserves runes" {
 
     const input = "let count = $state(0); let doubled = $derived(count * 2);";
     const result = try transformStoreSubscriptions(allocator, input);
-    defer allocator.free(result);
 
+    // Runes like $state and $derived are preserved as-is (no store declarations generated)
     try std.testing.expectEqualStrings("let count = $state(0); let doubled = $derived(count * 2);", result);
 }
 
@@ -2785,7 +2796,11 @@ test "transform store subscription multiple stores" {
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    try std.testing.expectEqualStrings("if (__svelte_store(page).v.url && __svelte_store(navigating).v) { console.log(__svelte_store(myStore).v); }", result);
+    // Content is preserved, with var declarations appended at end for each store
+    try std.testing.expect(std.mem.startsWith(u8, result, "if ($page.url && $navigating) { console.log($myStore); }"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "var $page = __svelte_store_get(page);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "var $navigating = __svelte_store_get(navigating);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "var $myStore = __svelte_store_get(myStore);") != null);
 }
 
 test "transform store subscription skips template literal interpolation marker" {
@@ -2795,7 +2810,9 @@ test "transform store subscription skips template literal interpolation marker" 
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    try std.testing.expectEqualStrings("const msg = `url: ${__svelte_store(page).v.url}`;", result);
+    // Content is preserved with $page kept in template literal, declaration appended
+    try std.testing.expect(std.mem.startsWith(u8, result, "const msg = `url: ${$page.url}`;"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "var $page = __svelte_store_get(page);") != null);
 }
 
 test "transform store subscription skips strings" {
@@ -2805,7 +2822,9 @@ test "transform store subscription skips strings" {
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    try std.testing.expectEqualStrings("const str = '$page is a store'; const real = __svelte_store(page).v;", result);
+    // Content is preserved; $page inside string is NOT collected (only real code usage)
+    try std.testing.expect(std.mem.startsWith(u8, result, "const str = '$page is a store'; const real = $page;"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "var $page = __svelte_store_get(page);") != null);
 }
 
 test "transform store subscription mixed runes and stores" {
@@ -2815,7 +2834,11 @@ test "transform store subscription mixed runes and stores" {
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    try std.testing.expectEqualStrings("let url = $state(__svelte_store(page).v.url);", result);
+    // Content is preserved; $state is a rune (not collected), $page is a store
+    try std.testing.expect(std.mem.startsWith(u8, result, "let url = $state($page.url);"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "var $page = __svelte_store_get(page);") != null);
+    // Should NOT generate declaration for runes
+    try std.testing.expect(std.mem.indexOf(u8, result, "var $state") == null);
 }
 
 test "transform store subscription assignment" {
@@ -2825,8 +2848,9 @@ test "transform store subscription assignment" {
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    // Store assignment becomes property assignment which is valid TypeScript
-    try std.testing.expectEqualStrings("__svelte_store(count).v = 5;", result);
+    // Store assignment preserved as-is (becomes variable assignment after hoisting)
+    try std.testing.expect(std.mem.startsWith(u8, result, "$count = 5;"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "var $count = __svelte_store_get(count);") != null);
 }
 
 test "transform component with store subscriptions" {
@@ -2848,10 +2872,10 @@ test "transform component with store subscriptions" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should have transformed $page to __svelte_store(page).v
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__svelte_store(page).v.url") != null);
-    // Should NOT have untransformed $page
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$page.url") == null);
+    // Should have $page.url preserved in content
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "$page.url") != null);
+    // Should have var declaration for $page using __svelte_store_get
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var $page = __svelte_store_get(page);") != null);
 }
 
 test "transform reactive statement" {
