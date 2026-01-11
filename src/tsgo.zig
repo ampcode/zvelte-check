@@ -741,9 +741,10 @@ fn parseTsgoOutput(
 
         // Determine if this is a Svelte file (for Svelte-specific filtering)
         const is_svelte_file = std.mem.endsWith(u8, original_path, ".svelte");
+        const is_test_file = isTestFile(original_path);
 
         // Skip errors that are false positives for Svelte files
-        if (shouldSkipError(message, is_svelte_file)) continue;
+        if (shouldSkipError(message, is_svelte_file, is_test_file)) continue;
 
         try diagnostics.append(allocator, .{
             .source = .js,
@@ -762,7 +763,7 @@ fn parseTsgoOutput(
 /// Returns true if the error should be skipped.
 /// Some errors are Svelte-specific false positives (only skipped for .svelte files).
 /// Others are general false positives from our code generation.
-fn shouldSkipError(message: []const u8, is_svelte_file: bool) bool {
+fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool) bool {
     // Skip "declared but never used/read" errors for Svelte files only.
     // Variables declared in <script> are used in the template, but TypeScript
     // only sees the generated .ts file where template usages aren't visible.
@@ -948,7 +949,43 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool) bool {
         return true;
     }
 
+    // Skip errors involving __SvelteComponent__ placeholder type
+    // This appears when tsgo can't infer the actual component type from .svelte imports.
+    // Example: "Argument of type '{ content: string; }' is not assignable to parameter
+    // of type 'SvelteComponentOptions<__SvelteComponent__> | undefined'"
+    // @testing-library/svelte's render() needs component prop types, but our *.svelte
+    // module shim declares `Component<any, any, any>` which doesn't provide prop info.
+    if (std.mem.indexOf(u8, message, "__SvelteComponent__") != null) {
+        return true;
+    }
+
+    // Test file specific filters - false positives from component prop type inference
+    if (is_test_file) {
+        // Skip errors involving $$Props - our generated prop types don't match what
+        // @testing-library/svelte expects. Example:
+        // "Property 'class' is missing in type '{ visible: true; }' but required in type '$$Props'"
+        if (std.mem.indexOf(u8, message, "$$Props") != null) {
+            return true;
+        }
+
+        // Skip errors about missing properties in Svelte component mount options
+        // Example: "Object literal may only specify known properties, and 'threadEnv'
+        // does not exist in type 'Partial<MountOptions<...>>'"
+        if (std.mem.indexOf(u8, message, "MountOptions<") != null) {
+            return true;
+        }
+    }
+
     return false;
+}
+
+/// Returns true if the path is a test file.
+/// Matches common test file patterns: .test.ts, .test.js, .spec.ts, .spec.js
+fn isTestFile(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".test.ts") or
+        std.mem.endsWith(u8, path, ".test.js") or
+        std.mem.endsWith(u8, path, ".spec.ts") or
+        std.mem.endsWith(u8, path, ".spec.js");
 }
 
 test "parse tsgo output with stub directory paths" {
