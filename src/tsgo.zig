@@ -316,10 +316,11 @@ fn writeGeneratedTsconfig(
         } else |_| {}
     }
 
-    // Compiler options optimized for Svelte checking
-    // Disable strict null checks and implicit any since Svelte's reactivity patterns
-    // often produce false positives (e.g., $state(null) with later narrowing, or
-    // callback parameters that Svelte infers at runtime).
+    // Compiler options for Svelte checking
+    // We disable noUnusedLocals/noUnusedParameters because variables declared in <script>
+    // are often used in the Svelte template, but TypeScript only sees the generated .ts
+    // file where those template usages aren't represented. Enabling these would cause
+    // many false positives for any variable used only in {expressions} or component props.
     try w.writeAll("  \"compilerOptions\": {\n");
     try w.writeAll("    \"noEmit\": true,\n");
     try w.writeAll("    \"skipLibCheck\": true,\n");
@@ -327,8 +328,6 @@ fn writeGeneratedTsconfig(
     try w.writeAll("    \"checkJs\": true,\n");
     try w.writeAll("    \"noUnusedLocals\": false,\n");
     try w.writeAll("    \"noUnusedParameters\": false,\n");
-    try w.writeAll("    \"strictNullChecks\": false,\n");
-    try w.writeAll("    \"noImplicitAny\": false,\n");
     // rootDirs makes TS treat .zvelte-check/ and workspace root as the same virtual root,
     // so relative imports in generated .svelte.ts files resolve correctly
     try w.writeAll("    \"rootDirs\": [\".\", \"..\"]\n");
