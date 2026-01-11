@@ -169,8 +169,33 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         try output.appendSlice(allocator, "\n\n");
     }
 
+    // Extract declared names from scripts to avoid snippet declaration conflicts.
+    // In Svelte, template snippets like {#snippet filter()} can shadow script imports,
+    // but in generated TS they'd conflict at module scope.
+    var declared_names: std.StringHashMapUnmanaged(void) = .empty;
+    defer declared_names.deinit(allocator);
+
+    if (module_script) |script| {
+        const content = ast.source[script.content_start..script.content_end];
+        var names = try extractDeclaredNames(allocator, content);
+        defer names.deinit(allocator);
+        var iter = names.iterator();
+        while (iter.next()) |entry| {
+            try declared_names.put(allocator, entry.key_ptr.*, {});
+        }
+    }
+    if (instance_script) |script| {
+        const content = ast.source[script.content_start..script.content_end];
+        var names = try extractDeclaredNames(allocator, content);
+        defer names.deinit(allocator);
+        var iter = names.iterator();
+        while (iter.next()) |entry| {
+            try declared_names.put(allocator, entry.key_ptr.*, {});
+        }
+    }
+
     // Extract and emit template expressions for type checking
-    try emitTemplateExpressions(allocator, &ast, &output, &mappings);
+    try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names);
 
     // Extract props from instance script
     var props: std.ArrayList(PropInfo) = .empty;
@@ -642,6 +667,108 @@ const SnippetNameInfo = struct {
     offset: u32,
 };
 
+/// Extracts all declared names from script content (imports and top-level declarations).
+/// Used to avoid emitting snippet declarations that would conflict with script bindings.
+/// In Svelte, template snippets can shadow script imports (scoped), but in our generated
+/// TypeScript they'd conflict since everything is at module scope.
+fn extractDeclaredNames(allocator: std.mem.Allocator, content: []const u8) !std.StringHashMapUnmanaged(void) {
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+
+    var i: usize = 0;
+    while (i < content.len) {
+        // Skip whitespace
+        while (i < content.len and std.ascii.isWhitespace(content[i])) : (i += 1) {}
+        if (i >= content.len) break;
+
+        // Skip comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
+            while (i < content.len and content[i] != '\n') : (i += 1) {}
+            continue;
+        }
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < content.len and !(content[i] == '*' and content[i + 1] == '/')) : (i += 1) {}
+            if (i + 1 < content.len) i += 2;
+            continue;
+        }
+
+        // Check for import statements
+        if (std.mem.startsWith(u8, content[i..], "import ")) {
+            // Find the import specifiers: { name1, name2 } or name
+            const line_start = i;
+            var line_end = i;
+            while (line_end < content.len and content[line_end] != '\n') : (line_end += 1) {}
+            const line = content[line_start..line_end];
+
+            // Named imports: import { a, b, type c } from '...'
+            if (std.mem.indexOf(u8, line, "{")) |brace_start| {
+                if (std.mem.indexOf(u8, line, "}")) |brace_end| {
+                    if (brace_start < brace_end) {
+                        const specifiers = line[brace_start + 1 .. brace_end];
+                        var spec_iter = std.mem.splitScalar(u8, specifiers, ',');
+                        while (spec_iter.next()) |spec_raw| {
+                            var spec = std.mem.trim(u8, spec_raw, " \t\r\n");
+                            if (spec.len == 0) continue;
+
+                            // Skip "type X" imports
+                            if (std.mem.startsWith(u8, spec, "type ")) continue;
+
+                            // Handle "X as Y" - extract Y
+                            if (std.mem.indexOf(u8, spec, " as ")) |as_pos| {
+                                spec = std.mem.trim(u8, spec[as_pos + 4 ..], " \t");
+                            }
+
+                            // Extract identifier (stop at non-alphanumeric)
+                            var name_end: usize = 0;
+                            while (name_end < spec.len and (std.ascii.isAlphanumeric(spec[name_end]) or spec[name_end] == '_' or spec[name_end] == '$')) : (name_end += 1) {}
+                            if (name_end > 0) {
+                                try names.put(allocator, spec[0..name_end], {});
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Namespace imports: import * as name from '...'
+            if (std.mem.indexOf(u8, line, "* as ")) |as_start| {
+                const after_as = line[as_start + 5 ..];
+                const trimmed = std.mem.trim(u8, after_as, " \t");
+                var name_end: usize = 0;
+                while (name_end < trimmed.len and (std.ascii.isAlphanumeric(trimmed[name_end]) or trimmed[name_end] == '_' or trimmed[name_end] == '$')) : (name_end += 1) {}
+                if (name_end > 0) {
+                    try names.put(allocator, trimmed[0..name_end], {});
+                }
+            }
+
+            // Default imports: import name from '...' (but not import { ... } or import * as)
+            if (std.mem.indexOf(u8, line, "{") == null and std.mem.indexOf(u8, line, "*") == null) {
+                const after_import = std.mem.trim(u8, line["import ".len..], " \t");
+                // Skip 'type' keyword if present
+                const after_type = if (std.mem.startsWith(u8, after_import, "type "))
+                    std.mem.trim(u8, after_import["type ".len..], " \t")
+                else
+                    after_import;
+                // Extract the name before 'from'
+                if (std.mem.indexOf(u8, after_type, " from")) |from_pos| {
+                    const name_part = std.mem.trim(u8, after_type[0..from_pos], " \t");
+                    var name_end: usize = 0;
+                    while (name_end < name_part.len and (std.ascii.isAlphanumeric(name_part[name_end]) or name_part[name_end] == '_' or name_part[name_end] == '$')) : (name_end += 1) {}
+                    if (name_end > 0) {
+                        try names.put(allocator, name_part[0..name_end], {});
+                    }
+                }
+            }
+
+            i = line_end;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    return names;
+}
+
 /// Emits type declarations for generic parameters from Svelte 5 generics="..." attribute.
 /// Parses comma-separated generic parameters and emits each as a type declaration.
 /// Examples:
@@ -744,11 +871,17 @@ fn emitGenericTypeDeclarations(
 ///
 /// Plain expressions like {variable} are NOT emitted separately because they
 /// often reference loop bindings that would be out of scope in the generated TS.
+///
+/// `declared_names` contains names already declared in the script (imports, variables).
+/// Snippet declarations for these names are skipped to avoid conflicts. In Svelte,
+/// template snippets create a new scope and can shadow script bindings, but in our
+/// generated TypeScript everything is at module scope.
 fn emitTemplateExpressions(
     allocator: std.mem.Allocator,
     ast: *const Ast,
     output: *std.ArrayList(u8),
     _: *std.ArrayList(SourceMap.Mapping),
+    declared_names: std.StringHashMapUnmanaged(void),
 ) !void {
     var has_expressions = false;
 
@@ -756,6 +889,11 @@ fn emitTemplateExpressions(
         switch (node.kind) {
             .snippet => {
                 if (extractSnippetName(ast.source, node.start, node.end)) |info| {
+                    // Skip snippet declarations for names already declared in script.
+                    // In Svelte, {#snippet filter()} can shadow imported `filter`,
+                    // but in generated TS they'd conflict at module scope.
+                    if (declared_names.contains(info.name)) continue;
+
                     if (!has_expressions) {
                         try output.appendSlice(allocator, "// Template expressions\n");
                         has_expressions = true;
@@ -3773,13 +3911,13 @@ test "combined: select with bind:value and on:change" {
     const source =
         \\<script lang="ts">
         \\  type Option = { value: string; label: string };
-        \\  
+        \\
         \\  let selected = $state("");
         \\  let options: Option[] = [
         \\    { value: "a", label: "Option A" },
         \\    { value: "b", label: "Option B" },
         \\  ];
-        \\  
+        \\
         \\  function handleChange() {
         \\    console.log('Selected:', selected);
         \\  }
@@ -3802,4 +3940,57 @@ test "combined: select with bind:value and on:change" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "type Option = { value: string; label: string }") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let selected = $state(\"\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleChange()") != null);
+}
+
+test "snippet name shadowing import should not emit var declaration" {
+    // Regression test: when a snippet has the same name as an import (e.g., {#snippet filter()}
+    // with `import { filter } from 'rxjs'`), we should NOT emit `var filter: any = null;`
+    // because it would conflict with the import. In Svelte, snippets create a new scope
+    // and can shadow imports, but in generated TS everything is at module scope.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  import { filter, map } from 'rxjs';
+        \\  import Default from './other';
+        \\  import * as Namespace from './namespace';
+        \\
+        \\  let data = $state([]);
+        \\</script>
+        \\
+        \\<div>
+        \\  {#snippet filter()}
+        \\    <span>Filter UI</span>
+        \\  {/snippet}
+        \\  {#snippet map()}
+        \\    <span>Map UI</span>
+        \\  {/snippet}
+        \\  {#snippet Default()}
+        \\    <span>Default UI</span>
+        \\  {/snippet}
+        \\  {#snippet other()}
+        \\    <span>Other UI (not imported)</span>
+        \\  {/snippet}
+        \\</div>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "SnippetShadow.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Should NOT emit var declarations for snippet names that shadow imports
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var filter: any = null;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var map: any = null;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var Default: any = null;") == null);
+
+    // SHOULD emit var declaration for snippet that doesn't shadow an import
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var other: any = null;") != null);
+
+    // The imports should still be present
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import { filter, map } from 'rxjs'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import Default from './other'") != null);
 }
