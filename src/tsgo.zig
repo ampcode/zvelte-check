@@ -825,6 +825,13 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
+        // Skip "'X' is declared but never used" errors for type-only imports
+        // Type-only imports (import type { X }) are only used in type annotations,
+        // not runtime code. Our void statements can't mark them as used since they're types.
+        if (std.mem.indexOf(u8, message, "is declared but never used") != null) {
+            return true;
+        }
+
         // Skip "Object is possibly 'null'" errors for Svelte files
         // These are often false positives from reactive patterns
         if (std.mem.indexOf(u8, message, "is possibly 'null'") != null or
