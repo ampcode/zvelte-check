@@ -493,17 +493,18 @@ fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
         \\// Generic .svelte file type declaration
         \\// Allows tsgo to resolve imports like `import Component from './Button.svelte'`
         \\// Named exports from .svelte files are typed via their generated .svelte.ts files
+        \\// Note: Svelte 5 uses Component interface instead of SvelteComponent class
         \\declare module "*.svelte" {
-        \\  import { SvelteComponent } from "svelte";
-        \\  const component: typeof SvelteComponent<any, any, any>;
+        \\  import type { Component } from "svelte";
+        \\  const component: Component<any, any, any>;
         \\  export default component;
         \\}
         \\
         \\// unplugin-icons virtual module stubs
         \\// Allows tsgo to resolve imports like `import Icon from '~icons/lucide/check'`
         \\declare module "~icons/*" {
-        \\  import { SvelteComponent } from "svelte";
-        \\  const component: typeof SvelteComponent;
+        \\  import type { Component } from "svelte";
+        \\  const component: Component;
         \\  export default component;
         \\}
         \\
