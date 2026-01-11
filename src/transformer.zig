@@ -230,6 +230,26 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     }
     try extractSlots(allocator, &ast, &slots);
 
+    // Emit void statements for $bindable() props to suppress "never read" errors.
+    // Bindable props are often only written to (reassigned) in script, not read,
+    // but the binding is read by the parent component. TypeScript sees writes but
+    // no reads, causing false "declared but its value is never read" errors.
+    var has_bindable_props = false;
+    for (props.items) |prop| {
+        if (prop.is_bindable) {
+            if (!has_bindable_props) {
+                try output.appendSlice(allocator, "// Mark bindable props as used (read by parent via binding)\n");
+                has_bindable_props = true;
+            }
+            try output.appendSlice(allocator, "void ");
+            try output.appendSlice(allocator, prop.name);
+            try output.appendSlice(allocator, ";\n");
+        }
+    }
+    if (has_bindable_props) {
+        try output.appendSlice(allocator, "\n");
+    }
+
     // Generate $$Props interface
     try output.appendSlice(allocator, "// Component typing\n");
     if (props_interface_name) |iface| {
