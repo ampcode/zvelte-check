@@ -1143,6 +1143,14 @@ fn extractIdentifiersFromExpr(
             // Store identifier reference
             if (ident.len > 0) {
                 try refs.put(allocator, ident, {});
+
+                // For $prefixed identifiers (Svelte store subscriptions like $showNudge),
+                // also add the unprefixed name (showNudge). The store variable is declared
+                // in script, but only the $prefixed form is used in templates. Adding both
+                // ensures the original variable is marked as "used".
+                if (ident[0] == '$' and ident.len > 1) {
+                    try refs.put(allocator, ident[1..], {});
+                }
             }
             continue;
         }
