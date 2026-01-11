@@ -1171,6 +1171,30 @@ fn emitTemplateExpressions(
                             }
                         }
                     }
+                    // class: directive - shorthand class:foo means class:foo={foo}
+                    // e.g., class:hidden, class:active, class:animate
+                    if (std.mem.startsWith(u8, attr.name, "class:")) {
+                        const class_var = attr.name[6..]; // Skip "class:"
+                        if (class_var.len > 0) {
+                            if (attr.value) |val| {
+                                // Full syntax: class:foo={expr} - extract identifiers from expr
+                                try extractIdentifiersFromExpr(allocator, val, &template_refs);
+                            } else {
+                                // Shorthand: class:foo uses variable named foo
+                                try template_refs.put(allocator, class_var, {});
+                            }
+                        }
+                    }
+                    // style: directive - shorthand style:prop means style:prop={prop}
+                    // e.g., style:color, style:--custom-property
+                    if (std.mem.startsWith(u8, attr.name, "style:")) {
+                        if (attr.value) |val| {
+                            // Full syntax: style:prop={expr} - extract identifiers from expr
+                            try extractIdentifiersFromExpr(allocator, val, &template_refs);
+                        }
+                        // Note: shorthand style:foo (without value) is rarely used with variables
+                        // because style properties are usually CSS names, not JS identifiers
+                    }
                 }
             },
 
@@ -1857,6 +1881,12 @@ fn emitSnippetParamDeclarations(
             } else {
                 try output.appendSlice(allocator, "any = undefined as any");
             }
+            try output.appendSlice(allocator, ";\n");
+            // Emit void statement to mark the parameter as used.
+            // Snippet params are used in template expressions which may not emit void
+            // statements (e.g., when param name matches a Svelte keyword like "key").
+            try output.appendSlice(allocator, "void ");
+            try output.appendSlice(allocator, param_name);
             try output.appendSlice(allocator, ";\n");
         }
 
