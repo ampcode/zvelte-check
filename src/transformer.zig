@@ -81,7 +81,10 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Svelte 5 rune type declarations
     try output.appendSlice(allocator,
         \\// Svelte 5 rune type stubs
-        \\declare function $state<T = undefined>(initial?: T): T;
+        \\// $state with no argument returns undefined; with explicit T but no initializer returns T | undefined
+        \\declare function $state(): undefined;
+        \\declare function $state<T>(initial: T): T;
+        \\declare function $state<T>(): T | undefined;
         \\declare namespace $state {
         \\  function raw<T>(initial: T): T;
         \\  function snapshot<T>(state: T): T;
@@ -2763,7 +2766,7 @@ test "rune stubs: $state with type inference" {
     const virtual = try transform(allocator, ast);
 
     // Verify $state declaration exists with correct signature
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state<T = undefined>(initial?: T): T;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state<T>(initial: T): T;") != null);
     // Verify script content is preserved
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let count = $state(0);") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let name = $state<string>('hello');") != null);
@@ -3789,7 +3792,7 @@ test "event handler: on:click with inline arrow function" {
     // Script content should be preserved
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let count = $state(0)") != null);
     // $state rune stub should be declared
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state<T = undefined>(initial?: T): T;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state<T>(initial: T): T;") != null);
 }
 
 test "event handler: on:change for input" {
