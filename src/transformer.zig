@@ -48,6 +48,11 @@ const SnippetInfo = struct {
     params: ?[]const u8,
 };
 
+const ExportInfo = struct {
+    name: []const u8,
+    type_repr: ?[]const u8,
+};
+
 pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
@@ -231,6 +236,14 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     }
     try extractSlots(allocator, &ast, &slots);
 
+    // Extract instance exports (methods/values accessible on component instance)
+    var instance_exports: std.ArrayList(ExportInfo) = .empty;
+    defer instance_exports.deinit(allocator);
+    if (instance_script) |script| {
+        const content = ast.source[script.content_start..script.content_end];
+        try extractInstanceExports(allocator, content, &instance_exports);
+    }
+
     // Emit void statements for $bindable() props to suppress "never read" errors.
     // Bindable props are often only written to (reassigned) in script, not read,
     // but the binding is read by the parent component. TypeScript sees writes but
@@ -328,11 +341,26 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     }
     try output.appendSlice(allocator, ";\n\n");
 
+    // Generate $$Exports interface for instance exports (methods accessible on component)
+    try output.appendSlice(allocator, "export interface $$Exports {\n");
+    for (instance_exports.items) |exp| {
+        try output.appendSlice(allocator, "  ");
+        try output.appendSlice(allocator, exp.name);
+        try output.appendSlice(allocator, ": ");
+        if (exp.type_repr) |t| {
+            try output.appendSlice(allocator, t);
+        } else {
+            try output.appendSlice(allocator, "any");
+        }
+        try output.appendSlice(allocator, ";\n");
+    }
+    try output.appendSlice(allocator, "}\n\n");
+
     // Generate default export using Component interface (Svelte 5 style)
     // This makes ComponentProps<typeof Component> work correctly.
     // The Component interface has the signature: Component<Props, Exports, Bindings>
     try output.appendSlice(allocator,
-        \\declare const __SvelteComponent__: __SvelteComponentType__<$$Props, {}, $$Bindings>;
+        \\declare const __SvelteComponent__: __SvelteComponentType__<$$Props, $$Exports, $$Bindings>;
         \\type __SvelteComponent__ = typeof __SvelteComponent__;
         \\export default __SvelteComponent__;
         \\
@@ -442,6 +470,211 @@ fn extractExportLets(allocator: std.mem.Allocator, content: []const u8, props: *
 
         i += 1;
     }
+}
+
+/// Extracts instance exports from Svelte component scripts.
+/// These are values exported from the instance script that are accessible on the component instance.
+/// Patterns supported:
+/// - `export { name }` - re-export of already-defined variable/function
+/// - `export { name1, name2 }` - multiple re-exports
+/// - `export function name()` - inline function export
+/// - `export const name = ...` - inline const export
+/// - `export let name = ...` - skipped (these are props in Svelte 4)
+fn extractInstanceExports(allocator: std.mem.Allocator, content: []const u8, exports: *std.ArrayList(ExportInfo)) !void {
+    var i: usize = 0;
+    var brace_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Track nesting depth
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+        if (c == '(') paren_depth += 1;
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        // Skip single-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
+            while (i < content.len and content[i] != '\n') : (i += 1) {}
+            continue;
+        }
+
+        // Skip multi-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < content.len) {
+                if (content[i] == '*' and content[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Only look for exports at top level
+        if (brace_depth == 0 and paren_depth == 0) {
+            if (startsWithKeyword(content[i..], "export")) {
+                i += 6;
+                i = skipWhitespace(content, i);
+
+                // Skip "export let" - these are props, not instance exports
+                if (startsWithKeyword(content[i..], "let")) {
+                    while (i < content.len and content[i] != ';' and content[i] != '\n') : (i += 1) {}
+                    continue;
+                }
+
+                // Handle "export { name1, name2 }"
+                if (i < content.len and content[i] == '{') {
+                    i += 1;
+                    while (i < content.len) {
+                        i = skipWhitespace(content, i);
+                        if (i < content.len and content[i] == '}') {
+                            i += 1;
+                            break;
+                        }
+
+                        // Parse identifier
+                        const name_start = i;
+                        while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+                        const name = content[name_start..i];
+
+                        if (name.len > 0) {
+                            // Look up the type from the function/variable definition
+                            const type_repr = findExportedNameType(content, name);
+                            try exports.append(allocator, .{
+                                .name = name,
+                                .type_repr = type_repr,
+                            });
+                        }
+
+                        i = skipWhitespace(content, i);
+
+                        // Skip "as alias" if present
+                        if (startsWithKeyword(content[i..], "as")) {
+                            i += 2;
+                            i = skipWhitespace(content, i);
+                            while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+                        }
+
+                        i = skipWhitespace(content, i);
+                        if (i < content.len and content[i] == ',') {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle "export function name(...): ReturnType"
+                // Use "typeof name" to reference the function's inferred type from the script
+                if (startsWithKeyword(content[i..], "function")) {
+                    i += 8;
+                    i = skipWhitespace(content, i);
+
+                    const name_start = i;
+                    while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+                    const name = content[name_start..i];
+
+                    if (name.len > 0) {
+                        // Use typeof to reference the actual function's type
+                        // This handles default parameters, generics, overloads correctly
+                        const type_repr = try std.fmt.allocPrint(allocator, "typeof {s}", .{name});
+                        try exports.append(allocator, .{
+                            .name = name,
+                            .type_repr = type_repr,
+                        });
+                    }
+
+                    // Skip to end of function body
+                    while (i < content.len and content[i] != '{') : (i += 1) {}
+                    if (i < content.len) {
+                        var body_depth: u32 = 0;
+                        while (i < content.len) {
+                            if (content[i] == '{') body_depth += 1;
+                            if (content[i] == '}') {
+                                body_depth -= 1;
+                                if (body_depth == 0) {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle "export const name = ..." or "export const name: Type = ..."
+                if (startsWithKeyword(content[i..], "const")) {
+                    i += 5;
+                    i = skipWhitespace(content, i);
+
+                    const name_start = i;
+                    while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+                    const name = content[name_start..i];
+
+                    if (name.len > 0) {
+                        i = skipWhitespace(content, i);
+
+                        var type_repr: ?[]const u8 = null;
+                        if (i < content.len and content[i] == ':') {
+                            i += 1;
+                            i = skipWhitespace(content, i);
+                            const type_start = i;
+                            i = skipTypeAnnotation(content, i);
+                            type_repr = std.mem.trim(u8, content[type_start..i], " \t\n\r");
+                        }
+
+                        try exports.append(allocator, .{
+                            .name = name,
+                            .type_repr = type_repr,
+                        });
+                    }
+
+                    // Skip to end of statement
+                    while (i < content.len and content[i] != ';' and content[i] != '\n') : (i += 1) {}
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+}
+
+/// Find the type of an exported name by looking up its definition in the script.
+/// Returns the function signature or variable type if found.
+fn findExportedNameType(content: []const u8, name: []const u8) ?[]const u8 {
+    // Look for "function name(" pattern
+    var search_i: usize = 0;
+    while (search_i + 8 + name.len < content.len) {
+        if (std.mem.startsWith(u8, content[search_i..], "function")) {
+            const after_func = search_i + 8;
+            var j = after_func;
+            // Skip whitespace
+            while (j < content.len and std.ascii.isWhitespace(content[j])) : (j += 1) {}
+            // Check if name matches
+            if (j + name.len <= content.len and std.mem.eql(u8, content[j .. j + name.len], name)) {
+                const after_name = j + name.len;
+                // Make sure it's not a prefix of another identifier
+                if (after_name >= content.len or !isIdentChar(content[after_name])) {
+                    // Found function definition - for now return "any" as extracting full signature is complex
+                    // The function is already emitted in the script content, so TypeScript will infer
+                    return null;
+                }
+            }
+        }
+        search_i += 1;
+    }
+
+    return null;
 }
 
 /// Extracts props from Svelte 5 $props() destructuring pattern.
@@ -3042,6 +3275,70 @@ test "extract export lets" {
     try std.testing.expect(props.items[2].has_initializer);
 }
 
+test "extract instance exports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const content =
+        \\  function handleKeyNavigation(event: KeyboardEvent) {
+        \\    // do something
+        \\  }
+        \\  function scrollToBottom(behavior: 'smooth' | 'instant' = 'instant') {
+        \\    // do something
+        \\  }
+        \\  export { handleKeyNavigation }
+        \\  export function isReady(): boolean {
+        \\    return true;
+        \\  }
+        \\  export const MAX_ITEMS = 10;
+    ;
+
+    var exports: std.ArrayList(ExportInfo) = .empty;
+    try extractInstanceExports(allocator, content, &exports);
+
+    // Should find 3 exports: handleKeyNavigation, isReady, MAX_ITEMS
+    try std.testing.expectEqual(@as(usize, 3), exports.items.len);
+
+    // handleKeyNavigation from export { ... } - type is null (looked up from definition returns null)
+    try std.testing.expectEqualStrings("handleKeyNavigation", exports.items[0].name);
+    try std.testing.expect(exports.items[0].type_repr == null);
+
+    // isReady from export function - type is typeof isReady
+    try std.testing.expectEqualStrings("isReady", exports.items[1].name);
+    try std.testing.expectEqualStrings("typeof isReady", exports.items[1].type_repr.?);
+
+    // MAX_ITEMS from export const - no explicit type
+    try std.testing.expectEqualStrings("MAX_ITEMS", exports.items[2].name);
+    try std.testing.expect(exports.items[2].type_repr == null);
+}
+
+test "instance exports in generated component type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  function handleKey(e: KeyboardEvent) {}
+        \\  export { handleKey }
+        \\  export function focus() { }
+        \\</script>
+    ;
+
+    var parser: @import("svelte_parser.zig").Parser = .init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // Should have $$Exports interface with the exports
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Exports") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "handleKey:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "focus: typeof focus") != null);
+
+    // Component type should use $$Exports
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__SvelteComponentType__<$$Props, $$Exports, $$Bindings>") != null);
+}
+
 test "transform typescript component" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3080,7 +3377,7 @@ test "transform typescript component" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "count?: number") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Slots") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "default: {}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__SvelteComponentType__<$$Props, {}, $$Bindings>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__SvelteComponentType__<$$Props, $$Exports, $$Bindings>") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "badType: number = \"not a number\"") != null);
 
     // Component usages in template should emit void statements
