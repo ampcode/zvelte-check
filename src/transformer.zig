@@ -1462,13 +1462,17 @@ fn emitEachBindingDeclarations(
     binding: EachBindingInfo,
     iterable: []const u8,
 ) !void {
-    // Emit item binding: var item = (iterable)[0];
+    // Emit item binding: var item = ((iterable) ?? [])[0];
     // Using var allows redeclaration for multiple blocks with same name
+    // The ?? [] fallback handles null/undefined iterables (Svelte treats them as empty)
+    // Also transform [...x] spreads inside the iterable to [...(x ?? [])] for null safety
+    const safe_iterable = try makeIterableNullSafe(allocator, iterable);
+
     try output.appendSlice(allocator, "var ");
     try output.appendSlice(allocator, binding.item_binding);
-    try output.appendSlice(allocator, " = (");
-    try output.appendSlice(allocator, iterable);
-    try output.appendSlice(allocator, ")[0];\n");
+    try output.appendSlice(allocator, " = ((");
+    try output.appendSlice(allocator, safe_iterable);
+    try output.appendSlice(allocator, ") ?? [])[0];\n");
 
     // Emit index binding if present: var i = 0;
     if (binding.index_binding) |idx| {
@@ -1476,6 +1480,63 @@ fn emitEachBindingDeclarations(
         try output.appendSlice(allocator, idx);
         try output.appendSlice(allocator, " = 0;\n");
     }
+}
+
+/// Transforms spread expressions inside an iterable to be null-safe.
+/// Replaces `[...x]` with `[...(x ?? [])]` to handle nullable arrays.
+/// Svelte tolerates null/undefined in {#each}, treating them as empty arrays.
+fn makeIterableNullSafe(allocator: std.mem.Allocator, iterable: []const u8) ![]const u8 {
+    // Look for [...identifier] or [...expression] patterns and wrap with ?? []
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+    try result.ensureTotalCapacity(allocator, iterable.len + 32);
+
+    var i: usize = 0;
+    while (i < iterable.len) {
+        // Look for "[..." pattern
+        if (i + 4 <= iterable.len and std.mem.eql(u8, iterable[i .. i + 4], "[...")) {
+            try result.appendSlice(allocator, "[...(");
+            i += 4;
+
+            // Find the matching ] by tracking bracket depth
+            const spread_start = i;
+            var bracket_depth: u32 = 1;
+            var paren_depth: u32 = 0;
+
+            while (i < iterable.len and bracket_depth > 0) {
+                const c = iterable[i];
+                switch (c) {
+                    '[' => bracket_depth += 1,
+                    ']' => bracket_depth -= 1,
+                    '(' => paren_depth += 1,
+                    ')' => {
+                        if (paren_depth > 0) paren_depth -= 1;
+                    },
+                    else => {},
+                }
+                if (bracket_depth > 0) i += 1;
+            }
+
+            // i now points to the closing ]
+            const spread_expr = iterable[spread_start..i];
+
+            // Check if it's a method call like .reverse() - extract just the base
+            // For [...suggestions].reverse(), spread_expr is "suggestions"
+            try result.appendSlice(allocator, spread_expr);
+            try result.appendSlice(allocator, " ?? [])");
+
+            // Copy the closing ]
+            if (i < iterable.len and iterable[i] == ']') {
+                try result.append(allocator, ']');
+                i += 1;
+            }
+        } else {
+            try result.append(allocator, iterable[i]);
+            i += 1;
+        }
+    }
+
+    return try allocator.dupe(u8, result.items);
 }
 
 /// Emits variable declarations for snippet parameters
@@ -4618,4 +4679,61 @@ test "spread props in lowercase tags are detected" {
 
     // Spread props in lowercase tags should emit void statements
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void props;") != null);
+}
+
+test "each block with nullable iterable emits null-safe fallback" {
+    // Svelte tolerates null/undefined iterables in {#each} (treats them as empty).
+    // The generated TS must use ?? [] fallback to avoid "Type 'null' must have
+    // a '[Symbol.iterator]()' method" errors.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let items: string[] | null = $state(null);
+        \\</script>
+        \\{#each items as item}
+        \\  <p>{item}</p>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // The generated binding should use ?? [] fallback for null safety
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "((items) ?? [])[0]") != null);
+}
+
+test "each block with spread of nullable array emits null-safe fallback" {
+    // When spreading a nullable array like [...items], we need to make the spread null-safe.
+    // This handles patterns like: {#each showAbove ? [...items].reverse() : items as item}
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let items: string[] | null = $state(null);
+        \\  let reverse = $state(false);
+        \\</script>
+        \\{#each reverse ? [...items].reverse() : items as item}
+        \\  <p>{item}</p>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Debug output
+    std.debug.print("\n=== GENERATED OUTPUT ===\n{s}\n=== END ===\n", .{virtual.content});
+
+    // The spread should be wrapped with ?? [] for null safety: [...(items ?? [])]
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "[...(items ?? [])]") != null);
 }
