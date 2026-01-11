@@ -178,7 +178,7 @@ fn diagnosticMatches(expected: ExpectedDiagnostic, actual: ActualDiagnostic) boo
 }
 
 fn runBinary(allocator: std.mem.Allocator, workspace: []const u8) !struct { stdout: []const u8, exit_code: u8 } {
-    const exe_path = "zig-out/bin/svelte_check_zig";
+    const exe_path = "zig-out/bin/zvelte-check";
 
     var child = std.process.Child.init(
         &.{ exe_path, "--workspace", workspace, "--no-tsconfig" },

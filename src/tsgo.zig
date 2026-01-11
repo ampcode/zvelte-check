@@ -167,10 +167,8 @@ pub fn check(
     try args.append(allocator, tsgo_path);
     try args.append(allocator, "--noEmit");
     try args.append(allocator, "--project");
-
-    const tsconfig_abs = try std.fs.path.join(allocator, &.{ workspace_path, generated_tsconfig });
-    defer allocator.free(tsconfig_abs);
-    try args.append(allocator, tsconfig_abs);
+    // Use relative path since child.cwd is set to workspace_path
+    try args.append(allocator, generated_tsconfig);
 
     // Run tsgo from workspace root for proper module resolution
     var child = std.process.Child.init(args.items, allocator);
@@ -272,6 +270,22 @@ fn cleanupStubDir(workspace_dir: std.fs.Dir) void {
     workspace_dir.deleteTree(stub_dir) catch {};
 }
 
+/// Path comparison that treats `/` and `\` as equivalent separators.
+/// Returns true if `haystack` ends with `needle` (path-wise).
+fn pathEndsWith(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    if (needle.len == 0) return true;
+
+    const haystack_suffix = haystack[haystack.len - needle.len ..];
+
+    for (haystack_suffix, needle) |h, n| {
+        const h_normalized = if (h == '\\') @as(u8, '/') else h;
+        const n_normalized = if (n == '\\') @as(u8, '/') else n;
+        if (h_normalized != n_normalized) return false;
+    }
+    return true;
+}
+
 /// Generates a tsconfig that extends the project's config.
 /// Includes only transformed .svelte.ts files and our type stubs.
 fn writeGeneratedTsconfig(
@@ -315,20 +329,25 @@ fn writeGeneratedTsconfig(
     try w.writeAll("    \"noUnusedLocals\": false,\n");
     try w.writeAll("    \"noUnusedParameters\": false,\n");
     try w.writeAll("    \"strictNullChecks\": false,\n");
-    try w.writeAll("    \"noImplicitAny\": false\n");
+    try w.writeAll("    \"noImplicitAny\": false,\n");
+    // rootDirs makes TS treat .zvelte-check/ and workspace root as the same virtual root,
+    // so relative imports in generated .svelte.ts files resolve correctly
+    try w.writeAll("    \"rootDirs\": [\".\", \"..\"]\n");
     try w.writeAll("  },\n");
 
-    // Include our generated files plus all .ts files they may import
-    // Paths are relative to this tsconfig in .zvelte-check/
+    // Include source .ts files that .svelte files may import, plus our generated files.
+    // When extending a tsconfig, include is completely replaced (not merged), so we
+    // must re-include the source files. Paths are relative to .zvelte-check/ directory.
     try w.writeAll("  \"include\": [\n");
     try w.writeAll("    \"stubs.d.ts\",\n");
-    try w.writeAll("    \"../src/**/*.ts\"");
+    // Include common source directories - these are relative to the .zvelte-check dir
+    try w.writeAll("    \"../src/**/*.ts\",\n");
+    try w.writeAll("    \"../src/**/*.js\"");
 
     for (virtual_files) |vf| {
         // Strip workspace prefix from virtual_path to get relative path
         const relative_path = stripWorkspacePrefix(vf.virtual_path, workspace_path);
 
-        // Include the stub file (already in .zvelte-check/ relative to tsconfig)
         try w.writeAll(",\n    \"");
         try w.writeAll(relative_path);
         try w.writeAll("\"");
@@ -336,8 +355,8 @@ fn writeGeneratedTsconfig(
 
     try w.writeAll("\n  ],\n");
 
-    // Exclude node_modules to avoid scanning everything
-    try w.writeAll("  \"exclude\": [\"../node_modules\"]\n");
+    // Exclude node_modules
+    try w.writeAll("  \"exclude\": [\"../node_modules\"]");
     try w.writeAll("}\n");
 
     try w.flush();
@@ -589,8 +608,23 @@ fn parseTsgoOutput(
         const ts_col = std.fmt.parseInt(u32, col_str, 10) catch continue;
 
         // Find corresponding cached file by matching .svelte.ts path
+        // tsgo outputs paths like ".zvelte-check/MemberAccess.svelte.ts" but
+        // virtual_path contains the full original path "src/routes/+page.svelte.ts".
+        // Strip the stub_dir prefix and match the remainder against virtual_path endings.
+        //
+        // Note: On Windows, tsgo may output backslashes. We handle both separators.
+        const stub_prefix_slash = stub_dir ++ "/";
+        const stub_prefix_backslash = stub_dir ++ "\\";
+        const relative_stub_path = if (std.mem.startsWith(u8, file_path, stub_prefix_slash))
+            file_path[stub_prefix_slash.len..]
+        else if (std.mem.startsWith(u8, file_path, stub_prefix_backslash))
+            file_path[stub_prefix_backslash.len..]
+        else
+            file_path;
+
         const cached: ?CachedVirtualFile = for (cached_files) |cf| {
-            if (std.mem.endsWith(u8, file_path, cf.vf.virtual_path)) {
+            // Match using endsWith, handling both path separators
+            if (pathEndsWith(cf.vf.virtual_path, relative_stub_path)) {
                 break cf;
             }
         } else null;
@@ -679,21 +713,53 @@ fn shouldSkipSvelteTypeError(message: []const u8) bool {
         return true;
     }
 
+    // Skip "Subsequent variable declarations must have the same type" errors
+    // These are false positives from Svelte 5 event handling where onclick/onX
+    // props are declared multiple times in generated code
+    if (std.mem.indexOf(u8, message, "Subsequent variable declarations must have the same type") != null) {
+        return true;
+    }
+
+    // Skip "Cannot find module './X.remote'" and "./$types" errors
+    // SvelteKit remote functions and $types are virtual modules generated at build time
+    if (std.mem.indexOf(u8, message, "Cannot find module") != null) {
+        if (std.mem.indexOf(u8, message, ".remote'") != null) return true;
+        if (std.mem.indexOf(u8, message, "/$types'") != null) return true;
+    }
+
+    // Skip "Module '\"*.svelte\"' has no exported member" errors
+    // These occur when TypeScript doesn't understand .svelte imports
+    if (std.mem.indexOf(u8, message, "Module '\"*.svelte\"'") != null) {
+        return true;
+    }
+
     return false;
 }
 
-test "parse tsgo output" {
+test "parse tsgo output with stub directory paths" {
+    // tsgo outputs paths relative to its cwd, which is the workspace.
+    // Files are stored in .zvelte-check/<relative_path>.svelte.ts
+    // This test verifies we correctly match these paths to virtual files.
+    //
+    // Example: workspace is "my-project", file is "my-project/App.svelte"
+    // - virtual_path = "my-project/App.svelte.ts" (full path)
+    // - stub file written to: .zvelte-check/App.svelte.ts (workspace prefix stripped)
+    // - tsgo outputs: .zvelte-check/App.svelte.ts
+    // - after stripping stub_dir: App.svelte.ts
+    // - we match: virtual_path ends with "App.svelte.ts" ✓
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const tsgo_output = "src/routes/+page.svelte.ts(5,10): error TS2322: Type 'string' is not assignable to type 'number'.\n";
+    // tsgo outputs paths with .zvelte-check/ prefix
+    const tsgo_output = ".zvelte-check/App.svelte.ts(5,10): error TS2322: Type 'string' is not assignable to type 'number'.\n";
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
 
+    // Virtual file has full path including workspace prefix
     const vf: VirtualFile = .{
-        .original_path = "src/routes/+page.svelte",
-        .virtual_path = "src/routes/+page.svelte.ts",
+        .original_path = "my-project/App.svelte",
+        .virtual_path = "my-project/App.svelte.ts",
         .content = "",
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
     };
@@ -707,7 +773,93 @@ test "parse tsgo output" {
     try parseTsgoOutput(allocator, tsgo_output, &cached_files, &diagnostics);
 
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
-    try std.testing.expectEqualStrings("src/routes/+page.svelte", diagnostics.items[0].file_path);
+    try std.testing.expectEqualStrings("my-project/App.svelte", diagnostics.items[0].file_path);
+}
+
+test "parse tsgo output with nested stub directory paths" {
+    // When workspace contains nested directories, the stub preserves that structure.
+    // Example: workspace is "project", file is "project/src/routes/+page.svelte"
+    // - virtual_path = "project/src/routes/+page.svelte.ts"
+    // - stub file: .zvelte-check/src/routes/+page.svelte.ts
+    // - tsgo outputs: .zvelte-check/src/routes/+page.svelte.ts
+    // - after stripping: src/routes/+page.svelte.ts
+    // - match: virtual_path ends with "src/routes/+page.svelte.ts" ✓
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const tsgo_output = ".zvelte-check/src/routes/+page.svelte.ts(10,5): error TS2339: Property 'id2' does not exist on type 'Thread'.\n";
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+
+    const vf: VirtualFile = .{
+        .original_path = "project/src/routes/+page.svelte",
+        .virtual_path = "project/src/routes/+page.svelte.ts",
+        .content = "",
+        .source_map = .{ .mappings = &.{}, .svelte_source = "" },
+    };
+
+    const cached_files = [_]CachedVirtualFile{.{
+        .vf = vf,
+        .ts_line_table = try LineTable.init(allocator, vf.content),
+        .svelte_line_table = try LineTable.init(allocator, vf.source_map.svelte_source),
+    }};
+
+    try parseTsgoOutput(allocator, tsgo_output, &cached_files, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("project/src/routes/+page.svelte", diagnostics.items[0].file_path);
+}
+
+test "parse tsgo output with Windows-style backslash paths" {
+    // On Windows, tsgo may output paths with backslashes.
+    // Ensure we handle both separators correctly.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Windows-style output with backslashes
+    const tsgo_output = ".zvelte-check\\src\\routes\\+page.svelte.ts(10,5): error TS2339: Property 'id2' does not exist on type 'Thread'.\n";
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+
+    // Virtual file uses forward slashes (as constructed by Zig)
+    const vf: VirtualFile = .{
+        .original_path = "project/src/routes/+page.svelte",
+        .virtual_path = "project/src/routes/+page.svelte.ts",
+        .content = "",
+        .source_map = .{ .mappings = &.{}, .svelte_source = "" },
+    };
+
+    const cached_files = [_]CachedVirtualFile{.{
+        .vf = vf,
+        .ts_line_table = try LineTable.init(allocator, vf.content),
+        .svelte_line_table = try LineTable.init(allocator, vf.source_map.svelte_source),
+    }};
+
+    try parseTsgoOutput(allocator, tsgo_output, &cached_files, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("project/src/routes/+page.svelte", diagnostics.items[0].file_path);
+}
+
+test "pathEndsWith handles mixed separators" {
+    // Forward slashes
+    try std.testing.expect(pathEndsWith("project/src/routes/+page.svelte.ts", "src/routes/+page.svelte.ts"));
+    try std.testing.expect(pathEndsWith("project/src/routes/+page.svelte.ts", "+page.svelte.ts"));
+
+    // Backslashes in needle
+    try std.testing.expect(pathEndsWith("project/src/routes/+page.svelte.ts", "src\\routes\\+page.svelte.ts"));
+
+    // Backslashes in haystack
+    try std.testing.expect(pathEndsWith("project\\src\\routes\\+page.svelte.ts", "src/routes/+page.svelte.ts"));
+
+    // Mixed separators
+    try std.testing.expect(pathEndsWith("project/src\\routes/+page.svelte.ts", "src/routes\\+page.svelte.ts"));
+
+    // Non-matching
+    try std.testing.expect(!pathEndsWith("project/src/routes/+page.svelte.ts", "other/+page.svelte.ts"));
+    try std.testing.expect(!pathEndsWith("short.ts", "very/long/path/short.ts"));
 }
 
 test "writeGeneratedTsconfig generates valid config" {
