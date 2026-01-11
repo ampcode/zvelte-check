@@ -1,0 +1,13 @@
+{
+  "name": "zvelte-check-comparison-fixtures",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "svelte-check": "svelte-check"
+  },
+  "devDependencies": {
+    "svelte": "^5.0.0",
+    "svelte-check": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

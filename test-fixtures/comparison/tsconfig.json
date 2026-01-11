@@ -8,5 +8,5 @@
     "skipLibCheck": true
   },
   "include": ["**/*.ts", "**/*.svelte.ts", "**/*.svelte"],
-  "exclude": ["node_modules", "projects"]
+  "exclude": ["node_modules"]
 }

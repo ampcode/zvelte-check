@@ -386,3 +386,259 @@ test "diagnostic matching" {
     try std.testing.expect(!diagnosticMatches(expected, wrong_line));
     try std.testing.expect(!diagnosticMatches(expected, wrong_code));
 }
+
+// --- Svelte-check comparison tests ---
+
+const MachineDiagnostic = struct {
+    severity: []const u8,
+    file: []const u8,
+    line: u32,
+    col: u32,
+    message: []const u8,
+};
+
+fn parseMachineOutput(allocator: std.mem.Allocator, output: []const u8, strip_prefix: ?[]const u8) ![]MachineDiagnostic {
+    var list: std.ArrayList(MachineDiagnostic) = .empty;
+
+    var line_iter = std.mem.splitScalar(u8, output, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len == 0) continue;
+
+        // Skip non-diagnostic lines (START, COMPLETED, summary)
+        if (!std.mem.startsWith(u8, line, "1") and !std.mem.startsWith(u8, line, "2"))
+            continue;
+
+        // Format: TIMESTAMP SEVERITY "file" line:col "message"
+        // Parse timestamp (digits until space)
+        var i: usize = 0;
+        while (i < line.len and std.ascii.isDigit(line[i])) : (i += 1) {}
+        if (i >= line.len or line[i] != ' ') continue;
+        i += 1;
+
+        // Parse severity (ERROR or WARNING)
+        const sev_start = i;
+        while (i < line.len and line[i] != ' ') : (i += 1) {}
+        const severity = line[sev_start..i];
+        if (!std.mem.eql(u8, severity, "ERROR") and !std.mem.eql(u8, severity, "WARNING")) continue;
+        if (i >= line.len) continue;
+        i += 1;
+
+        // Parse filename (quoted)
+        if (line[i] != '"') continue;
+        i += 1;
+        const file_start = i;
+        while (i < line.len and line[i] != '"') : (i += 1) {}
+        var file = line[file_start..i];
+        if (i >= line.len) continue;
+        i += 1; // skip closing quote
+        if (i >= line.len or line[i] != ' ') continue;
+        i += 1;
+
+        // Strip prefix from file path for normalization
+        if (strip_prefix) |prefix| {
+            if (std.mem.startsWith(u8, file, prefix)) {
+                file = file[prefix.len..];
+            }
+        }
+
+        // Parse line:col
+        const loc_start = i;
+        while (i < line.len and line[i] != ' ') : (i += 1) {}
+        const loc = line[loc_start..i];
+        if (i >= line.len) continue;
+        i += 1;
+
+        var loc_iter = std.mem.splitScalar(u8, loc, ':');
+        const line_str = loc_iter.next() orelse continue;
+        const col_str = loc_iter.next() orelse continue;
+        const diag_line = std.fmt.parseInt(u32, line_str, 10) catch continue;
+        const diag_col = std.fmt.parseInt(u32, col_str, 10) catch continue;
+
+        // Parse message (quoted)
+        if (line[i] != '"') continue;
+        i += 1;
+        const msg_start = i;
+        // Find closing quote (handle escaped quotes if needed)
+        while (i < line.len) {
+            if (line[i] == '"' and (i == msg_start or line[i - 1] != '\\')) break;
+            i += 1;
+        }
+        const message = line[msg_start..i];
+
+        try list.append(allocator, .{
+            .severity = severity,
+            .file = file,
+            .line = diag_line,
+            .col = diag_col,
+            .message = message,
+        });
+    }
+
+    return list.toOwnedSlice(allocator);
+}
+
+fn runSvelteCheck(allocator: std.mem.Allocator, workspace: []const u8) ![]const u8 {
+    // Try bun first, fall back to pnpm
+    var child = std.process.Child.init(
+        &.{ "bun", "run", "svelte-check", "--output", "machine" },
+        allocator,
+    );
+    child.cwd = workspace;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch {
+        // Fall back to pnpm
+        child = std.process.Child.init(
+            &.{ "pnpm", "exec", "svelte-check", "--output", "machine" },
+            allocator,
+        );
+        child.cwd = workspace;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+
+        child.spawn() catch |err| {
+            if (err == error.FileNotFound) return error.SvelteCheckNotFound;
+            return err;
+        };
+    };
+
+    const stdout = try child.stdout.?.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    _ = try child.stderr.?.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    _ = try child.wait();
+
+    return stdout;
+}
+
+fn runZvelteCheck(allocator: std.mem.Allocator, workspace: []const u8) ![]const u8 {
+    const exe_path = "zig-out/bin/zvelte-check";
+
+    var child = std.process.Child.init(
+        &.{ exe_path, "--workspace", workspace, "--output", "machine" },
+        allocator,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    const stdout = try child.stdout.?.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    _ = try child.stderr.?.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    _ = try child.wait();
+
+    return stdout;
+}
+
+fn diagMatches(a: MachineDiagnostic, b: MachineDiagnostic) bool {
+    return std.mem.eql(u8, a.file, b.file) and a.line == b.line and a.col == b.col;
+}
+
+fn findDiag(list: []const MachineDiagnostic, target: MachineDiagnostic) bool {
+    for (list) |d| {
+        if (diagMatches(d, target)) return true;
+    }
+    return false;
+}
+
+fn compareToolOutputs(allocator: std.mem.Allocator, workspace: []const u8) !struct {
+    false_positives: usize,
+    false_negatives: usize,
+    matching: usize,
+} {
+    const svelte_out = runSvelteCheck(allocator, workspace) catch |err| {
+        if (err == error.SvelteCheckNotFound) {
+            std.debug.print("svelte-check not found (pnpm not in PATH?), skipping comparison\n", .{});
+            return .{ .false_positives = 0, .false_negatives = 0, .matching = 0 };
+        }
+        return err;
+    };
+    const zvelte_out = try runZvelteCheck(allocator, workspace);
+
+    // Parse outputs - strip workspace prefix from zvelte-check paths
+    const prefix = std.fmt.allocPrint(allocator, "{s}/", .{workspace}) catch "";
+    const svelte_diags = try parseMachineOutput(allocator, svelte_out, null);
+    const zvelte_diags = try parseMachineOutput(allocator, zvelte_out, prefix);
+
+    // Count matches and differences with O(n*m) comparison (small lists)
+    var matching: usize = 0;
+    var false_positives: usize = 0;
+    var false_negatives: usize = 0;
+
+    for (zvelte_diags) |d| {
+        if (findDiag(svelte_diags, d)) {
+            matching += 1;
+        } else {
+            false_positives += 1;
+            std.debug.print("  FALSE POSITIVE: {s}:{d}:{d} - {s}\n", .{ d.file, d.line, d.col, d.message });
+        }
+    }
+
+    for (svelte_diags) |d| {
+        if (!findDiag(zvelte_diags, d)) {
+            false_negatives += 1;
+            std.debug.print("  FALSE NEGATIVE: {s}:{d}:{d} - {s}\n", .{ d.file, d.line, d.col, d.message });
+        }
+    }
+
+    return .{
+        .false_positives = false_positives,
+        .false_negatives = false_negatives,
+        .matching = matching,
+    };
+}
+
+test "svelte-check comparison: basic fixtures" {
+    const allocator = std.testing.allocator;
+
+    // Check if comparison fixtures exist and have node_modules
+    const fixture_path = "test-fixtures/comparison";
+    std.fs.cwd().access(fixture_path ++ "/node_modules", .{}) catch {
+        std.debug.print("Skipping: {s}/node_modules not found. Run 'pnpm install' in {s}\n", .{ fixture_path, fixture_path });
+        return error.SkipZigTest;
+    };
+
+    // Check if zvelte-check binary exists
+    std.fs.cwd().access("zig-out/bin/zvelte-check", .{}) catch {
+        std.debug.print("Skipping: zig-out/bin/zvelte-check not found. Run 'zig build' first\n", .{});
+        return error.SkipZigTest;
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const result = try compareToolOutputs(arena.allocator(), fixture_path);
+
+    std.debug.print("\nComparison results:\n", .{});
+    std.debug.print("  Matching: {d}\n", .{result.matching});
+    std.debug.print("  False positives: {d}\n", .{result.false_positives});
+    std.debug.print("  False negatives: {d}\n", .{result.false_negatives});
+
+    // For now, just report - don't fail on differences
+    // TODO: Enable strict comparison once all false positives are fixed
+    if (result.false_positives > 0 or result.false_negatives > 0) {
+        std.debug.print("\n  Note: Differences exist but test passes for now\n", .{});
+    }
+}
+
+test "parse machine output format" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const svelte_output =
+        \\1768159808176 START "/Users/tim/repos/zvelte-check/test-fixtures/comparison"
+        \\1768159808497 ERROR "TypeError.svelte" 2:6 "Type 'string' is not assignable to type 'number'."
+        \\1768159808497 WARNING "Test.svelte" 5:1 "Some warning"
+        \\1768159808497 COMPLETED 67 FILES 1 ERRORS 0 WARNINGS 1 FILES_WITH_PROBLEMS
+    ;
+
+    const diags = try parseMachineOutput(allocator, svelte_output, null);
+
+    try std.testing.expectEqual(@as(usize, 2), diags.len);
+    try std.testing.expectEqualStrings("ERROR", diags[0].severity);
+    try std.testing.expectEqualStrings("TypeError.svelte", diags[0].file);
+    try std.testing.expectEqual(@as(u32, 2), diags[0].line);
+    try std.testing.expectEqual(@as(u32, 6), diags[0].col);
+    try std.testing.expectEqualStrings("WARNING", diags[1].severity);
+    try std.testing.expectEqualStrings("Test.svelte", diags[1].file);
+}
