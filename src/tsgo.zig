@@ -766,6 +766,16 @@ fn shouldSkipSvelteTypeError(message: []const u8) bool {
         return true;
     }
 
+    // Skip "Property X does not exist on type 'unknown'" errors
+    // These are false positives caused by tsgo's handling of rootDirs, which
+    // we use to make relative imports work in generated .svelte.ts files.
+    // tsgo incorrectly infers 'unknown' for some reactive patterns (like store
+    // subscriptions returned from $derived()) when rootDirs is enabled.
+    // Regular tsc handles these correctly.
+    if (std.mem.indexOf(u8, message, "does not exist on type 'unknown'") != null) {
+        return true;
+    }
+
     return false;
 }
 
