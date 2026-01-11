@@ -342,7 +342,9 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     try output.appendSlice(allocator, ";\n\n");
 
     // Generate $$Exports interface for instance exports (methods accessible on component)
+    // Include index signature for compatibility with Record<string, any> (required by mount())
     try output.appendSlice(allocator, "export interface $$Exports {\n");
+    try output.appendSlice(allocator, "  [key: string]: any;\n");
     for (instance_exports.items) |exp| {
         try output.appendSlice(allocator, "  ");
         try output.appendSlice(allocator, exp.name);
@@ -3335,8 +3337,36 @@ test "instance exports in generated component type" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "handleKey:") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "focus: typeof focus") != null);
 
+    // $$Exports must have index signature for Record<string, any> compatibility (required by mount())
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "[key: string]: any;") != null);
+
     // Component type should use $$Exports
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__SvelteComponentType__<$$Props, $$Exports, $$Bindings>") != null);
+}
+
+test "$$Exports is compatible with Record<string, any> for mount()" {
+    // Regression test: mount() returns Exports which must extend Record<string, any>.
+    // Without an index signature, empty $$Exports {} is not assignable to Record<string, unknown>.
+    // This caused false positives like: "Type '$$Exports' is not assignable to 'Record<string, unknown>'"
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Component with no exports - the common case that triggered the bug
+    const source =
+        \\<script lang="ts">
+        \\  let { name }: { name: string } = $props();
+        \\</script>
+        \\<p>{name}</p>
+    ;
+
+    var parser: @import("svelte_parser.zig").Parser = .init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // Even with no exports, $$Exports must have index signature
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Exports") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "[key: string]: any;") != null);
 }
 
 test "transform typescript component" {
