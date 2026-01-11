@@ -764,26 +764,7 @@ fn parseTsgoOutput(
 /// Some errors are Svelte-specific false positives (only skipped for .svelte files).
 /// Others are general false positives from our code generation.
 fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool) bool {
-    // Skip "declared but never used/read" errors for Svelte files only.
-    // Variables declared in <script> are used in the template, but TypeScript
-    // only sees the generated .ts file where template usages aren't visible.
-    // For .ts files, we want to report these errors.
     if (is_svelte_file) {
-        if (std.mem.indexOf(u8, message, "is declared but") != null) {
-            if (std.mem.indexOf(u8, message, "never used") != null or
-                std.mem.indexOf(u8, message, "never read") != null)
-            {
-                return true;
-            }
-        }
-        // Also skip "All imports in import declaration are unused" for Svelte
-        if (std.mem.indexOf(u8, message, "All imports in import declaration are unused") != null) {
-            return true;
-        }
-        // Skip "All destructured elements are unused" for Svelte
-        if (std.mem.indexOf(u8, message, "All destructured elements are unused") != null) {
-            return true;
-        }
         // Svelte-specific type errors (only for .svelte files)
         // These are false positives from our code generation
 

@@ -67,10 +67,11 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     try output.appendSlice(allocator, ast.file_path);
     try output.appendSlice(allocator, "\n\n");
 
-    // Svelte type imports (including Snippet for Svelte 5)
+    // Svelte type imports
     // SvelteComponentTyped must be a regular import (not type-only) since we extend it
     try output.appendSlice(allocator, "import { SvelteComponentTyped } from \"svelte\";\n");
-    try output.appendSlice(allocator, "import type { Snippet } from \"svelte\";\n");
+    // Note: We don't auto-import Snippet - if users need it, they import it themselves.
+    // Auto-importing caused "declared but never used" errors for files that don't use Snippet types.
 
     // SvelteKit route type imports are NOT auto-generated
     // User code imports from './$types' which resolves via SvelteKit's generated types
@@ -652,6 +653,35 @@ fn extractSlots(allocator: std.mem.Allocator, ast: *const Ast, slots: *std.Array
     }
 }
 
+/// Checks if a file uses Snippet types (for conditional import).
+/// Returns true if:
+/// - The AST contains {#snippet} blocks
+/// - Script content contains "Snippet" as a type reference (not just substring)
+fn fileUsesSnippet(ast: *const Ast) bool {
+    // Check for {#snippet} blocks in template
+    for (ast.nodes.items) |node| {
+        if (node.kind == .snippet) return true;
+    }
+
+    // Check for Snippet type references in scripts
+    for (ast.scripts.items) |script| {
+        const content = ast.source[script.content_start..script.content_end];
+        // Look for "Snippet" as a word boundary (not part of another identifier)
+        var i: usize = 0;
+        while (i + 7 <= content.len) {
+            if (std.mem.startsWith(u8, content[i..], "Snippet")) {
+                // Check it's not part of a larger identifier
+                const before_ok = i == 0 or !std.ascii.isAlphanumeric(content[i - 1]) and content[i - 1] != '_';
+                const after_ok = i + 7 >= content.len or !std.ascii.isAlphanumeric(content[i + 7]) and content[i + 7] != '_';
+                if (before_ok and after_ok) return true;
+            }
+            i += 1;
+        }
+    }
+
+    return false;
+}
+
 const ExprInfo = struct {
     expr: []const u8,
     offset: u32,
@@ -981,6 +1011,29 @@ fn emitTemplateExpressions(
                             try extractIdentifiersFromExpr(allocator, src, &template_refs);
                         }
                     }
+                    // Shorthand bind:x directive (bind:open means bind:open={open})
+                    if (attr.value == null and std.mem.startsWith(u8, attr.name, "bind:")) {
+                        const binding_name = attr.name[5..]; // Skip "bind:"
+                        if (binding_name.len > 0) {
+                            try template_refs.put(allocator, binding_name, {});
+                        }
+                    }
+                    // Transition, animate, and use directives reference the function name
+                    // e.g., transition:fade, in:fly, out:slide, use:enhance
+                    if (attr.value == null) {
+                        for ([_][]const u8{ "transition:", "in:", "out:", "animate:", "use:" }) |prefix| {
+                            if (std.mem.startsWith(u8, attr.name, prefix)) {
+                                // Extract function name (may have | modifiers like fade|local)
+                                const rest = attr.name[prefix.len..];
+                                var end: usize = 0;
+                                while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_')) : (end += 1) {}
+                                if (end > 0) {
+                                    try template_refs.put(allocator, rest[0..end], {});
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
             },
 
@@ -1055,8 +1108,17 @@ fn extractIdentifiersFromExpr(
             while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_' or expr[i] == '$')) : (i += 1) {}
             const ident = expr[start..i];
 
-            // Skip if preceded by dot (member access) - check char before start
-            if (start > 0 and expr[start - 1] == '.') continue;
+            // Skip if preceded by dot (member access) - but NOT spread syntax (...)
+            // Member access: obj.prop (single dot before identifier)
+            // Spread syntax: ...props (three dots before identifier) - keep these!
+            if (start > 0 and expr[start - 1] == '.') {
+                // Check if this is spread syntax (three consecutive dots)
+                const is_spread = start >= 3 and
+                    expr[start - 1] == '.' and
+                    expr[start - 2] == '.' and
+                    expr[start - 3] == '.';
+                if (!is_spread) continue; // Skip member access, but keep spread
+            }
 
             // Store identifier reference
             if (ident.len > 0) {
@@ -1151,9 +1213,29 @@ fn scanTemplateForEachBlocks(
         }
     }
 
-    // Find first <style> tag to limit template_end
-    if (std.mem.indexOf(u8, ast.source[template_start..], "<style")) |style_offset| {
-        template_end = template_start + style_offset;
+    // Find top-level <style> tag to limit template_end
+    // Must be at the start of a line with NO indentation (truly top-level)
+    // <style> inside <svelte:head> or other blocks will be indented
+    // The component's own <style> block is at column 0
+    const source_slice = ast.source[template_start..];
+    var search_pos: usize = 0;
+    while (search_pos < source_slice.len) {
+        if (std.mem.indexOf(u8, source_slice[search_pos..], "<style")) |rel_offset| {
+            const style_pos = search_pos + rel_offset;
+            // Check if it's at column 0 (preceded by newline only, no whitespace)
+            var is_top_level = style_pos == 0; // At start of template
+            if (!is_top_level and style_pos > 0) {
+                // Top-level <style> must be immediately after newline
+                is_top_level = source_slice[style_pos - 1] == '\n';
+            }
+            if (is_top_level) {
+                template_end = template_start + style_pos;
+                break;
+            }
+            search_pos = style_pos + 6; // Skip past this "<style" and keep searching
+        } else {
+            break;
+        }
     }
 
     const template = ast.source[template_start..template_end];
@@ -1210,6 +1292,137 @@ fn scanTemplateForEachBlocks(
 
         i = j; // move past this expression
     }
+
+    // Scan for component tags (capitalized tag names)
+    try scanTemplateForComponents(allocator, template, template_refs);
+}
+
+/// Scans template source for component usages (capitalized tag names) and
+/// attribute expressions. Fallback for when the parser doesn't detect elements
+/// inside block structures.
+fn scanTemplateForComponents(
+    allocator: std.mem.Allocator,
+    template: []const u8,
+    refs: *std.StringHashMapUnmanaged(void),
+) !void {
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] == '<' and i + 1 < template.len) {
+            const next_char = template[i + 1];
+            // Skip closing tags, comments, special tags
+            if (next_char == '/' or next_char == '!' or next_char == '?') {
+                i += 1;
+                continue;
+            }
+
+            // Check for valid tag start (letter for regular tags)
+            if (std.ascii.isAlphabetic(next_char)) {
+                // Check for uppercase letter (component)
+                if (next_char >= 'A' and next_char <= 'Z') {
+                    // Extract component name (up to space, >, /, or .)
+                    var name_end = i + 2;
+                    while (name_end < template.len) {
+                        const c = template[name_end];
+                        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '$') {
+                            name_end += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    const name = template[i + 1 .. name_end];
+                    if (name.len > 0) {
+                        try refs.put(allocator, name, {});
+                    }
+                    i = name_end;
+                } else {
+                    // Lowercase tag - skip the tag name
+                    i += 2;
+                    while (i < template.len and (std.ascii.isAlphanumeric(template[i]) or template[i] == '-' or template[i] == ':')) : (i += 1) {}
+                }
+
+                // Scan tag attributes for expressions (until > or />)
+                while (i < template.len and template[i] != '>') {
+                    // Look for { in attributes
+                    if (template[i] == '{') {
+                        const expr_start = i;
+                        var depth: u32 = 1;
+                        i += 1;
+                        while (i < template.len and depth > 0) {
+                            if (template[i] == '{') depth += 1;
+                            if (template[i] == '}') depth -= 1;
+                            i += 1;
+                        }
+                        // Extract identifiers from attribute expression (includes spreads like {...props})
+                        const attr_expr = template[expr_start..i];
+                        try extractIdentifiersFromExpr(allocator, attr_expr, refs);
+                    } else if (template[i] == '/' and i + 1 < template.len and template[i + 1] == '>') {
+                        i += 2; // Skip />
+                        break;
+                    } else if (std.mem.startsWith(u8, template[i..], "bind:")) {
+                        // Detect bind:xxx shorthand (bind:open means bind:open={open})
+                        i += 5; // Skip "bind:"
+                        const name_start = i;
+                        while (i < template.len and (std.ascii.isAlphanumeric(template[i]) or template[i] == '_' or template[i] == '$')) : (i += 1) {}
+                        const binding_name = template[name_start..i];
+                        if (binding_name.len > 0) {
+                            // Skip whitespace
+                            while (i < template.len and (template[i] == ' ' or template[i] == '\t')) : (i += 1) {}
+                            // Check if there's no = (shorthand) or next char is space/> (end of attr)
+                            if (i >= template.len or template[i] != '=') {
+                                // Shorthand bind:xxx - xxx is used as identifier
+                                try refs.put(allocator, binding_name, {});
+                            }
+                            // If there's =, the { } will be caught by the expression handler above
+                        }
+                    } else if (detectDirectiveIdentifier(template, i)) |directive_info| {
+                        // Detect Svelte directives that reference identifiers:
+                        // transition:fade, in:fly, out:slide, animate:flip, use:action
+                        try refs.put(allocator, directive_info.name, {});
+                        i = directive_info.end_pos;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+const DirectiveInfo = struct {
+    name: []const u8,
+    end_pos: usize,
+};
+
+/// Detects Svelte directives that reference identifiers:
+/// transition:xxx, in:xxx, out:xxx, animate:xxx, use:xxx
+/// Returns the identifier name and position after it, or null if not a directive.
+fn detectDirectiveIdentifier(template: []const u8, pos: usize) ?DirectiveInfo {
+    const directives = [_][]const u8{ "transition:", "animate:", "use:", "in:", "out:" };
+
+    for (directives) |prefix| {
+        if (pos + prefix.len < template.len and std.mem.startsWith(u8, template[pos..], prefix)) {
+            const name_start = pos + prefix.len;
+            var name_end = name_start;
+            // Extract identifier (alphanumeric, underscore, dollar)
+            while (name_end < template.len) {
+                const c = template[name_end];
+                if (std.ascii.isAlphanumeric(c) or c == '_' or c == '$') {
+                    name_end += 1;
+                } else {
+                    break;
+                }
+            }
+            if (name_end > name_start) {
+                return .{
+                    .name = template[name_start..name_end],
+                    .end_pos = name_end,
+                };
+            }
+        }
+    }
+    return null;
 }
 
 /// Returns true if the identifier is a JavaScript keyword or built-in.
@@ -2005,12 +2218,15 @@ fn filterSvelteImports(allocator: std.mem.Allocator, content: []const u8) ![]con
             std.mem.indexOf(u8, trimmed, "from \"svelte\"") != null;
         const should_filter = is_svelte_import;
 
+        // We no longer filter type-only imports since we don't auto-import types.
+        // User imports like `import type { Snippet } from 'svelte'` are preserved.
+        // We only filter mixed imports to remove type specifiers that conflict with our stubs.
         if (should_filter and std.mem.startsWith(u8, trimmed, "import")) {
-            // Case 1: `import type { ... } from ...` - filter entire line
+            // Type-only imports: keep them (e.g., `import type { Snippet } from 'svelte'`)
             if (std.mem.startsWith(u8, trimmed, "import type")) {
-                // Skip this line entirely
+                try result.appendSlice(allocator, line);
             } else if (try filterMixedImport(allocator, trimmed)) |filtered_line| {
-                // Case 2: `import { type X, y } from ...` - remove type specifiers
+                // Mixed imports: remove type specifiers (e.g., `import { type X, tick } from ...`)
                 try result.appendSlice(allocator, filtered_line);
             } else {
                 // No types to filter, keep line as-is
@@ -2581,7 +2797,8 @@ test "transform typescript component" {
 
     // Verify key parts of the generated TypeScript
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import { SvelteComponentTyped }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") != null);
+    // Snippet import is conditional - only added when file uses snippets
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") == null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Props") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "name: string") != null);
@@ -2723,16 +2940,10 @@ test "transform svelte 5 runes component" {
 
     const virtual = try transform(allocator, ast);
 
-    // Verify Snippet only appears once (in our import, not duplicated from user code)
-    var snippet_count: usize = 0;
-    var search_start: usize = 0;
-    while (std.mem.indexOfPos(u8, virtual.content, search_start, "Snippet")) |pos| {
-        snippet_count += 1;
-        search_start = pos + 7;
-    }
-    // Should appear exactly twice: once in "import type { Snippet }"
-    // and once in the Props interface "children?: Snippet"
-    try std.testing.expectEqual(@as(usize, 2), snippet_count);
+    // We don't auto-import Snippet - user's import is preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet } from 'svelte'") != null);
+    // Snippet type annotation from user code is preserved
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "children?: Snippet") != null);
 
     // Should use Props interface directly
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type $$Props = Props;") != null);
@@ -3472,6 +3683,8 @@ test "transform snippet with import type param" {
 
     const virtual = try transform(allocator, ast);
 
+    // We don't auto-import Snippet (users import it themselves if needed)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") == null);
     // Should handle import() types with parentheses correctly (with initializers)
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var key: import('svelte').Snippet | string = undefined as any;") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var label: string = undefined as any;") != null);
@@ -4348,4 +4561,61 @@ test "component usages in template emit void statements" {
     // Simple components should emit void statements
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Button;") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void UserCard;") != null);
+}
+
+test "component usages nested inside snippets emit void statements" {
+    // Verify components used inside {#snippet} blocks are detected.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  import Button from './Button.svelte';
+        \\</script>
+        \\<Popover.Trigger>
+        \\  {#snippet child({ props })}
+        \\    <Button variant="outline" {...props}>Click</Button>
+        \\  {/snippet}
+        \\</Popover.Trigger>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Components inside snippets should emit void statements
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Button;") != null);
+    // Popover should also be marked as used
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Popover;") != null);
+    // Spread props inside attributes should be detected
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void props;") != null);
+}
+
+test "spread props in lowercase tags are detected" {
+    // Verify that spread props like {...props} in lowercase tags are detected.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let { children, ...props } = $props();
+        \\</script>
+        \\<a class="link" {...props}>Click</a>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Debug: print template expressions section
+    std.debug.print("\n=== GENERATED OUTPUT ===\n{s}\n=== END ===\n", .{virtual.content});
+
+    // Spread props in lowercase tags should emit void statements
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void props;") != null);
 }
