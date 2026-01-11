@@ -1189,6 +1189,26 @@ fn skipStringLiteral(expr: []const u8, start: usize) usize {
     return i;
 }
 
+/// Finds the position after the matching closing brace, starting from the position
+/// after an opening brace. Properly handles nested braces and skips over string
+/// literals (single, double, and template) to avoid counting braces inside strings.
+fn findMatchingCloseBrace(template: []const u8, start: usize) usize {
+    var depth: u32 = 1;
+    var i = start;
+    while (i < template.len and depth > 0) {
+        const c = template[i];
+        // Skip string literals - braces inside strings shouldn't affect depth
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipStringLiteral(template, i);
+            continue;
+        }
+        if (c == '{') depth += 1;
+        if (c == '}') depth -= 1;
+        i += 1;
+    }
+    return i;
+}
+
 /// Scans template source directly for template expressions not captured by AST nodes.
 /// This is a fallback for when the parser misses expressions inside component elements.
 fn scanTemplateForEachBlocks(
@@ -1250,14 +1270,8 @@ fn scanTemplateForEachBlocks(
 
         const expr_start = i;
 
-        // Find matching closing brace, respecting nesting
-        var depth: u32 = 1;
-        var j = i + 1;
-        while (j < template.len and depth > 0) {
-            if (template[j] == '{') depth += 1;
-            if (template[j] == '}') depth -= 1;
-            j += 1;
-        }
+        // Find matching closing brace, respecting nesting and string literals
+        const j = findMatchingCloseBrace(template, i + 1);
 
         const full_expr = template[expr_start..j];
 
@@ -1345,13 +1359,8 @@ fn scanTemplateForComponents(
                     // Look for { in attributes
                     if (template[i] == '{') {
                         const expr_start = i;
-                        var depth: u32 = 1;
-                        i += 1;
-                        while (i < template.len and depth > 0) {
-                            if (template[i] == '{') depth += 1;
-                            if (template[i] == '}') depth -= 1;
-                            i += 1;
-                        }
+                        // Find matching brace, skipping strings to handle braces in string content
+                        i = findMatchingCloseBrace(template, i + 1);
                         // Extract identifiers from attribute expression (includes spreads like {...props})
                         const attr_expr = template[expr_start..i];
                         try extractIdentifiersFromExpr(allocator, attr_expr, refs);
@@ -4736,4 +4745,37 @@ test "each block with spread of nullable array emits null-safe fallback" {
 
     // The spread should be wrapped with ?? [] for null safety: [...(items ?? [])]
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "[...(items ?? [])]") != null);
+}
+
+test "braces inside string literals in attribute expressions are not counted" {
+    // Regression test: When scanning attribute expressions like {...toolCallProps({...})},
+    // braces inside string literals (e.g., '{ foo }') must not affect brace depth counting.
+    // This was causing spurious identifier extraction from HTML text content.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // The expression contains a string with unbalanced-looking braces: '{ foo'
+    // If we incorrectly count these braces, we'd exit the expression early and
+    // treat subsequent text as identifiers.
+    const source =
+        \\<script lang="ts">
+        \\  function getProps() { return { str: '{ unclosed' }; }
+        \\</script>
+        \\<Component {...getProps()} />
+        \\<h4>Diff text should not be extracted</h4>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // "Diff" from the <h4> text should NOT appear as a void statement
+    // (it's plain text content, not an identifier reference)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Diff;") == null);
+
+    // "getProps" should appear since it's used in the expression
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void getProps;") != null);
 }
