@@ -497,6 +497,17 @@ fn extractPropsRune(allocator: std.mem.Allocator, content: []const u8, props: *s
                 is_bindable = true;
                 i += 9;
                 i = skipWhitespace(content, i);
+                // Skip generic type parameter <...> if present (e.g., $bindable<T>(...))
+                if (i < content.len and content[i] == '<') {
+                    var angle_depth: u32 = 1;
+                    i += 1;
+                    while (i < content.len and angle_depth > 0) {
+                        if (content[i] == '<') angle_depth += 1;
+                        if (content[i] == '>') angle_depth -= 1;
+                        i += 1;
+                    }
+                    i = skipWhitespace(content, i);
+                }
                 // Skip the $bindable(...) call
                 if (i < content.len and content[i] == '(') {
                     var paren_depth: u32 = 1;
