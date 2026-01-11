@@ -776,6 +776,14 @@ fn shouldSkipSvelteTypeError(message: []const u8) bool {
         return true;
     }
 
+    // Skip "Conversion of type X to type Y may be a mistake" errors
+    // These are tsgo-specific false positives for type assertions that tsc allows.
+    // Common in test/storybook files where mock data uses simplified keys like
+    // 'thread-1' instead of full UUID template literals like 'T-${string}-...'
+    if (std.mem.indexOf(u8, message, "may be a mistake because neither type sufficiently overlaps") != null) {
+        return true;
+    }
+
     return false;
 }
 
