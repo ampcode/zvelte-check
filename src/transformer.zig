@@ -5225,11 +5225,12 @@ test "spread props in lowercase tags are detected" {
 
     const virtual = try transform(allocator, ast);
 
-    // Debug: print template expressions section
-    std.debug.print("\n=== GENERATED OUTPUT ===\n{s}\n=== END ===\n", .{virtual.content});
-
     // Spread props in lowercase tags should emit void statements
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void props;") != null);
+    const found = std.mem.indexOf(u8, virtual.content, "void props;") != null;
+    if (!found) {
+        std.debug.print("\n=== GENERATED OUTPUT ===\n{s}\n=== END ===\n", .{virtual.content});
+    }
+    try std.testing.expect(found);
 }
 
 test "each block with nullable iterable emits null-safe fallback" {
@@ -5282,11 +5283,12 @@ test "each block with spread of nullable array emits null-safe fallback" {
 
     const virtual = try transform(allocator, ast);
 
-    // Debug output
-    std.debug.print("\n=== GENERATED OUTPUT ===\n{s}\n=== END ===\n", .{virtual.content});
-
     // The spread should be wrapped with ?? [] for null safety: [...(items ?? [])]
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "[...(items ?? [])]") != null);
+    const found = std.mem.indexOf(u8, virtual.content, "[...(items ?? [])]") != null;
+    if (!found) {
+        std.debug.print("\n=== GENERATED OUTPUT ===\n{s}\n=== END ===\n", .{virtual.content});
+    }
+    try std.testing.expect(found);
 }
 
 test "identifier in attribute expression is marked as used" {

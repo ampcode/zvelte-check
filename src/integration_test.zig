@@ -608,15 +608,13 @@ test "svelte-check comparison: basic fixtures" {
 
     const result = try compareToolOutputs(arena.allocator(), fixture_path);
 
-    std.debug.print("\nComparison results:\n", .{});
-    std.debug.print("  Matching: {d}\n", .{result.matching});
-    std.debug.print("  False positives: {d}\n", .{result.false_positives});
-    std.debug.print("  False negatives: {d}\n", .{result.false_negatives});
-
-    // For now, just report - don't fail on differences
-    // TODO: Enable strict comparison once all false positives are fixed
+    // Only print results when there are differences (to keep test output clean)
     if (result.false_positives > 0 or result.false_negatives > 0) {
-        std.debug.print("\n  Note: Differences exist but test passes for now\n", .{});
+        std.debug.print("\nComparison results:\n", .{});
+        std.debug.print("  Matching: {d}\n", .{result.matching});
+        std.debug.print("  False positives: {d}\n", .{result.false_positives});
+        std.debug.print("  False negatives: {d}\n", .{result.false_negatives});
+        std.debug.print("  Note: Differences exist but test passes for now\n", .{});
     }
 }
 
