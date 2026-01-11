@@ -112,6 +112,21 @@ const foo = Type{ .field = value };     // Avoid
 
 **Bug fixes:** Always add a regression test when fixing a bug. The test should reproduce the original failure and verify the fix.
 
+## Regression Testing with Fixtures
+
+When encountering a bug or false positive/negative compared to svelte-check:
+
+1. **Create a minimal reproduction** in `test-fixtures/` with a `.svelte` file that isolates the issue
+2. **Run both tools** to confirm the discrepancy:
+   ```bash
+   ./zig-out/bin/zvelte-check --workspace test-fixtures
+   cd test-fixtures && pnpm exec svelte-check
+   ```
+3. **Fix the bug** in the transformer or parser
+4. **Verify parity** - both tools should now report the same errors (or lack thereof)
+
+This ensures we catch regressions and maintain compatibility with svelte-check.
+
 ## Safety Conventions
 
 Inspired by [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
