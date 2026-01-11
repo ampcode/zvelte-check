@@ -866,6 +866,14 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
+        // Skip "Argument of type 'unknown' is not assignable" errors
+        // These are cascade errors from missing type information (e.g., when ./$types
+        // can't be resolved). The type chain `any` -> `unknown` via generic inference
+        // produces these errors, but the root cause is already reported separately.
+        if (std.mem.indexOf(u8, message, "Argument of type 'unknown'") != null) {
+            return true;
+        }
+
         // Skip "Argument of type 'X | undefined' is not assignable to parameter of type 'Y'"
         // Same narrowing issue as above, but with undefined instead of null.
         if (std.mem.indexOf(u8, message, "| undefined' is not assignable to parameter of type") != null) {
