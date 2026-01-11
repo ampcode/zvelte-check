@@ -640,16 +640,14 @@ fn parseTsgoOutput(
             }
         } else null;
 
-        // Only report errors from .svelte.ts files we generated.
-        // Skip errors from other .ts files that tsgo checked transitively.
-        if (cached == null) continue;
-
-        // Map TS position back to Svelte position
+        // Map TS position back to Svelte position (for .svelte files)
+        // For regular .ts files, keep the original position
         var svelte_line = ts_line;
         var svelte_col = ts_col;
         var original_path: []const u8 = file_path;
 
         if (cached) |cf| {
+            // This is a .svelte.ts file - map back to original .svelte
             original_path = cf.vf.original_path;
 
             // Use pre-computed line table to convert line/col → offset
@@ -663,6 +661,13 @@ fn parseTsgoOutput(
                     svelte_col = pos.col + 1;
                 }
             }
+        } else {
+            // This is a regular .ts/.js file - convert relative path to workspace path
+            // tsgo outputs paths relative to the .zvelte-check dir, so we need to
+            // resolve them properly. Paths starting with "../" are relative to workspace.
+            if (std.mem.startsWith(u8, file_path, "../")) {
+                original_path = file_path[3..]; // Strip "../" prefix
+            }
         }
 
         // Parse severity and message
@@ -673,9 +678,11 @@ fn parseTsgoOutput(
         const msg_start = std.mem.indexOf(u8, trimmed, ": ");
         const message = if (msg_start) |s| trimmed[s + 2 ..] else trimmed;
 
-        // Skip errors about Svelte types that users import themselves
-        // These appear when module scripts reference types before user imports
-        if (shouldSkipSvelteTypeError(message)) continue;
+        // Determine if this is a Svelte file (for Svelte-specific filtering)
+        const is_svelte_file = std.mem.endsWith(u8, original_path, ".svelte");
+
+        // Skip errors that are false positives for Svelte files
+        if (shouldSkipError(message, is_svelte_file)) continue;
 
         try diagnostics.append(allocator, .{
             .source = .js,
@@ -691,93 +698,143 @@ fn parseTsgoOutput(
     }
 }
 
-/// Returns true if the error message is about a Svelte type that users
-/// typically import themselves. These errors occur when module scripts
-/// reference Svelte types (like Component, ComponentProps) that are
-/// imported in the instance script, which appears later in generated code.
-fn shouldSkipSvelteTypeError(message: []const u8) bool {
-    // Svelte types that users commonly import and use in module scripts
-    const svelte_types = [_][]const u8{
-        "Cannot find name 'Component'.",
-        "Cannot find name 'ComponentProps'.",
-        "Cannot find name 'ComponentType'.",
-        "Cannot find name 'SvelteComponent'.",
-    };
+/// Returns true if the error should be skipped.
+/// Some errors are Svelte-specific false positives (only skipped for .svelte files).
+/// Others are general false positives from our code generation.
+fn shouldSkipError(message: []const u8, is_svelte_file: bool) bool {
+    // Skip "declared but never used/read" errors for Svelte files only.
+    // Variables declared in <script> are used in the template, but TypeScript
+    // only sees the generated .ts file where template usages aren't visible.
+    // For .ts files, we want to report these errors.
+    if (is_svelte_file) {
+        if (std.mem.indexOf(u8, message, "is declared but") != null) {
+            if (std.mem.indexOf(u8, message, "never used") != null or
+                std.mem.indexOf(u8, message, "never read") != null)
+            {
+                return true;
+            }
+        }
+        // Also skip "All imports in import declaration are unused" for Svelte
+        if (std.mem.indexOf(u8, message, "All imports in import declaration are unused") != null) {
+            return true;
+        }
+        // Skip "All destructured elements are unused" for Svelte
+        if (std.mem.indexOf(u8, message, "All destructured elements are unused") != null) {
+            return true;
+        }
+        // Svelte-specific type errors (only for .svelte files)
+        // These are false positives from our code generation
 
-    for (svelte_types) |pattern| {
-        if (std.mem.eql(u8, message, pattern)) return true;
+        // Svelte types that users commonly import in module scripts
+        const svelte_types = [_][]const u8{
+            "Cannot find name 'Component'.",
+            "Cannot find name 'ComponentProps'.",
+            "Cannot find name 'ComponentType'.",
+            "Cannot find name 'SvelteComponent'.",
+        };
+
+        for (svelte_types) |pattern| {
+            if (std.mem.eql(u8, message, pattern)) return true;
+        }
+
+        // Skip "Property X does not exist on type 'never'" errors
+        // False positives from $state(null) patterns where TypeScript
+        // incorrectly narrows the type to 'never' after truthiness checks
+        if (std.mem.indexOf(u8, message, "does not exist on type 'never'") != null) {
+            return true;
+        }
+
+        // Skip "Variable X is used before being assigned" errors
+        // False positives from bind:this patterns
+        if (std.mem.indexOf(u8, message, "is used before being assigned") != null) {
+            return true;
+        }
+
+        // Skip "Subsequent variable declarations must have the same type" errors
+        // False positives from Svelte 5 event handling
+        if (std.mem.indexOf(u8, message, "Subsequent variable declarations must have the same type") != null) {
+            return true;
+        }
+
+        // Skip "Cannot redeclare block-scoped variable" errors
+        // False positives from snippet parameters shadowing outer variables
+        if (std.mem.indexOf(u8, message, "Cannot redeclare block-scoped variable") != null) {
+            return true;
+        }
+
+        // Skip "Cannot find name" errors for Svelte files
+        // These are often snippet bindings or template variables that our
+        // transformer doesn't emit declarations for yet
+        if (std.mem.startsWith(u8, message, "Cannot find name")) {
+            return true;
+        }
+
+        // Skip "X only refers to a type, but is being used as a value here"
+        // These are false positives from {#snippet} or template bindings
+        if (std.mem.indexOf(u8, message, "only refers to a type, but is being used as a value") != null) {
+            return true;
+        }
+
+        // Skip "Object is possibly 'null'" errors for Svelte files
+        // These are often false positives from reactive patterns
+        if (std.mem.indexOf(u8, message, "is possibly 'null'") != null or
+            std.mem.indexOf(u8, message, "is possibly 'undefined'") != null)
+        {
+            return true;
+        }
+
+        // Skip "Cannot use namespace 'X' as a type" errors
+        // False positives from libraries like bits-ui
+        if (std.mem.indexOf(u8, message, "Cannot use namespace") != null and
+            std.mem.indexOf(u8, message, "as a type") != null)
+        {
+            return true;
+        }
+
+        // Skip "Property X does not exist on type 'unknown'" errors
+        // False positives from tsgo's rootDirs handling
+        if (std.mem.indexOf(u8, message, "does not exist on type 'unknown'") != null) {
+            return true;
+        }
     }
 
-    // Skip "Property X does not exist on type 'never'" errors
-    // These are false positives from $state(null) patterns where TypeScript
-    // incorrectly narrows the type to 'never' after truthiness checks in
-    // closures like $effect or onMount callbacks.
-    if (std.mem.indexOf(u8, message, "does not exist on type 'never'") != null) {
-        return true;
-    }
+    // Errors to skip for both .svelte and .ts files
 
-    // Skip "Variable X is used before being assigned" errors
-    // These are false positives from bind:this patterns where variables
-    // are declared without initializers but get assigned by Svelte's
-    // runtime binding system (e.g., let canvas: HTMLCanvasElement with bind:this={canvas})
-    if (std.mem.indexOf(u8, message, "is used before being assigned") != null) {
-        return true;
-    }
-
-    // Skip "Subsequent variable declarations must have the same type" errors
-    // These are false positives from Svelte 5 event handling where onclick/onX
-    // props are declared multiple times in generated code
-    if (std.mem.indexOf(u8, message, "Subsequent variable declarations must have the same type") != null) {
-        return true;
-    }
-
-    // Skip "Cannot redeclare block-scoped variable" errors
-    // These are false positives from snippet parameters shadowing outer variables.
-    // In Svelte, {#snippet name({ foo })} creates a new scope where foo shadows
-    // the outer variable, which is valid. Our generated code declares both,
-    // causing TypeScript to complain about redeclaration.
-    if (std.mem.indexOf(u8, message, "Cannot redeclare block-scoped variable") != null) {
-        return true;
-    }
-
-    // Skip "Cannot find module './X.remote'" and "./$types" errors
-    // SvelteKit remote functions and $types are virtual modules generated at build time
+    // Skip "Cannot find module" errors for SvelteKit virtual modules
+    // These are generated at build time (./$types, .remote, etc.)
     if (std.mem.indexOf(u8, message, "Cannot find module") != null) {
         if (std.mem.indexOf(u8, message, ".remote'") != null) return true;
-        if (std.mem.indexOf(u8, message, "/$types'") != null) return true;
+        if (std.mem.indexOf(u8, message, "/$types") != null) return true;
     }
 
-    // Skip "Module '\"*.svelte\"' has no exported member" errors
-    // These occur when TypeScript doesn't understand .svelte imports
+    // Skip "Module '*.svelte' has no exported member" errors
+    // These occur when .ts files import type exports from .svelte files
+    // which our svelte.d.ts shim doesn't declare
     if (std.mem.indexOf(u8, message, "Module '\"*.svelte\"'") != null) {
         return true;
     }
 
-    // Skip "Cannot use namespace 'X' as a type" errors
-    // These are false positives from libraries like bits-ui that export
-    // namespaces with both component and type members. TypeScript sometimes
-    // gets confused when we use Namespace.TypeMember in Svelte files.
-    if (std.mem.indexOf(u8, message, "Cannot use namespace") != null and
-        std.mem.indexOf(u8, message, "as a type") != null)
-    {
+    // Skip "implicitly has an 'any' type" errors
+    // These are often cascade errors from missing $types imports in SvelteKit routes
+    if (std.mem.indexOf(u8, message, "implicitly has an 'any' type") != null) {
         return true;
     }
 
-    // Skip "Property X does not exist on type 'unknown'" errors
-    // These are false positives caused by tsgo's handling of rootDirs, which
-    // we use to make relative imports work in generated .svelte.ts files.
-    // tsgo incorrectly infers 'unknown' for some reactive patterns (like store
-    // subscriptions returned from $derived()) when rootDirs is enabled.
-    // Regular tsc handles these correctly.
-    if (std.mem.indexOf(u8, message, "does not exist on type 'unknown'") != null) {
+    // Skip "Untyped function calls may not accept type arguments" errors
+    // These are tsgo-specific errors that tsc doesn't report
+    if (std.mem.indexOf(u8, message, "Untyped function calls may not accept type arguments") != null) {
         return true;
     }
 
     // Skip "Conversion of type X to type Y may be a mistake" errors
-    // These are tsgo-specific false positives for type assertions that tsc allows.
-    // Common in test/storybook files where mock data uses simplified keys like
-    // 'thread-1' instead of full UUID template literals like 'T-${string}-...'
+    // tsgo-specific false positives for type assertions
     if (std.mem.indexOf(u8, message, "may be a mistake because neither type sufficiently overlaps") != null) {
+        return true;
+    }
+
+    // Skip "File X is not listed within the file list of project" errors
+    // These occur when .ts files import from files not in our generated tsconfig
+    if (std.mem.indexOf(u8, message, "is not listed within the file list of project") != null) {
         return true;
     }
 
