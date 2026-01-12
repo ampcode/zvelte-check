@@ -23,6 +23,7 @@ const ScriptData = @import("svelte_parser.zig").ScriptData;
 const ElementData = @import("svelte_parser.zig").ElementData;
 const SourceMap = @import("source_map.zig").SourceMap;
 const sveltekit = @import("sveltekit.zig");
+const Diagnostic = @import("diagnostic.zig").Diagnostic;
 
 pub const VirtualFile = struct {
     original_path: []const u8,
@@ -30,6 +31,8 @@ pub const VirtualFile = struct {
     content: []const u8,
     source_map: SourceMap,
     is_typescript: bool, // true if script has lang="ts"
+    /// Diagnostic for TS syntax in JS scripts (e.g., "Unexpected token" at first type annotation)
+    ts_syntax_diagnostic: ?Diagnostic = null,
 };
 
 const PropInfo = struct {
@@ -503,6 +506,53 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     const extension = if (is_typescript) ".ts" else ".js";
     const virtual_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ ast.file_path, extension });
 
+    // Detect TypeScript syntax in JavaScript scripts and emit "Unexpected token" diagnostic.
+    // svelte-check reports this at the first `:` or `as` position.
+    var ts_syntax_diagnostic: ?Diagnostic = null;
+    if (!is_typescript) {
+        // Check instance script for TS syntax
+        if (instance_script) |script| {
+            const content = ast.source[script.content_start..script.content_end];
+            if (findFirstTsSyntax(content)) |offset| {
+                // Convert offset in script content to position in source file
+                const source_offset = script.content_start + offset;
+                const pos = offsetToLineCol(ast.source, source_offset);
+                ts_syntax_diagnostic = .{
+                    .source = .js,
+                    .severity = .@"error",
+                    .code = null,
+                    .message = "Unexpected token",
+                    .file_path = ast.file_path,
+                    .start_line = pos.line,
+                    .start_col = pos.col,
+                    .end_line = pos.line,
+                    .end_col = pos.col,
+                };
+            }
+        }
+        // Check module script if no TS syntax found in instance script
+        if (ts_syntax_diagnostic == null) {
+            if (module_script) |script| {
+                const content = ast.source[script.content_start..script.content_end];
+                if (findFirstTsSyntax(content)) |offset| {
+                    const source_offset = script.content_start + offset;
+                    const pos = offsetToLineCol(ast.source, source_offset);
+                    ts_syntax_diagnostic = .{
+                        .source = .js,
+                        .severity = .@"error",
+                        .code = null,
+                        .message = "Unexpected token",
+                        .file_path = ast.file_path,
+                        .start_line = pos.line,
+                        .start_col = pos.col,
+                        .end_line = pos.line,
+                        .end_col = pos.col,
+                    };
+                }
+            }
+        }
+    }
+
     return .{
         .original_path = ast.file_path,
         .virtual_path = virtual_path,
@@ -512,6 +562,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             .svelte_source = ast.source,
         },
         .is_typescript = is_typescript,
+        .ts_syntax_diagnostic = ts_syntax_diagnostic,
     };
 }
 
@@ -3470,6 +3521,24 @@ fn isIdentChar(c: u8) bool {
     return isIdentStart(c) or (c >= '0' and c <= '9');
 }
 
+/// Convert byte offset to 1-based line and column numbers
+fn offsetToLineCol(source: []const u8, offset: usize) struct { line: u32, col: u32 } {
+    var line: u32 = 1;
+    var col: u32 = 1;
+    var i: usize = 0;
+
+    while (i < source.len and i < offset) : (i += 1) {
+        if (source[i] == '\n') {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+
+    return .{ .line = line, .col = col };
+}
+
 /// Filters out `import type ... from 'svelte'` statements from script content
 /// to avoid duplicate identifier errors with our injected type imports.
 /// Preserves regular imports (onMount, onDestroy, tick, etc.) from svelte.
@@ -6287,4 +6356,185 @@ test "JS Svelte files with undefined identifiers in $props defaults" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let { a, b = true, g = foo } = $props();") != null);
     // This is a JavaScript file, so is_typescript should be false
     try std.testing.expect(!virtual.is_typescript);
+}
+
+/// Detect the first TypeScript syntax in a JavaScript script.
+/// Returns the offset (within the script content) where TypeScript syntax was found.
+/// Used to emit "Unexpected token" diagnostic for JS scripts with TS syntax.
+///
+/// Detects:
+/// - Type annotations: `let x: Type` - returns position of `:`
+/// - Type assertions: `value as Type` - returns position of `as`
+fn findFirstTsSyntax(content: []const u8) ?usize {
+    var i: usize = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        // Skip comments
+        if (i + 1 < content.len and c == '/' and content[i + 1] == '/') {
+            while (i < content.len and content[i] != '\n') : (i += 1) {}
+            continue;
+        }
+        if (i + 1 < content.len and c == '/' and content[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < content.len) {
+                if (content[i] == '*' and content[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Check for type annotation: colon after identifier (but not in ternary or object literal)
+        // Pattern: identifier : Type (in let/const/param context)
+        if (c == ':') {
+            // Look back to see if this is after an identifier (type annotation context)
+            if (isTypeAnnotationColon(content, i)) {
+                return i;
+            }
+        }
+
+        // Check for type assertion: `as` keyword followed by type
+        // Must be after an expression, not part of import
+        if (startsWithKeyword(content[i..], "as") and i > 0) {
+            // Make sure it's not `import { x as y }` or `export { x as y }` pattern
+            if (!isImportAsContext(content, i)) {
+                return i;
+            }
+        }
+
+        i += 1;
+    }
+
+    return null;
+}
+
+/// Check if a colon at position `pos` is a type annotation rather than object literal key or ternary
+fn isTypeAnnotationColon(content: []const u8, pos: usize) bool {
+    if (pos == 0) return false;
+
+    // Scan back past optional whitespace
+    var j = pos - 1;
+    while (j > 0 and (content[j] == ' ' or content[j] == '\t')) : (j -= 1) {}
+
+    // Must be after an identifier
+    if (!isIdentChar(content[j])) return false;
+
+    // Scan back to find start of identifier
+    const ident_end = j + 1;
+    while (j > 0 and isIdentChar(content[j - 1])) : (j -= 1) {}
+    const ident_start = j;
+
+    // Now look for preceding context
+    // Scan back past whitespace (but NOT newlines - those we want to detect)
+    var k = ident_start;
+    while (k > 0 and (content[k - 1] == ' ' or content[k - 1] == '\t')) : (k -= 1) {}
+
+    // Check what's before the identifier
+    if (k == 0) {
+        // At start of content, check if line starts with let/const/var
+        return isVarDeclarationLine(content[0..ident_end]);
+    }
+
+    const prev_char = content[k - 1];
+
+    // Definitely not type annotation: object literal key `{key:` or ternary `? :`
+    if (prev_char == '?') return false;
+
+    // After `=` could be a cast: `let x = value: Type` - but that's not valid TS either
+    // More likely we're in object literal `{key: value}` if prev is `{` or `,`
+    if (prev_char == '{') return false;
+
+    // After `,` could be object literal or variable list - check for var keyword
+    if (prev_char == ',') {
+        return hasVarKeywordBefore(content, k);
+    }
+
+    // After `(` could be function param
+    if (prev_char == '(') return true;
+
+    // After newline - check if current line is a variable declaration
+    if (prev_char == '\n') {
+        // Find the line and check if it starts with let/const/var
+        const line_content = content[k..ident_end];
+        return isVarDeclarationLine(line_content);
+    }
+
+    // Check if directly preceded by let/const/var keyword
+    // At this point, k points to the space AFTER let/const/var (we scanned back past whitespace)
+    // So content[k] is that space, and content[k-3..k] should be "let" or "var"
+    // Or content[k-5..k] should be "const"
+    if (k >= 3 and k < content.len and content[k] == ' ') {
+        if (std.mem.eql(u8, content[k - 3 .. k], "let")) return true;
+        if (std.mem.eql(u8, content[k - 3 .. k], "var")) return true;
+    }
+    if (k >= 5 and k < content.len and content[k] == ' ') {
+        if (std.mem.eql(u8, content[k - 5 .. k], "const")) return true;
+    }
+
+    // Otherwise, assume it's an object literal key
+    return false;
+}
+
+/// Check if content starts with let/const/var (possibly with leading whitespace)
+fn isVarDeclarationLine(content: []const u8) bool {
+    var i: usize = 0;
+    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
+
+    if (startsWithKeyword(content[i..], "let")) return true;
+    if (startsWithKeyword(content[i..], "const")) return true;
+    if (startsWithKeyword(content[i..], "var")) return true;
+    return false;
+}
+
+/// Look backwards from position to find if there's a let/const/var on the same statement
+fn hasVarKeywordBefore(content: []const u8, pos: usize) bool {
+    // Simple heuristic: look for let/const/var with no semicolon between
+    var search_start: usize = 0;
+    if (pos >= 100) search_start = pos - 100;
+
+    const context = content[search_start..pos];
+
+    // Find last semicolon or newline (statement boundary)
+    var boundary: usize = 0;
+    for (context, 0..) |ch, idx| {
+        if (ch == ';' or ch == '\n') boundary = idx + 1;
+    }
+
+    // Now check if the segment after boundary starts with let/const/var
+    const stmt = std.mem.trimLeft(u8, context[boundary..], " \t");
+    return std.mem.startsWith(u8, stmt, "let ") or
+        std.mem.startsWith(u8, stmt, "const ") or
+        std.mem.startsWith(u8, stmt, "var ");
+}
+
+/// Check if `as` at position is part of import/export renaming (not type assertion)
+fn isImportAsContext(content: []const u8, pos: usize) bool {
+    // Look for import or export before this position
+    var search_start: usize = 0;
+    if (pos >= 200) search_start = pos - 200;
+
+    const context = content[search_start..pos];
+
+    // Find the last statement boundary (newline or semicolon)
+    var i: usize = context.len;
+    while (i > 0) {
+        i -= 1;
+        if (context[i] == ';') break;
+        if (context[i] == '\n') break;
+    }
+
+    const stmt = std.mem.trim(u8, context[i..], " \t\n\r");
+
+    // If statement starts with import or export, this is renaming context
+    return std.mem.startsWith(u8, stmt, "import") or std.mem.startsWith(u8, stmt, "export");
 }

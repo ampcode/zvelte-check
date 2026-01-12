@@ -297,6 +297,11 @@ fn processFileInner(ctx: *ProcessContext, file_path: []const u8, index: usize) !
     // Transform to TS
     const virtual = try transformer.transform(allocator, ast);
 
+    // Include diagnostic for TypeScript syntax in JavaScript scripts (e.g., "Unexpected token")
+    if (virtual.ts_syntax_diagnostic) |diag| {
+        try diag_list.append(allocator, diag);
+    }
+
     // Store result (no lock needed - each thread writes to unique index)
     ctx.results[index] = .{
         .virtual_file = virtual,
