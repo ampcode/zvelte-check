@@ -854,16 +854,29 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Property X does not exist on type Y" errors in Svelte templates
-        // False positives from template control flow narrowing (e.g., {#if} blocks)
-        // that our transformer doesn't preserve. Examples:
-        // - "Property 'brand' does not exist on type '{ brand: string } | undefined'" (nullable narrowing)
-        // - "Property 'paidData' does not exist on type 'FreeProps | PaidProps'" (discriminated union)
-        // - "Property 'fileChanges' does not exist on type 'ThreadWorkerStatus'" (state narrowing)
-        // Svelte's template type-checking preserves narrowing from {#if}/{:else} blocks,
+        // Skip "Property X does not exist on type Y" errors from template narrowing.
+        // False positives from {#if}/{:else} blocks that narrow union types,
         // but our transformer emits @const bindings at module scope without that context.
+        // Examples (all involve unions, which contain '|'):
+        // - "Property 'brand' does not exist on type '{ brand: string } | undefined'"
+        // - "Property 'paidData' does not exist on type 'FreeProps | PaidProps'"
+        // Only skip when the type involves a union - simple types like '{}' are real errors.
         if (std.mem.indexOf(u8, message, "does not exist on type '") != null) {
-            return true;
+            // Extract the type from the message and check if it's a union type
+            // Real errors like "...does not exist on type '{}'." should NOT be skipped
+            const type_start = std.mem.indexOf(u8, message, "does not exist on type '");
+            if (type_start) |start| {
+                const type_content = message[start + "does not exist on type '".len ..];
+                // Skip if the type contains '|' (union type from narrowing)
+                if (std.mem.indexOf(u8, type_content, " | ") != null) {
+                    return true;
+                }
+                // Skip if the type is '$$Props' - our generated type may be incomplete
+                // (e.g., when using JSDoc instead of TypeScript type annotations)
+                if (std.mem.startsWith(u8, type_content, "$$Props'.")) {
+                    return true;
+                }
+            }
         }
 
         // Skip "Argument of type 'X | null' is not assignable to parameter of type 'Y'"

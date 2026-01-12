@@ -107,6 +107,9 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         \\  function root(fn: () => void | (() => void)): () => void;
         \\}
         \\declare function $props<T = $$Props>(): T;
+        \\declare namespace $props {
+        \\  function id(): string;
+        \\}
         \\declare function $bindable<T>(initial?: T): T;
         \\declare function $inspect<T>(...values: T[]): { with: (fn: (type: 'init' | 'update', ...values: T[]) => void) => void };
         \\declare function $host<T extends HTMLElement>(): T;
@@ -5405,4 +5408,33 @@ test "keyed each with destructured key emits void for key expression" {
 
     // The key expression should be emitted as void (key)
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void (key);") != null);
+}
+
+test "regression: destructuring from empty object is preserved for type-checking" {
+    // Regression test for ts-runes-hoistable-props-false-7.v5 conformance sample.
+    // When destructuring from an empty object `{}`, TypeScript should report an error
+    // like "Property 'destructured' does not exist on type '{}'.".
+    // The generated TypeScript must preserve the original code so tsgo can detect this.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\    let { destructured } = {};
+        \\    type Props = {
+        \\        prop: typeof destructured;
+        \\    };
+        \\    let { prop }: Props = $props();
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "input.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // The user's destructuring statement must be preserved for TypeScript to type-check
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let { destructured } = {};") != null);
 }
