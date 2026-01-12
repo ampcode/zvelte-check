@@ -193,11 +193,14 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
 
     // 5. Run tsgo (skip when js diagnostics disabled or --no-tsconfig)
     if (!args.no_tsconfig and args.diagnostic_sources.js) {
-        // Collect JavaScript files (not TypeScript) with fatal Svelte errors.
-        // For JS files with experimental_async errors, the generated TS is invalid
-        // and produces spurious type errors. svelte-check only reports the Svelte error
-        // for JS files, but reports both Svelte and TS errors for TypeScript files.
-        var js_files_with_fatal_errors: std.StringHashMapUnmanaged(void) = .empty;
+        // Collect files with fatal Svelte errors that should suppress TS diagnostics.
+        // - For JS files with experimental_async errors, the generated TS is invalid
+        //   and produces spurious type errors. svelte-check only reports the Svelte error
+        //   for JS files, but reports both Svelte and TS errors for TypeScript files.
+        // - For files with unsupported_ts_feature errors (like enums), TS produces
+        //   confusing errors because the code requires preprocessing. Suppress all TS
+        //   errors and only report the Svelte diagnostic.
+        var files_to_suppress_ts: std.StringHashMapUnmanaged(void) = .empty;
         for (all_diagnostics.items) |d| {
             if (d.source == .svelte and d.severity == .@"error") {
                 if (d.code) |code| {
@@ -206,11 +209,15 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
                         for (virtual_files.items) |vf| {
                             if (std.mem.eql(u8, vf.original_path, d.file_path)) {
                                 if (!vf.is_typescript) {
-                                    try js_files_with_fatal_errors.put(allocator, d.file_path, {});
+                                    try files_to_suppress_ts.put(allocator, d.file_path, {});
                                 }
                                 break;
                             }
                         }
+                    } else if (std.mem.eql(u8, code, "unsupported_ts_feature")) {
+                        // Unsupported TS features like enums produce confusing TS errors
+                        // Suppress all TS errors for these files (matches svelte-check)
+                        try files_to_suppress_ts.put(allocator, d.file_path, {});
                     }
                 }
             }
@@ -229,9 +236,8 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
         };
 
         for (ts_diagnostics) |d| {
-            // Skip TS errors for JavaScript files with fatal Svelte errors
-            // (TypeScript files report both Svelte and TS errors)
-            if (js_files_with_fatal_errors.contains(d.file_path)) continue;
+            // Skip TS errors for files with fatal Svelte errors
+            if (files_to_suppress_ts.contains(d.file_path)) continue;
             try all_diagnostics.append(allocator, d);
         }
     }

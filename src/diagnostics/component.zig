@@ -5,6 +5,7 @@
 //! - invalid-rune-usage: Rune calls ($state, $derived, etc.) in template expressions
 //! - unused-export-let: Exported props not used in the template
 //! - slot_element_deprecated: <slot> elements (use {@render} in Svelte 5)
+//! - unsupported_ts_feature: TypeScript features like enums that aren't natively supported
 
 const std = @import("std");
 const Ast = @import("../svelte_parser.zig").Ast;
@@ -35,6 +36,8 @@ const RUNES = [_][]const u8{
 
 const EXPERIMENTAL_ASYNC_ERROR = "Cannot use `await` in deriveds and template expressions, or at the top level of a component, unless the `experimental.async` compiler option is `true`";
 
+const UNSUPPORTED_TS_FEATURE_ERROR = "TypeScript language features like enums are not natively supported, and their use is generally discouraged. Outside of `<script>` tags, these features are not supported. For use within `<script>` tags, you will need to use a preprocessor to convert it to JavaScript before it gets passed to the Svelte compiler. If you are using `vitePreprocess`, make sure to specifically enable preprocessing script tags (`vitePreprocess({ script: true })`)";
+
 const ExportLet = struct {
     name: []const u8,
     offset: u32, // Position in source for error reporting
@@ -50,6 +53,7 @@ pub fn runDiagnostics(
     try checkUnusedExportLet(allocator, ast, diagnostics);
     try checkSlotDeprecation(allocator, ast, diagnostics);
     try checkNonHoistableDeclarations(allocator, ast, diagnostics);
+    try checkUnsupportedTsFeatures(allocator, ast, diagnostics);
 }
 
 /// Detects await usage where experimental_async is required.
@@ -504,6 +508,87 @@ fn checkNonHoistableDeclarations(
         // Scan for namespace/enum declarations at top level
         try scanNonHoistableDeclarations(allocator, script_content, script.content_start, ast.source, ast.file_path, diagnostics);
     }
+}
+
+/// Detects TypeScript language features like enums that Svelte doesn't natively support.
+/// Unlike checkNonHoistableDeclarations (which only checks instance scripts), this checks
+/// ALL scripts because enums require preprocessing regardless of where they appear.
+fn checkUnsupportedTsFeatures(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    for (ast.scripts.items) |script| {
+        const script_content = ast.source[script.content_start..script.content_end];
+
+        // Look for `enum` keyword at top level
+        if (findTopLevelEnum(script_content)) |enum_pos| {
+            const loc = computeLineCol(ast.source, script.content_start + enum_pos);
+            try diagnostics.append(allocator, .{
+                .source = .svelte,
+                .severity = .@"error",
+                .code = "unsupported_ts_feature",
+                .message = UNSUPPORTED_TS_FEATURE_ERROR,
+                .file_path = ast.file_path,
+                .start_line = loc.line,
+                .start_col = loc.col,
+                .end_line = loc.line,
+                .end_col = loc.col + 4, // "enum" is 4 chars
+            });
+            return; // Stop after first error to match svelte-check behavior
+        }
+    }
+}
+
+/// Find first top-level enum keyword in script content.
+fn findTopLevelEnum(content: []const u8) ?u32 {
+    var i: usize = 0;
+    var brace_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        // Skip comments
+        if (c == '/' and i + 1 < content.len) {
+            if (content[i + 1] == '/') {
+                while (i < content.len and content[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (content[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < content.len) {
+                    if (content[i] == '*' and content[i + 1] == '/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // Track nesting
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+        if (c == '(') paren_depth += 1;
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+
+        // Check for "enum" at top level
+        if (brace_depth == 0 and paren_depth == 0 and startsWithKeyword(content[i..], "enum")) {
+            return @intCast(i);
+        }
+
+        i += 1;
+    }
+
+    return null;
 }
 
 /// Scans script content for top-level namespace/enum declarations.
@@ -1428,5 +1513,99 @@ test "non-hoistable-declaration: namespace inside function is valid" {
     try runDiagnostics(allocator, &ast, &diagnostics);
 
     // "namespace" inside a function is just a variable, not a declaration
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+// ============================================================================
+// unsupported-ts-feature tests
+// ============================================================================
+
+test "unsupported-ts-feature: enum in module script" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script module>
+        \\enum A {
+        \\}
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("unsupported_ts_feature", diagnostics.items[0].code.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "enums") != null);
+}
+
+test "unsupported-ts-feature: enum in instance script" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\enum Status {
+        \\    Active,
+        \\    Inactive
+        \\}
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("unsupported_ts_feature", diagnostics.items[0].code.?);
+}
+
+test "unsupported-ts-feature: enum in string is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\const x = "enum is a keyword";
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // "enum" inside a string is not a declaration
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "unsupported-ts-feature: enum in comment is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\// enum declarations are not supported
+        \\/* enum Status {} */
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // "enum" inside comments is not a declaration
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
