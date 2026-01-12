@@ -68,64 +68,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Detect SvelteKit route files
     const route_info = sveltekit.detectRoute(ast.file_path);
 
-    // Header comment
-    try output.appendSlice(allocator, "// Generated from ");
-    try output.appendSlice(allocator, ast.file_path);
-    try output.appendSlice(allocator, "\n\n");
-
-    // Svelte type imports
-    // Import Component for Svelte 5 type compatibility (makes ComponentProps work)
-    // Use a private alias to avoid conflicts with user imports of Component
-    try output.appendSlice(allocator, "import type { Component as __SvelteComponentType__ } from \"svelte\";\n");
-    // Note: We don't auto-import Snippet - if users need it, they import it themselves.
-    // Auto-importing caused "declared but never used" errors for files that don't use Snippet types.
-
-    // SvelteKit route type imports are NOT auto-generated
-    // User code imports from './$types' which resolves via SvelteKit's generated types
-    // in .svelte-kit/types/ (requires SvelteKit to be built/dev'd first)
-    _ = route_info;
-    try output.appendSlice(allocator, "\n");
-
-    // Svelte 5 rune type declarations
-    try output.appendSlice(allocator,
-        \\// Svelte 5 rune type stubs
-        \\// $state with no argument returns undefined; with explicit T but no initializer returns T | undefined
-        \\declare function $state(): undefined;
-        \\declare function $state<T>(initial: T): T;
-        \\declare function $state<T>(): T | undefined;
-        \\declare namespace $state {
-        \\  function raw<T>(initial: T): T;
-        \\  function snapshot<T>(state: T): T;
-        \\}
-        \\declare function $derived<T>(expr: T): T;
-        \\declare namespace $derived {
-        \\  function by<T>(fn: () => T): T;
-        \\}
-        \\declare function $effect(fn: () => void | (() => void)): void;
-        \\declare namespace $effect {
-        \\  function pre(fn: () => void | (() => void)): void;
-        \\  function tracking(): boolean;
-        \\  function root(fn: () => void | (() => void)): () => void;
-        \\}
-        \\declare function $props<T = $$Props>(): T;
-        \\declare namespace $props {
-        \\  function id(): string;
-        \\}
-        \\declare function $bindable<T>(initial?: T): T;
-        \\declare function $inspect<T>(...values: T[]): { with: (fn: (type: 'init' | 'update', ...values: T[]) => void) => void };
-        \\declare function $host<T extends HTMLElement>(): T;
-        \\
-        \\// Svelte store auto-subscription stub
-        \\// $storeName syntax in Svelte auto-subscribes to the store
-        \\// This function extracts the value type from a store's subscribe method
-        \\type SvelteStore<T> = { subscribe: (run: (value: T) => any, invalidate?: any) => any };
-        \\declare function __svelte_store_get<T>(store: SvelteStore<T>): T;
-        \\declare function __svelte_store_get<Store extends SvelteStore<any> | undefined | null>(store: Store): Store extends SvelteStore<infer T> ? T : Store;
-        \\
-        \\
-    );
-
-    // Separate module and instance scripts
+    // Separate module and instance scripts first (need this for is_typescript check)
     var module_script: ?ScriptData = null;
     var instance_script: ?ScriptData = null;
 
@@ -141,16 +84,19 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         }
     }
 
-    // Get generics from instance script (if any)
-    const instance_generics = if (instance_script) |script| script.generics else null;
-
-    // Check if any script has lang="ts" (TypeScript mode)
+    // Check if any script has lang="ts" OR generics (TypeScript mode)
+    // The generics attribute implies TypeScript mode even without lang="ts"
+    // This determines whether we emit .ts or .js output, and whether to emit type stubs
     var is_typescript = false;
     if (module_script) |script| {
         if (script.lang) |lang| {
             if (std.mem.eql(u8, lang, "ts") or std.mem.eql(u8, lang, "typescript")) {
                 is_typescript = true;
             }
+        }
+        // generics attribute implies TypeScript
+        if (script.generics != null) {
+            is_typescript = true;
         }
     }
     if (instance_script) |script| {
@@ -159,6 +105,77 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
                 is_typescript = true;
             }
         }
+        // generics attribute implies TypeScript
+        if (script.generics != null) {
+            is_typescript = true;
+        }
+    }
+
+    // Get generics from instance script (if any)
+    const instance_generics = if (instance_script) |script| script.generics else null;
+
+    // Header comment
+    try output.appendSlice(allocator, "// Generated from ");
+    try output.appendSlice(allocator, ast.file_path);
+    try output.appendSlice(allocator, "\n\n");
+
+    // For TypeScript files, emit type imports and rune stubs
+    // For JavaScript files, skip these to avoid "X can only be used in TypeScript files" errors
+    if (is_typescript) {
+        // Svelte type imports
+        // Import Component for Svelte 5 type compatibility (makes ComponentProps work)
+        // Use a private alias to avoid conflicts with user imports of Component
+        try output.appendSlice(allocator, "import type { Component as __SvelteComponentType__ } from \"svelte\";\n");
+        // Note: We don't auto-import Snippet - if users need it, they import it themselves.
+        // Auto-importing caused "declared but never used" errors for files that don't use Snippet types.
+
+        // SvelteKit route type imports are NOT auto-generated
+        // User code imports from './$types' which resolves via SvelteKit's generated types
+        // in .svelte-kit/types/ (requires SvelteKit to be built/dev'd first)
+        _ = route_info;
+        try output.appendSlice(allocator, "\n");
+
+        // Svelte 5 rune type declarations
+        try output.appendSlice(allocator,
+            \\// Svelte 5 rune type stubs
+            \\// $state with no argument returns undefined; with explicit T but no initializer returns T | undefined
+            \\declare function $state(): undefined;
+            \\declare function $state<T>(initial: T): T;
+            \\declare function $state<T>(): T | undefined;
+            \\declare namespace $state {
+            \\  function raw<T>(initial: T): T;
+            \\  function snapshot<T>(state: T): T;
+            \\}
+            \\declare function $derived<T>(expr: T): T;
+            \\declare namespace $derived {
+            \\  function by<T>(fn: () => T): T;
+            \\}
+            \\declare function $effect(fn: () => void | (() => void)): void;
+            \\declare namespace $effect {
+            \\  function pre(fn: () => void | (() => void)): void;
+            \\  function tracking(): boolean;
+            \\  function root(fn: () => void | (() => void)): () => void;
+            \\}
+            \\declare function $props<T = $$Props>(): T;
+            \\declare namespace $props {
+            \\  function id(): string;
+            \\}
+            \\declare function $bindable<T>(initial?: T): T;
+            \\declare function $inspect<T>(...values: T[]): { with: (fn: (type: 'init' | 'update', ...values: T[]) => void) => void };
+            \\declare function $host<T extends HTMLElement>(): T;
+            \\
+            \\// Svelte store auto-subscription stub
+            \\// $storeName syntax in Svelte auto-subscribes to the store
+            \\// This function extracts the value type from a store's subscribe method
+            \\type SvelteStore<T> = { subscribe: (run: (value: T) => any, invalidate?: any) => any };
+            \\declare function __svelte_store_get<T>(store: SvelteStore<T>): T;
+            \\declare function __svelte_store_get<Store extends SvelteStore<any> | undefined | null>(store: Store): Store extends SvelteStore<infer T> ? T : Store;
+            \\
+            \\
+        );
+    } else {
+        // For JavaScript files, we still need to mark route_info as used
+        _ = route_info;
     }
 
     // Emit module script content (if any)
@@ -310,112 +327,136 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         try output.appendSlice(allocator, "\n");
     }
 
-    // Generate $$Props interface
-    try output.appendSlice(allocator, "// Component typing\n");
-    if (props_interface_name) |iface| {
-        // Use the existing interface directly
-        try output.appendSlice(allocator, "export type $$Props = ");
-        try output.appendSlice(allocator, iface);
-        try output.appendSlice(allocator, ";\n\n");
-    } else {
-        try output.appendSlice(allocator, "export interface $$Props {\n");
-        for (props.items) |prop| {
+    // For TypeScript files, generate component type interfaces
+    // For JavaScript files, skip these to avoid "X can only be used in TypeScript files" errors
+    if (is_typescript) {
+        // Generate $$Props interface
+        try output.appendSlice(allocator, "// Component typing\n");
+        if (props_interface_name) |iface| {
+            // Use the existing interface directly
+            try output.appendSlice(allocator, "export type $$Props = ");
+            try output.appendSlice(allocator, iface);
+            try output.appendSlice(allocator, ";\n\n");
+        } else {
+            try output.appendSlice(allocator, "export interface $$Props {\n");
+            for (props.items) |prop| {
+                try output.appendSlice(allocator, "  ");
+                try output.appendSlice(allocator, prop.name);
+                if (prop.has_initializer) {
+                    try output.appendSlice(allocator, "?");
+                }
+                try output.appendSlice(allocator, ": ");
+                if (prop.type_repr) |t| {
+                    try output.appendSlice(allocator, t);
+                } else {
+                    try output.appendSlice(allocator, "any");
+                }
+                try output.appendSlice(allocator, ";\n");
+            }
+            try output.appendSlice(allocator, "}\n\n");
+        }
+
+        // Generate $$Slots interface
+        try output.appendSlice(allocator, "export interface $$Slots {\n");
+        var has_default_slot = false;
+        for (slots.items) |slot| {
+            if (std.mem.eql(u8, slot.name, "default")) {
+                has_default_slot = true;
+            }
             try output.appendSlice(allocator, "  ");
-            try output.appendSlice(allocator, prop.name);
-            if (prop.has_initializer) {
+            try output.appendSlice(allocator, slot.name);
+            if (!std.mem.eql(u8, slot.name, "default")) {
                 try output.appendSlice(allocator, "?");
             }
+            try output.appendSlice(allocator, ": {");
+            for (slot.props.items, 0..) |prop, i| {
+                if (i > 0) try output.appendSlice(allocator, ",");
+                try output.appendSlice(allocator, " ");
+                try output.appendSlice(allocator, prop);
+                try output.appendSlice(allocator, "?: any");
+            }
+            if (slot.props.items.len > 0) {
+                try output.appendSlice(allocator, " ");
+            }
+            try output.appendSlice(allocator, "};\n");
+        }
+        if (!has_default_slot) {
+            try output.appendSlice(allocator, "  default: {};\n");
+        }
+        try output.appendSlice(allocator, "}\n\n");
+
+        // Generate $$Events type
+        try output.appendSlice(allocator, "export type $$Events = Record<string, any>;\n\n");
+
+        // Generate $$Bindings type for bindable props
+        try output.appendSlice(allocator, "export type $$Bindings = ");
+        var has_bindable = false;
+        for (props.items) |prop| {
+            if (prop.is_bindable) {
+                if (has_bindable) {
+                    try output.appendSlice(allocator, " | ");
+                }
+                try output.appendSlice(allocator, "\"");
+                try output.appendSlice(allocator, prop.name);
+                try output.appendSlice(allocator, "\"");
+                has_bindable = true;
+            }
+        }
+        if (!has_bindable) {
+            try output.appendSlice(allocator, "\"\"");
+        }
+        try output.appendSlice(allocator, ";\n\n");
+
+        // Generate $$Exports interface for instance exports (methods accessible on component)
+        // Include index signature for compatibility with Record<string, any> (required by mount())
+        try output.appendSlice(allocator, "export interface $$Exports {\n");
+        try output.appendSlice(allocator, "  [key: string]: any;\n");
+        for (instance_exports.items) |exp| {
+            try output.appendSlice(allocator, "  ");
+            try output.appendSlice(allocator, exp.name);
             try output.appendSlice(allocator, ": ");
-            if (prop.type_repr) |t| {
-                try output.appendSlice(allocator, t);
+            // For generic components, exports are scoped inside __render, so typeof won't work.
+            // Use the explicit type if available, otherwise fall back to 'any'.
+            if (instance_generics != null) {
+                // Generic component: can't use typeof since functions are inside __render
+                if (exp.type_repr) |t| {
+                    // Skip "typeof X" patterns since X is out of scope
+                    if (!std.mem.startsWith(u8, t, "typeof ")) {
+                        try output.appendSlice(allocator, t);
+                    } else {
+                        try output.appendSlice(allocator, "any");
+                    }
+                } else {
+                    try output.appendSlice(allocator, "any");
+                }
             } else {
-                try output.appendSlice(allocator, "any");
+                // Non-generic: typeof references work at module scope
+                if (exp.type_repr) |t| {
+                    try output.appendSlice(allocator, t);
+                } else {
+                    try output.appendSlice(allocator, "any");
+                }
             }
             try output.appendSlice(allocator, ";\n");
         }
         try output.appendSlice(allocator, "}\n\n");
+
+        // Generate default export using Component interface (Svelte 5 style)
+        // This makes ComponentProps<typeof Component> work correctly.
+        // The Component interface has the signature: Component<Props, Exports, Bindings>
+        try output.appendSlice(allocator,
+            \\declare const __SvelteComponent__: __SvelteComponentType__<$$Props, $$Exports, $$Bindings>;
+            \\type __SvelteComponent__ = typeof __SvelteComponent__;
+            \\export default __SvelteComponent__;
+            \\
+        );
     }
 
-    // Generate $$Slots interface
-    try output.appendSlice(allocator, "export interface $$Slots {\n");
-    var has_default_slot = false;
-    for (slots.items) |slot| {
-        if (std.mem.eql(u8, slot.name, "default")) {
-            has_default_slot = true;
-        }
-        try output.appendSlice(allocator, "  ");
-        try output.appendSlice(allocator, slot.name);
-        if (!std.mem.eql(u8, slot.name, "default")) {
-            try output.appendSlice(allocator, "?");
-        }
-        try output.appendSlice(allocator, ": {");
-        for (slot.props.items, 0..) |prop, i| {
-            if (i > 0) try output.appendSlice(allocator, ",");
-            try output.appendSlice(allocator, " ");
-            try output.appendSlice(allocator, prop);
-            try output.appendSlice(allocator, "?: any");
-        }
-        if (slot.props.items.len > 0) {
-            try output.appendSlice(allocator, " ");
-        }
-        try output.appendSlice(allocator, "};\n");
-    }
-    if (!has_default_slot) {
-        try output.appendSlice(allocator, "  default: {};\n");
-    }
-    try output.appendSlice(allocator, "}\n\n");
-
-    // Generate $$Events type
-    try output.appendSlice(allocator, "export type $$Events = Record<string, any>;\n\n");
-
-    // Generate $$Bindings type for bindable props
-    try output.appendSlice(allocator, "export type $$Bindings = ");
-    var has_bindable = false;
-    for (props.items) |prop| {
-        if (prop.is_bindable) {
-            if (has_bindable) {
-                try output.appendSlice(allocator, " | ");
-            }
-            try output.appendSlice(allocator, "\"");
-            try output.appendSlice(allocator, prop.name);
-            try output.appendSlice(allocator, "\"");
-            has_bindable = true;
-        }
-    }
-    if (!has_bindable) {
-        try output.appendSlice(allocator, "\"\"");
-    }
-    try output.appendSlice(allocator, ";\n\n");
-
-    // Generate $$Exports interface for instance exports (methods accessible on component)
-    // Include index signature for compatibility with Record<string, any> (required by mount())
-    try output.appendSlice(allocator, "export interface $$Exports {\n");
-    try output.appendSlice(allocator, "  [key: string]: any;\n");
-    for (instance_exports.items) |exp| {
-        try output.appendSlice(allocator, "  ");
-        try output.appendSlice(allocator, exp.name);
-        try output.appendSlice(allocator, ": ");
-        if (exp.type_repr) |t| {
-            try output.appendSlice(allocator, t);
-        } else {
-            try output.appendSlice(allocator, "any");
-        }
-        try output.appendSlice(allocator, ";\n");
-    }
-    try output.appendSlice(allocator, "}\n\n");
-
-    // Generate default export using Component interface (Svelte 5 style)
-    // This makes ComponentProps<typeof Component> work correctly.
-    // The Component interface has the signature: Component<Props, Exports, Bindings>
-    try output.appendSlice(allocator,
-        \\declare const __SvelteComponent__: __SvelteComponentType__<$$Props, $$Exports, $$Bindings>;
-        \\type __SvelteComponent__ = typeof __SvelteComponent__;
-        \\export default __SvelteComponent__;
-        \\
-    );
-
-    // Build virtual path
-    const virtual_path = try std.fmt.allocPrint(allocator, "{s}.ts", .{ast.file_path});
+    // Build virtual path - use .js extension for JavaScript, .ts for TypeScript
+    // This allows TypeScript to report "Type annotations can only be used in TypeScript files"
+    // for scripts that don't have lang="ts"
+    const extension = if (is_typescript) ".ts" else ".js";
+    const virtual_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ ast.file_path, extension });
 
     return .{
         .original_path = ast.file_path,
@@ -3635,7 +3676,9 @@ test "transform simple script" {
 
     try std.testing.expect(virtual.content.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let count = 0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__SvelteComponentType__<$$Props") != null);
+    // JavaScript files (no lang="ts") don't emit TypeScript-specific constructs
+    try std.testing.expect(!virtual.is_typescript);
+    try std.testing.expect(std.mem.endsWith(u8, virtual.virtual_path, ".js"));
 }
 
 test "transform with export let" {
