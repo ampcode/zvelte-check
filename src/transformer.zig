@@ -1368,7 +1368,8 @@ fn emitTemplateExpressions(
 
     // Collect identifiers referenced in template expressions to emit void statements.
     // This marks variables as "used" so noUnusedLocals works correctly.
-    var template_refs: std.StringHashMapUnmanaged(void) = .empty;
+    // Value is the Svelte source offset where the identifier was first found.
+    var template_refs: std.StringHashMapUnmanaged(u32) = .empty;
     defer template_refs.deinit(allocator);
 
     for (ast.nodes.items) |node| {
@@ -1426,13 +1427,13 @@ fn emitTemplateExpressions(
             .expression, .if_block, .await_block, .key_block, .render, .html, .const_tag, .debug_tag => {
                 // Extract identifiers from template expressions
                 const expr = ast.source[node.start..node.end];
-                try extractIdentifiersFromExpr(allocator, expr, &template_refs);
+                try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
             },
 
             .each_block => {
                 // Extract identifiers from each expression and emit binding declarations
                 const expr = ast.source[node.start..node.end];
-                try extractIdentifiersFromExpr(allocator, expr, &template_refs);
+                try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
 
                 // Parse and emit each block bindings (item, index variables)
                 if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
@@ -1455,7 +1456,11 @@ fn emitTemplateExpressions(
                     var name_end: usize = 0;
                     while (name_end < tag.len and (std.ascii.isAlphanumeric(tag[name_end]) or tag[name_end] == '_' or tag[name_end] == '$')) : (name_end += 1) {}
                     if (name_end > 0) {
-                        try template_refs.put(allocator, tag[0..name_end], {});
+                        const result = try template_refs.getOrPut(allocator, tag[0..name_end]);
+                        if (!result.found_existing) {
+                            // Use node.start as approximate offset (tag name follows '<')
+                            result.value_ptr.* = node.start + 1;
+                        }
                     }
                 }
 
@@ -1463,7 +1468,9 @@ fn emitTemplateExpressions(
                     if (attr.value) |val| {
                         // Expression values are wrapped in {}
                         if (val.len > 0 and val[0] == '{') {
-                            try extractIdentifiersFromExpr(allocator, val, &template_refs);
+                            // Compute offset within source for this attribute value
+                            // attr.start points to attr start, we need to find the { in the value
+                            try extractIdentifiersFromExpr(allocator, val, attr.start, &template_refs);
                         }
                     }
                     // Shorthand attributes like {foo} use attr name as expression
@@ -1471,14 +1478,17 @@ fn emitTemplateExpressions(
                         // This might be a shorthand {foo}
                         const src = ast.source[attr.start..attr.end];
                         if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
-                            try extractIdentifiersFromExpr(allocator, src, &template_refs);
+                            try extractIdentifiersFromExpr(allocator, src, attr.start, &template_refs);
                         }
                     }
                     // Shorthand bind:x directive (bind:open means bind:open={open})
                     if (attr.value == null and std.mem.startsWith(u8, attr.name, "bind:")) {
                         const binding_name = attr.name[5..]; // Skip "bind:"
                         if (binding_name.len > 0) {
-                            try template_refs.put(allocator, binding_name, {});
+                            const result = try template_refs.getOrPut(allocator, binding_name);
+                            if (!result.found_existing) {
+                                result.value_ptr.* = attr.start;
+                            }
                         }
                     }
                     // Transition, animate, and use directives reference the function name
@@ -1491,7 +1501,10 @@ fn emitTemplateExpressions(
                                 var end: usize = 0;
                                 while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_')) : (end += 1) {}
                                 if (end > 0) {
-                                    try template_refs.put(allocator, rest[0..end], {});
+                                    const result = try template_refs.getOrPut(allocator, rest[0..end]);
+                                    if (!result.found_existing) {
+                                        result.value_ptr.* = attr.start;
+                                    }
                                 }
                                 break;
                             }
@@ -1504,10 +1517,13 @@ fn emitTemplateExpressions(
                         if (class_var.len > 0) {
                             if (attr.value) |val| {
                                 // Full syntax: class:foo={expr} - extract identifiers from expr
-                                try extractIdentifiersFromExpr(allocator, val, &template_refs);
+                                try extractIdentifiersFromExpr(allocator, val, attr.start, &template_refs);
                             } else {
                                 // Shorthand: class:foo uses variable named foo
-                                try template_refs.put(allocator, class_var, {});
+                                const result = try template_refs.getOrPut(allocator, class_var);
+                                if (!result.found_existing) {
+                                    result.value_ptr.* = attr.start;
+                                }
                             }
                         }
                     }
@@ -1516,7 +1532,7 @@ fn emitTemplateExpressions(
                     if (std.mem.startsWith(u8, attr.name, "style:")) {
                         if (attr.value) |val| {
                             // Full syntax: style:prop={expr} - extract identifiers from expr
-                            try extractIdentifiersFromExpr(allocator, val, &template_refs);
+                            try extractIdentifiersFromExpr(allocator, val, attr.start, &template_refs);
                         }
                         // Note: shorthand style:foo (without value) is rarely used with variables
                         // because style properties are usually CSS names, not JS identifiers
@@ -1534,9 +1550,10 @@ fn emitTemplateExpressions(
 
     // Emit void statements for template-referenced identifiers
     // This marks them as "used" for noUnusedLocals checking
-    var iter = template_refs.keyIterator();
-    while (iter.next()) |key| {
-        const name = key.*;
+    var iter = template_refs.iterator();
+    while (iter.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const svelte_offset = entry.value_ptr.*;
         // Skip snippet parameters - they're only in scope inside the snippet function
         if (snippet_params.contains(name)) continue;
         // Skip keywords and built-ins, UNLESS the name is declared in script.
@@ -1549,6 +1566,12 @@ fn emitTemplateExpressions(
             has_expressions = true;
         }
         try output.appendSlice(allocator, "void ");
+        // Add source mapping so "Cannot find name" errors point to the template location
+        try mappings.append(allocator, .{
+            .svelte_offset = svelte_offset,
+            .ts_offset = @intCast(output.items.len),
+            .len = @intCast(name.len),
+        });
         try output.appendSlice(allocator, name);
         try output.appendSlice(allocator, ";\n");
     }
@@ -1560,11 +1583,20 @@ fn emitTemplateExpressions(
 
 /// Extracts identifier references from a template expression string.
 /// Handles expressions like {foo}, {foo.bar}, {foo + bar}, onclick={handler}, etc.
+/// Skips identifiers that are arrow function parameters (e.g., `e` in `e => e`).
+/// `base_offset` is the Svelte source offset of the start of `expr`.
 fn extractIdentifiersFromExpr(
     allocator: std.mem.Allocator,
     expr: []const u8,
-    refs: *std.StringHashMapUnmanaged(void),
+    base_offset: u32,
+    refs: *std.StringHashMapUnmanaged(u32),
 ) std.mem.Allocator.Error!void {
+    // First pass: collect arrow function parameter names to exclude.
+    // This handles patterns like: e => e, (e) => e, (a, b) => a + b, (e: Event) => e
+    var arrow_params: std.StringHashMapUnmanaged(void) = .empty;
+    defer arrow_params.deinit(allocator);
+    try collectArrowFunctionParams(allocator, expr, &arrow_params);
+
     var i: usize = 0;
     while (i < expr.len) {
         const c = expr[i];
@@ -1575,7 +1607,7 @@ fn extractIdentifiersFromExpr(
             continue;
         }
         if (c == '`') {
-            i = try skipStringLiteralAndExtract(allocator, expr, i, refs);
+            i = try skipStringLiteralAndExtract(allocator, expr, i, base_offset, refs);
             continue;
         }
 
@@ -1611,16 +1643,27 @@ fn extractIdentifiersFromExpr(
                 if (!is_spread) continue; // Skip member access, but keep spread
             }
 
-            // Store identifier reference
+            // Skip arrow function parameters - they're scoped to the function, not module scope
+            if (arrow_params.contains(ident)) continue;
+
+            // Store identifier reference with its Svelte source offset
+            // Only store the first occurrence (don't overwrite with later occurrences)
             if (ident.len > 0) {
-                try refs.put(allocator, ident, {});
+                const offset = base_offset + @as(u32, @intCast(start));
+                const result = try refs.getOrPut(allocator, ident);
+                if (!result.found_existing) {
+                    result.value_ptr.* = offset;
+                }
 
                 // For $prefixed identifiers (Svelte store subscriptions like $showNudge),
                 // also add the unprefixed name (showNudge). The store variable is declared
                 // in script, but only the $prefixed form is used in templates. Adding both
                 // ensures the original variable is marked as "used".
                 if (ident[0] == '$' and ident.len > 1) {
-                    try refs.put(allocator, ident[1..], {});
+                    const unprefixed_result = try refs.getOrPut(allocator, ident[1..]);
+                    if (!unprefixed_result.found_existing) {
+                        unprefixed_result.value_ptr.* = offset + 1; // +1 to skip the $
+                    }
                 }
             }
             continue;
@@ -1630,13 +1673,158 @@ fn extractIdentifiersFromExpr(
     }
 }
 
+/// Collects arrow function parameter names from an expression.
+/// Handles patterns: e => ..., (e) => ..., (a, b) => ..., (e: Type) => ...
+fn collectArrowFunctionParams(
+    allocator: std.mem.Allocator,
+    expr: []const u8,
+    params: *std.StringHashMapUnmanaged(void),
+) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+    while (i < expr.len) {
+        const c = expr[i];
+
+        // Skip string literals
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipStringLiteral(expr, i);
+            continue;
+        }
+
+        // Skip comments
+        if (i + 1 < expr.len and c == '/') {
+            if (expr[i + 1] == '/') {
+                while (i < expr.len and expr[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (expr[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < expr.len and !(expr[i] == '*' and expr[i + 1] == '/')) : (i += 1) {}
+                if (i + 1 < expr.len) i += 2;
+                continue;
+            }
+        }
+
+        // Look for arrow function patterns
+        // Pattern 1: identifier followed by => (e.g., e => e)
+        if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
+            const ident_start = i;
+            while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_' or expr[i] == '$')) : (i += 1) {}
+            const ident = expr[ident_start..i];
+
+            // Skip whitespace
+            var j = i;
+            while (j < expr.len and std.ascii.isWhitespace(expr[j])) : (j += 1) {}
+
+            // Check for =>
+            if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
+                // This identifier is an arrow function parameter
+                try params.put(allocator, ident, {});
+            }
+            continue;
+        }
+
+        // Pattern 2: parenthesized parameters followed by => (e.g., (e) => ..., (a, b) => ...)
+        if (c == '(') {
+            const paren_start = i;
+            i += 1;
+            var depth: u32 = 1;
+            while (i < expr.len and depth > 0) {
+                if (expr[i] == '(') depth += 1;
+                if (expr[i] == ')') depth -= 1;
+                if (depth > 0) i += 1;
+            }
+            const paren_end = i;
+            if (i < expr.len) i += 1; // Skip closing )
+
+            // Skip whitespace
+            var j = i;
+            while (j < expr.len and std.ascii.isWhitespace(expr[j])) : (j += 1) {}
+
+            // Check for => after the parentheses
+            if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
+                // Extract parameter names from inside parentheses
+                try extractArrowParamsFromParens(allocator, expr[paren_start + 1 .. paren_end], params);
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Extracts parameter names from arrow function parentheses content.
+/// Handles: a, b, (a: Type), ({ destructured }), etc.
+fn extractArrowParamsFromParens(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    params: *std.StringHashMapUnmanaged(void),
+) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+    while (i < content.len) {
+        // Skip whitespace
+        while (i < content.len and std.ascii.isWhitespace(content[i])) : (i += 1) {}
+        if (i >= content.len) break;
+
+        // Handle destructuring patterns: { a, b } or [ a, b ]
+        if (content[i] == '{' or content[i] == '[') {
+            const open_char = content[i];
+            const close_char: u8 = if (open_char == '{') '}' else ']';
+            i += 1;
+            var depth: u32 = 1;
+            while (i < content.len and depth > 0) {
+                if (content[i] == open_char) depth += 1;
+                if (content[i] == close_char) depth -= 1;
+                // Don't extract identifiers from destructuring - they're complex patterns
+                i += 1;
+            }
+            // Skip type annotation if present
+            while (i < content.len and content[i] != ',') : (i += 1) {}
+            if (i < content.len and content[i] == ',') i += 1;
+            continue;
+        }
+
+        // Handle rest parameter: ...rest
+        if (i + 2 < content.len and content[i] == '.' and content[i + 1] == '.' and content[i + 2] == '.') {
+            i += 3;
+            // Skip whitespace
+            while (i < content.len and std.ascii.isWhitespace(content[i])) : (i += 1) {}
+        }
+
+        // Extract identifier
+        if (i < content.len and (std.ascii.isAlphabetic(content[i]) or content[i] == '_' or content[i] == '$')) {
+            const name_start = i;
+            while (i < content.len and (std.ascii.isAlphanumeric(content[i]) or content[i] == '_' or content[i] == '$')) : (i += 1) {}
+            const name = content[name_start..i];
+            try params.put(allocator, name, {});
+        }
+
+        // Skip type annotation and default value until comma or end
+        while (i < content.len and content[i] != ',') {
+            // Skip nested generics in type annotations
+            if (content[i] == '<') {
+                var depth: u32 = 1;
+                i += 1;
+                while (i < content.len and depth > 0) {
+                    if (content[i] == '<') depth += 1;
+                    if (content[i] == '>') depth -= 1;
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        if (i < content.len and content[i] == ',') i += 1;
+    }
+}
+
 /// Skips a string literal starting at position i, returning position after closing quote.
 /// For template literals, also extracts identifiers from interpolations.
 fn skipStringLiteralAndExtract(
     allocator: std.mem.Allocator,
     expr: []const u8,
     start: usize,
-    refs: *std.StringHashMapUnmanaged(void),
+    base_offset: u32,
+    refs: *std.StringHashMapUnmanaged(u32),
 ) std.mem.Allocator.Error!usize {
     if (start >= expr.len) return start;
     const quote = expr[start];
@@ -1661,7 +1849,8 @@ fn skipStringLiteralAndExtract(
             }
             const interp_end = i;
             // Recursively extract identifiers from the interpolation content
-            try extractIdentifiersFromExpr(allocator, expr[interp_start..interp_end], refs);
+            const interp_offset = base_offset + @as(u32, @intCast(interp_start));
+            try extractIdentifiersFromExpr(allocator, expr[interp_start..interp_end], interp_offset, refs);
             if (i < expr.len) i += 1; // skip closing }
             continue;
         }
@@ -1714,7 +1903,7 @@ fn scanTemplateForEachBlocks(
     allocator: std.mem.Allocator,
     ast: *const Ast,
     output: *std.ArrayList(u8),
-    template_refs: *std.StringHashMapUnmanaged(void),
+    template_refs: *std.StringHashMapUnmanaged(u32),
     has_expressions: *bool,
 ) !void {
     // Find template portion (after scripts, before styles)
@@ -1784,7 +1973,9 @@ fn scanTemplateForEachBlocks(
         }
 
         // Extract identifiers from the expression
-        try extractIdentifiersFromExpr(allocator, full_expr, template_refs);
+        // template_start + expr_start gives the absolute Svelte source offset
+        const svelte_offset: u32 = @intCast(template_start + expr_start);
+        try extractIdentifiersFromExpr(allocator, full_expr, svelte_offset, template_refs);
 
         // Special handling for {#each} - emit binding declarations
         if (std.mem.startsWith(u8, full_expr, "{#each ")) {
@@ -1816,7 +2007,7 @@ fn scanTemplateForEachBlocks(
     }
 
     // Scan for component tags (capitalized tag names)
-    try scanTemplateForComponents(allocator, template, template_refs);
+    try scanTemplateForComponents(allocator, template, @intCast(template_start), template_refs);
 }
 
 /// Scans template source for component usages (capitalized tag names) and
@@ -1825,7 +2016,8 @@ fn scanTemplateForEachBlocks(
 fn scanTemplateForComponents(
     allocator: std.mem.Allocator,
     template: []const u8,
-    refs: *std.StringHashMapUnmanaged(void),
+    template_start_offset: u32,
+    refs: *std.StringHashMapUnmanaged(u32),
 ) !void {
     var i: usize = 0;
     while (i < template.len) {
@@ -1864,7 +2056,10 @@ fn scanTemplateForComponents(
                     }
                     const name = template[i + 1 .. name_end];
                     if (name.len > 0) {
-                        try refs.put(allocator, name, {});
+                        const result = try refs.getOrPut(allocator, name);
+                        if (!result.found_existing) {
+                            result.value_ptr.* = template_start_offset + @as(u32, @intCast(i + 1));
+                        }
                     }
                     i = name_end;
                 } else {
@@ -1882,12 +2077,14 @@ fn scanTemplateForComponents(
                         i = findMatchingCloseBrace(template, i + 1);
                         // Extract identifiers from attribute expression (includes spreads like {...props})
                         const attr_expr = template[expr_start..i];
-                        try extractIdentifiersFromExpr(allocator, attr_expr, refs);
+                        const svelte_offset = template_start_offset + @as(u32, @intCast(expr_start));
+                        try extractIdentifiersFromExpr(allocator, attr_expr, svelte_offset, refs);
                     } else if (template[i] == '/' and i + 1 < template.len and template[i + 1] == '>') {
                         i += 2; // Skip />
                         break;
                     } else if (std.mem.startsWith(u8, template[i..], "bind:")) {
                         // Detect bind:xxx shorthand (bind:open means bind:open={open})
+                        const bind_offset = template_start_offset + @as(u32, @intCast(i));
                         i += 5; // Skip "bind:"
                         const name_start = i;
                         while (i < template.len and (std.ascii.isAlphanumeric(template[i]) or template[i] == '_' or template[i] == '$')) : (i += 1) {}
@@ -1898,14 +2095,20 @@ fn scanTemplateForComponents(
                             // Check if there's no = (shorthand) or next char is space/> (end of attr)
                             if (i >= template.len or template[i] != '=') {
                                 // Shorthand bind:xxx - xxx is used as identifier
-                                try refs.put(allocator, binding_name, {});
+                                const result = try refs.getOrPut(allocator, binding_name);
+                                if (!result.found_existing) {
+                                    result.value_ptr.* = bind_offset;
+                                }
                             }
                             // If there's =, the { } will be caught by the expression handler above
                         }
                     } else if (detectDirectiveIdentifier(template, i)) |directive_info| {
                         // Detect Svelte directives that reference identifiers:
                         // transition:fade, in:fly, out:slide, animate:flip, use:action
-                        try refs.put(allocator, directive_info.name, {});
+                        const result = try refs.getOrPut(allocator, directive_info.name);
+                        if (!result.found_existing) {
+                            result.value_ptr.* = template_start_offset + @as(u32, @intCast(i));
+                        }
                         i = directive_info.end_pos;
                     } else {
                         i += 1;
