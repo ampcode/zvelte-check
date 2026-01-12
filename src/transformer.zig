@@ -114,6 +114,32 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Get generics from instance script (if any)
     const instance_generics = if (instance_script) |script| script.generics else null;
 
+    // Extract declared names from scripts FIRST (before emitting any content).
+    // This is needed to avoid snippet declaration conflicts and for snippet hoisting.
+    // In Svelte, template snippets like {#snippet filter()} can shadow script imports,
+    // but in generated TS they'd conflict at module scope.
+    var declared_names: std.StringHashMapUnmanaged(void) = .empty;
+    defer declared_names.deinit(allocator);
+
+    if (module_script) |script| {
+        const content = ast.source[script.content_start..script.content_end];
+        var names = try extractDeclaredNames(allocator, content);
+        defer names.deinit(allocator);
+        var iter = names.iterator();
+        while (iter.next()) |entry| {
+            try declared_names.put(allocator, entry.key_ptr.*, {});
+        }
+    }
+    if (instance_script) |script| {
+        const content = ast.source[script.content_start..script.content_end];
+        var names = try extractDeclaredNames(allocator, content);
+        defer names.deinit(allocator);
+        var iter = names.iterator();
+        while (iter.next()) |entry| {
+            try declared_names.put(allocator, entry.key_ptr.*, {});
+        }
+    }
+
     // Header comment
     try output.appendSlice(allocator, "// Generated from ");
     try output.appendSlice(allocator, ast.file_path);
@@ -178,6 +204,35 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         _ = route_info;
     }
 
+    // Emit forward declarations for template snippets (hoisting).
+    // Svelte hoists snippets so they're visible in both module and instance scripts,
+    // even though they're defined in the template. We emit `let snippetName;` (JS) or
+    // `let snippetName: any;` (TS) before scripts so TypeScript sees them as declared.
+    // Skip snippets whose names conflict with script declarations.
+    var emitted_snippet_header = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .snippet) {
+            if (extractSnippetName(ast.source, node.start, node.end)) |info| {
+                if (!declared_names.contains(info.name)) {
+                    if (!emitted_snippet_header) {
+                        try output.appendSlice(allocator, "// Hoisted snippet declarations\n");
+                        emitted_snippet_header = true;
+                    }
+                    try output.appendSlice(allocator, "let ");
+                    try output.appendSlice(allocator, info.name);
+                    // Only emit type annotation for TypeScript files
+                    if (is_typescript) {
+                        try output.appendSlice(allocator, ": any");
+                    }
+                    try output.appendSlice(allocator, ";\n");
+                }
+            }
+        }
+    }
+    if (emitted_snippet_header) {
+        try output.appendSlice(allocator, "\n");
+    }
+
     // Emit module script content (if any)
     if (module_script) |script| {
         try output.appendSlice(allocator, "// <script context=\"module\">\n");
@@ -194,32 +249,6 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
 
         try output.appendSlice(allocator, content);
         try output.appendSlice(allocator, "\n\n");
-    }
-
-    // Extract declared names from scripts to avoid snippet declaration conflicts.
-    // In Svelte, template snippets like {#snippet filter()} can shadow script imports,
-    // but in generated TS they'd conflict at module scope.
-    // We need this before emitTemplateExpressions, so extract it first.
-    var declared_names: std.StringHashMapUnmanaged(void) = .empty;
-    defer declared_names.deinit(allocator);
-
-    if (module_script) |script| {
-        const content = ast.source[script.content_start..script.content_end];
-        var names = try extractDeclaredNames(allocator, content);
-        defer names.deinit(allocator);
-        var iter = names.iterator();
-        while (iter.next()) |entry| {
-            try declared_names.put(allocator, entry.key_ptr.*, {});
-        }
-    }
-    if (instance_script) |script| {
-        const content = ast.source[script.content_start..script.content_end];
-        var names = try extractDeclaredNames(allocator, content);
-        defer names.deinit(allocator);
-        var iter = names.iterator();
-        while (iter.next()) |entry| {
-            try declared_names.put(allocator, entry.key_ptr.*, {});
-        }
     }
 
     // Emit instance script content (if any)
