@@ -771,17 +771,10 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         // Svelte-specific type errors (only for .svelte files)
         // These are false positives from our code generation
 
-        // Svelte types that users commonly import in module scripts
-        const svelte_types = [_][]const u8{
-            "Cannot find name 'Component'.",
-            "Cannot find name 'ComponentProps'.",
-            "Cannot find name 'ComponentType'.",
-            "Cannot find name 'SvelteComponent'.",
-        };
-
-        for (svelte_types) |pattern| {
-            if (std.mem.eql(u8, message, pattern)) return true;
-        }
+        // NOTE: We previously filtered "Cannot find name 'Component'" etc. as Svelte types
+        // that users commonly import. However, this was incorrect - if a component like
+        // <Component /> is used without importing it, we should report the error.
+        // The more targeted filtering below handles actual false positives.
 
         // Skip "Property X does not exist on type 'never'" errors
         // False positives from $state(null) patterns where TypeScript
@@ -816,15 +809,56 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Cannot find name" errors for Svelte files.
+        // Skip "Cannot find name" errors only for known false positives.
         // Our transformer extracts identifiers from template expressions and emits void
         // statements for noUnusedLocals checking. This causes false positives for:
         // - Arrow function parameters (e, evt, event)
-        // - Type names in type annotations
-        // - Names in snippet bodies
-        // TODO: Fix the transformer to not emit void statements for these cases.
-        if (std.mem.startsWith(u8, message, "Cannot find name")) {
-            return true;
+        // - Type names in type annotations (Props, svelte)
+        // - Default values in props destructuring (foo in g = foo)
+        // - Generic type parameters (T, U, K, V)
+        //
+        // NOTE: We intentionally don't filter ALL "Cannot find name" errors because
+        // that hides real errors like using undefined components (<Component />).
+        // TODO: The proper fix is in the transformer to not emit void statements for
+        // arrow function parameters, type names, and default values.
+        if (std.mem.startsWith(u8, message, "Cannot find name '")) {
+            // Extract the identifier name from the message
+            const name_start = "Cannot find name '".len;
+            if (std.mem.indexOfScalarPos(u8, message, name_start, '\'')) |name_end| {
+                const name = message[name_start..name_end];
+
+                // Skip common event parameter names used in arrow functions
+                const event_params = [_][]const u8{ "e", "evt", "event", "err", "error" };
+                for (event_params) |param| {
+                    if (std.mem.eql(u8, name, param)) return true;
+                }
+
+                // Skip single uppercase letters (common generic type parameters like T, U, K, V)
+                if (name.len == 1 and std.ascii.isUpper(name[0])) {
+                    return true;
+                }
+
+                // Skip 'svelte' - extracted from <svelte:options> and similar tags
+                if (std.mem.eql(u8, name, "svelte")) {
+                    return true;
+                }
+
+                // Skip $-prefixed names that look like store subscriptions ($store)
+                // The actual store variable may be defined, but the auto-subscription syntax
+                // expands to something that references both $store and store
+                if (name.len > 1 and name[0] == '$') {
+                    return true;
+                }
+
+                // Skip names that look like type interface names (end with common suffixes)
+                // These are false positives from $props<Props>() patterns
+                if (std.mem.endsWith(u8, name, "Props") or
+                    std.mem.endsWith(u8, name, "Event") or
+                    std.mem.endsWith(u8, name, "Events"))
+                {
+                    return true;
+                }
+            }
         }
 
         // Skip "X only refers to a type, but is being used as a value here"
