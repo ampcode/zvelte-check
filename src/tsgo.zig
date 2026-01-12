@@ -806,6 +806,14 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
+        // Skip "Duplicate identifier" errors
+        // False positives from type shadowing between module and instance scripts.
+        // In Svelte, <script module> and <script> have separate scopes, but our
+        // transformer emits both at module level in TypeScript.
+        if (std.mem.indexOf(u8, message, "Duplicate identifier") != null) {
+            return true;
+        }
+
         // Skip "Cannot find name" errors for Svelte files
         // These are often snippet bindings or template variables that our
         // transformer doesn't emit declarations for yet

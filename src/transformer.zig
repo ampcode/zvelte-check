@@ -140,6 +140,16 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         }
     }
 
+    // Emit instance script generic type declarations FIRST (before module script).
+    // This ensures generics like `T extends boolean` shadow any module script types
+    // with the same name (e.g., `type T = unknown`). In Svelte, instance script
+    // generics are in scope for both scripts when referenced from props/template.
+    if (instance_script) |script| {
+        if (script.generics) |generics| {
+            try emitGenericTypeDeclarations(allocator, &output, generics);
+        }
+    }
+
     // Emit module script content (if any)
     if (module_script) |script| {
         try output.appendSlice(allocator, "// <script context=\"module\">\n");
@@ -161,11 +171,6 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Emit instance script content (if any)
     if (instance_script) |script| {
         try output.appendSlice(allocator, "// <script>\n");
-
-        // Emit generic type declarations if present (Svelte 5 generics="T" attribute)
-        if (script.generics) |generics| {
-            try emitGenericTypeDeclarations(allocator, &output, generics);
-        }
 
         const raw_content = ast.source[script.content_start..script.content_end];
         const filtered = try filterSvelteImports(allocator, raw_content);
