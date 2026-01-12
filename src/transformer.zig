@@ -1126,6 +1126,7 @@ const SnippetParamInfo = struct {
 
 const SnippetNameInfo = struct {
     name: []const u8,
+    generics: ?[]const u8,
     params: ?[]const u8,
     offset: u32,
 };
@@ -1348,6 +1349,23 @@ fn emitTemplateExpressions(
 ) !void {
     var has_expressions = false;
 
+    // First pass: collect snippet parameter names.
+    // Snippet parameters are only in scope inside the snippet body, not at module scope.
+    // We need to exclude them from template_refs to avoid "Cannot find name" errors.
+    var snippet_params: std.StringHashMapUnmanaged(void) = .empty;
+    defer snippet_params.deinit(allocator);
+
+    for (ast.nodes.items) |node| {
+        if (node.kind == .snippet) {
+            if (extractSnippetName(ast.source, node.start, node.end)) |info| {
+                if (info.params) |params| {
+                    // Extract parameter names from the params string (e.g., "val: T, x: number")
+                    try extractParamNames(allocator, params, &snippet_params);
+                }
+            }
+        }
+    }
+
     // Collect identifiers referenced in template expressions to emit void statements.
     // This marks variables as "used" so noUnusedLocals works correctly.
     var template_refs: std.StringHashMapUnmanaged(void) = .empty;
@@ -1369,16 +1387,31 @@ fn emitTemplateExpressions(
 
                     // Emit snippet as arrow function to preserve parameter type checking.
                     // This ensures TypeScript reports "implicit any" for untyped params.
-                    // Format: const snippetName = (params) => {};
+                    // Format: const snippetName = <T>(params) => {}; (with optional generics)
                     try output.appendSlice(allocator, "const ");
                     try output.appendSlice(allocator, info.name);
-                    try output.appendSlice(allocator, " = (");
+                    try output.appendSlice(allocator, " = ");
+
+                    // Emit generic type parameters if present
+                    if (info.generics) |generics| {
+                        try output.appendSlice(allocator, "<");
+                        try output.appendSlice(allocator, generics);
+                        try output.appendSlice(allocator, ">");
+                    }
+
+                    try output.appendSlice(allocator, "(");
 
                     // Add source mapping for parameters so TypeScript errors map back correctly
                     if (info.params) |params| {
                         // Calculate Svelte offset: node.start + offset to params within the snippet tag
-                        // The snippet format is {#snippet name(params)} - info.offset is relative to node.start
-                        const params_svelte_offset = node.start + info.offset + @as(u32, @intCast(info.name.len)) + 1; // +1 for '('
+                        // The snippet format is {#snippet name(params)} or {#snippet name<T>(params)}
+                        // info.offset is position of name start; need to add name length + generics + 1 for '('
+                        var params_offset = info.offset + @as(u32, @intCast(info.name.len));
+                        if (info.generics) |generics| {
+                            params_offset += @as(u32, @intCast(generics.len)) + 2; // +2 for '<' and '>'
+                        }
+                        params_offset += 1; // +1 for '('
+                        const params_svelte_offset = node.start + params_offset;
                         try mappings.append(allocator, .{
                             .svelte_offset = params_svelte_offset,
                             .ts_offset = @intCast(output.items.len),
@@ -1504,6 +1537,8 @@ fn emitTemplateExpressions(
     var iter = template_refs.keyIterator();
     while (iter.next()) |key| {
         const name = key.*;
+        // Skip snippet parameters - they're only in scope inside the snippet function
+        if (snippet_params.contains(name)) continue;
         // Skip keywords and built-ins, UNLESS the name is declared in script.
         // User imports can shadow built-in names (e.g., `import Map from './icons/map'`),
         // so if a name is declared in script, we should emit void for it.
@@ -1739,6 +1774,15 @@ fn scanTemplateForEachBlocks(
 
         const full_expr = template[expr_start..j];
 
+        // Skip snippet blocks - they're handled separately and contain type annotations
+        // that would be incorrectly extracted as identifiers (e.g., { bracket: "<" })
+        if (std.mem.startsWith(u8, full_expr, "{#snippet ") or
+            std.mem.startsWith(u8, full_expr, "{/snippet"))
+        {
+            i = j;
+            continue;
+        }
+
         // Extract identifiers from the expression
         try extractIdentifiersFromExpr(allocator, full_expr, template_refs);
 
@@ -1785,6 +1829,17 @@ fn scanTemplateForComponents(
 ) !void {
     var i: usize = 0;
     while (i < template.len) {
+        // Skip {#snippet ...} blocks - they contain TypeScript generics like <T extends ...>
+        // that would be misinterpreted as component tags
+        if (template[i] == '{' and i + 1 < template.len and template[i + 1] == '#') {
+            // Check if this is a snippet block
+            if (std.mem.startsWith(u8, template[i..], "{#snippet ")) {
+                // Skip to matching closing brace
+                i = findMatchingCloseBrace(template, i + 1);
+                continue;
+            }
+        }
+
         if (template[i] == '<' and i + 1 < template.len) {
             const next_char = template[i + 1];
             // Skip closing tags, comments, special tags
@@ -2386,29 +2441,54 @@ fn extractSnippetParams(source: []const u8, start: u32, end: u32) ?SnippetParamI
     };
 }
 
-/// Extracts snippet name and params from {#snippet name(params)}
+/// Extracts snippet name, generics, and params from {#snippet name<T>(params)}
 fn extractSnippetName(source: []const u8, start: u32, end: u32) ?SnippetNameInfo {
     const content = source[start..end];
-    // Format: {#snippet name(params)}
+    // Format: {#snippet name(params)} or {#snippet name<T>(params)}
     const prefix = "{#snippet ";
     const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
     const name_start = idx + prefix.len;
 
-    // Find opening paren or closing brace (for snippets without params)
+    // Find end of name: stops at '<' (generics), '(' (params), '}' or whitespace
     var name_end = name_start;
     while (name_end < content.len) {
         const c = content[name_end];
-        if (c == '(' or c == '}' or std.ascii.isWhitespace(c)) break;
+        if (c == '<' or c == '(' or c == '}' or std.ascii.isWhitespace(c)) break;
         name_end += 1;
     }
 
     const name = std.mem.trim(u8, content[name_start..name_end], " \t\n\r");
     if (name.len == 0) return null;
 
+    var pos = name_end;
+
+    // Check for generics: <T extends Foo, U>
+    // Must handle string literals inside generics like <T extends { x: "<" } | "<">
+    var generics: ?[]const u8 = null;
+    if (pos < content.len and content[pos] == '<') {
+        const generic_start = pos + 1;
+        var angle_depth: u32 = 1;
+        pos += 1;
+        while (pos < content.len and angle_depth > 0) {
+            const c = content[pos];
+            // Skip string literals to avoid matching < or > inside strings
+            if (c == '"' or c == '\'' or c == '`') {
+                pos = skipString(content, pos);
+                continue;
+            }
+            if (c == '<') angle_depth += 1;
+            if (c == '>') angle_depth -= 1;
+            if (angle_depth > 0) pos += 1;
+        }
+        const g = std.mem.trim(u8, content[generic_start..pos], " \t\n\r");
+        if (g.len > 0) generics = g;
+        if (pos < content.len and content[pos] == '>') pos += 1; // Skip closing '>'
+    }
+
     // Check for params
     var params: ?[]const u8 = null;
-    if (name_end < content.len and content[name_end] == '(') {
-        const params_start = name_end + 1;
+    if (pos < content.len and content[pos] == '(') {
+        const params_start = pos + 1;
         var paren_depth: u32 = 1;
         var i = params_start;
         while (i < content.len and paren_depth > 0) {
@@ -2422,9 +2502,79 @@ fn extractSnippetName(source: []const u8, start: u32, end: u32) ?SnippetNameInfo
 
     return .{
         .name = name,
+        .generics = generics,
         .params = params,
         .offset = @intCast(name_start),
     };
+}
+
+/// Extracts parameter names from a function parameter string.
+/// Handles patterns like "val: T", "x: number, y: string", "{ a, b }: Props", etc.
+fn extractParamNames(
+    allocator: std.mem.Allocator,
+    params: []const u8,
+    names: *std.StringHashMapUnmanaged(void),
+) !void {
+    var i: usize = 0;
+    while (i < params.len) {
+        // Skip whitespace
+        while (i < params.len and std.ascii.isWhitespace(params[i])) : (i += 1) {}
+        if (i >= params.len) break;
+
+        // Handle destructuring patterns: { a, b } or [a, b]
+        if (params[i] == '{' or params[i] == '[') {
+            const open_char = params[i];
+            const close_char: u8 = if (open_char == '{') '}' else ']';
+            i += 1;
+            var depth: u32 = 1;
+            while (i < params.len and depth > 0) {
+                if (params[i] == open_char) depth += 1;
+                if (params[i] == close_char) depth -= 1;
+                // Extract identifiers inside the destructuring pattern
+                if (depth > 0 and isIdentStartChar(params[i])) {
+                    const name_start = i;
+                    while (i < params.len and isIdentChar(params[i])) : (i += 1) {}
+                    const name = params[name_start..i];
+                    // Skip TypeScript keywords
+                    if (!std.mem.eql(u8, name, "as") and !std.mem.eql(u8, name, "readonly")) {
+                        try names.put(allocator, name, {});
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if (i < params.len and params[i] == close_char) i += 1;
+            // Skip type annotation after destructuring
+            while (i < params.len and params[i] != ',') : (i += 1) {}
+            if (i < params.len and params[i] == ',') i += 1;
+            continue;
+        }
+
+        // Simple parameter: name or name: type
+        if (isIdentStartChar(params[i])) {
+            const name_start = i;
+            while (i < params.len and isIdentChar(params[i])) : (i += 1) {}
+            const name = params[name_start..i];
+            try names.put(allocator, name, {});
+        }
+
+        // Skip to next parameter (past : type annotation and , separator)
+        while (i < params.len and params[i] != ',') {
+            // Skip nested generics in type annotations
+            if (params[i] == '<') {
+                var depth: u32 = 1;
+                i += 1;
+                while (i < params.len and depth > 0) {
+                    if (params[i] == '<') depth += 1;
+                    if (params[i] == '>') depth -= 1;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if (i < params.len and params[i] == ',') i += 1;
+    }
 }
 
 /// Extracts binding from {@const name = expr}
