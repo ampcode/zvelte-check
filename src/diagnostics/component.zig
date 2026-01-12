@@ -43,6 +43,7 @@ pub fn runDiagnostics(
 ) !void {
     try checkInvalidRuneUsage(allocator, ast, diagnostics);
     try checkUnusedExportLet(allocator, ast, diagnostics);
+    try checkSlotDeprecation(allocator, ast, diagnostics);
 }
 
 /// Detects rune calls ($state, $derived, etc.) in template expressions.
@@ -225,6 +226,63 @@ fn checkUnusedExportLet(
                 .end_col = loc.col + @as(u32, @intCast(exp.name.len)),
             });
         }
+    }
+}
+
+/// Warns when <slot> elements are used - deprecated in Svelte 5.
+/// Users should use {@render ...} tags instead.
+fn checkSlotDeprecation(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    // Track ignore codes from consecutive preceding comments
+    var accumulated_ignore_codes: std.ArrayList([]const u8) = .empty;
+
+    for (ast.nodes.items) |node| {
+        if (node.kind == .comment) {
+            const comment = ast.comments.items[node.data];
+            const codes = ast.ignore_codes.items[comment.ignore_codes_start..comment.ignore_codes_end];
+            for (codes) |code| {
+                try accumulated_ignore_codes.append(allocator, code);
+            }
+            continue;
+        }
+
+        if (node.kind != .element) {
+            accumulated_ignore_codes.clearRetainingCapacity();
+            continue;
+        }
+
+        const elem = ast.elements.items[node.data];
+        if (!std.mem.eql(u8, elem.tag_name, "slot")) {
+            accumulated_ignore_codes.clearRetainingCapacity();
+            continue;
+        }
+
+        // Check if suppressed by svelte-ignore
+        var is_ignored = false;
+        for (accumulated_ignore_codes.items) |ignored| {
+            if (std.mem.eql(u8, ignored, "slot_element_deprecated")) {
+                is_ignored = true;
+                break;
+            }
+        }
+        accumulated_ignore_codes.clearRetainingCapacity();
+        if (is_ignored) continue;
+
+        const loc = computeLineCol(ast.source, node.start);
+        try diagnostics.append(allocator, .{
+            .source = .svelte,
+            .severity = .warning,
+            .code = "slot_element_deprecated",
+            .message = try allocator.dupe(u8, "Using `<slot>` to render parent content is deprecated. Use `{@render ...}` tags instead\nhttps://svelte.dev/e/slot_element_deprecated"),
+            .file_path = ast.file_path,
+            .start_line = loc.line,
+            .start_col = loc.col,
+            .end_line = loc.line,
+            .end_col = loc.col + @as(u32, @intCast(elem.tag_name.len)) + 1, // +1 for <
+        });
     }
 }
 
@@ -792,5 +850,76 @@ test "invalid-rune-usage: variable referencing state is valid" {
     try runDiagnostics(allocator, &ast, &diagnostics);
 
     // Using the variable 'count' (not $state) in template is correct
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+// ============================================================================
+// slot-element-deprecated tests
+// ============================================================================
+
+test "slot-element-deprecated: warns on <slot>" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<slot />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("slot_element_deprecated", diagnostics.items[0].code.?);
+    try std.testing.expectEqual(Severity.warning, diagnostics.items[0].severity);
+}
+
+test "slot-element-deprecated: warns on <slot> with props" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<slot {x} {y} />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("slot_element_deprecated", diagnostics.items[0].code.?);
+}
+
+test "slot-element-deprecated: respects svelte-ignore" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<!-- svelte-ignore slot_element_deprecated -->\n<slot />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "slot-element-deprecated: regular elements not affected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<div>content</div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }

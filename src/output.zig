@@ -104,15 +104,18 @@ fn printMachine(file: std.fs.File, diagnostics: []const Diagnostic) !void {
             .@"error" => "ERROR",
             .warning => "WARNING",
         };
-        const line = std.fmt.bufPrint(&buf, "{d} {s} \"{s}\" {d}:{d} \"{s}\"\n", .{
+        const prefix = std.fmt.bufPrint(&buf, "{d} {s} \"{s}\" {d}:{d} \"", .{
             timestamp,
             severity_str,
             d.file_path,
             d.start_line,
             d.start_col,
-            d.message,
         }) catch continue;
-        try file.writeAll(line);
+        try file.writeAll(prefix);
+
+        // Write message with escaped newlines (svelte-check format)
+        try writeEscaped(file, d.message);
+        try file.writeAll("\"\n");
     }
 
     var errors: usize = 0;
@@ -132,6 +135,19 @@ fn printMachine(file: std.fs.File, diagnostics: []const Diagnostic) !void {
         files_count,
     }) catch return;
     try file.writeAll(completed);
+}
+
+/// Writes a string with escaped newlines (literal \n instead of newline char).
+fn writeEscaped(file: std.fs.File, message: []const u8) !void {
+    var start: usize = 0;
+    for (message, 0..) |c, i| {
+        if (c == '\n') {
+            if (i > start) try file.writeAll(message[start..i]);
+            try file.writeAll("\\n");
+            start = i + 1;
+        }
+    }
+    if (start < message.len) try file.writeAll(message[start..]);
 }
 
 /// NDJSON format compatible with svelte-check's machine-verbose output.
