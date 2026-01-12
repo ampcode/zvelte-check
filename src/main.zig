@@ -192,6 +192,19 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
 
     // 5. Run tsgo (skip when js diagnostics disabled or --no-tsconfig)
     if (!args.no_tsconfig and args.diagnostic_sources.js) {
+        // Collect files with fatal Svelte errors that make TS checking unreliable
+        var files_with_fatal_errors: std.StringHashMapUnmanaged(void) = .empty;
+        for (all_diagnostics.items) |d| {
+            if (d.source == .svelte and d.severity == .@"error") {
+                if (d.code) |code| {
+                    // experimental_async is a fatal compiler error - generated TS is invalid
+                    if (std.mem.eql(u8, code, "experimental_async")) {
+                        try files_with_fatal_errors.put(allocator, d.file_path, {});
+                    }
+                }
+            }
+        }
+
         const ts_diagnostics = tsgo.check(allocator, virtual_files.items, args.workspace, args.tsconfig) catch |err| {
             if (err == tsgo.TsgoNotFoundError.TsgoNotFound) {
                 const stderr = std.fs.File.stderr();
@@ -205,6 +218,8 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
         };
 
         for (ts_diagnostics) |d| {
+            // Skip TS errors for files with fatal Svelte errors (TS output is invalid)
+            if (files_with_fatal_errors.contains(d.file_path)) continue;
             try all_diagnostics.append(allocator, d);
         }
     }

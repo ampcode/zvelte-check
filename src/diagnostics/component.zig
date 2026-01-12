@@ -1,8 +1,10 @@
 //! Component diagnostics for Svelte
 //!
 //! Checks for component-level issues:
-//! - unused-export-let: Exported props not used in the template
+//! - experimental_async: await expressions in templates or top-level script
 //! - invalid-rune-usage: Rune calls ($state, $derived, etc.) in template expressions
+//! - unused-export-let: Exported props not used in the template
+//! - slot_element_deprecated: <slot> elements (use {@render} in Svelte 5)
 
 const std = @import("std");
 const Ast = @import("../svelte_parser.zig").Ast;
@@ -31,6 +33,8 @@ const RUNES = [_][]const u8{
     "$host",
 };
 
+const EXPERIMENTAL_ASYNC_ERROR = "Cannot use `await` in deriveds and template expressions, or at the top level of a component, unless the `experimental.async` compiler option is `true`";
+
 const ExportLet = struct {
     name: []const u8,
     offset: u32, // Position in source for error reporting
@@ -41,9 +45,182 @@ pub fn runDiagnostics(
     ast: *const Ast,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !void {
+    try checkExperimentalAsync(allocator, ast, diagnostics);
     try checkInvalidRuneUsage(allocator, ast, diagnostics);
     try checkUnusedExportLet(allocator, ast, diagnostics);
     try checkSlotDeprecation(allocator, ast, diagnostics);
+}
+
+/// Detects await usage where experimental_async is required.
+/// Checks for await in:
+/// - Top-level script code (not inside functions)
+/// - Template expressions
+/// - Control flow block conditions
+/// - Attribute expressions
+fn checkExperimentalAsync(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    // Find instance script (not context="module")
+    for (ast.scripts.items) |script| {
+        if (script.context != null and std.mem.eql(u8, script.context.?, "module")) {
+            continue;
+        }
+
+        const script_content = ast.source[script.content_start..script.content_end];
+
+        // Check for top-level await in script
+        if (findTopLevelAwait(script_content)) |await_pos| {
+            const loc = computeLineCol(ast.source, script.content_start + await_pos);
+            try diagnostics.append(allocator, .{
+                .source = .svelte,
+                .severity = .@"error",
+                .code = "experimental_async",
+                .message = EXPERIMENTAL_ASYNC_ERROR,
+                .file_path = ast.file_path,
+                .start_line = loc.line,
+                .start_col = loc.col,
+                .end_line = loc.line,
+                .end_col = loc.col + 5, // "await" is 5 chars
+            });
+            return; // svelte-check stops after first await error
+        }
+    }
+
+    // Check template expressions
+    for (ast.nodes.items) |node| {
+        const expr_content = switch (node.kind) {
+            .expression, .if_block, .each_block, .key_block, .snippet, .render, .const_tag => ast.source[node.start..node.end],
+            else => continue,
+        };
+
+        if (containsAwait(expr_content)) |await_pos| {
+            const loc = computeLineCol(ast.source, node.start + await_pos);
+            try diagnostics.append(allocator, .{
+                .source = .svelte,
+                .severity = .@"error",
+                .code = "experimental_async",
+                .message = EXPERIMENTAL_ASYNC_ERROR,
+                .file_path = ast.file_path,
+                .start_line = loc.line,
+                .start_col = loc.col,
+                .end_line = loc.line,
+                .end_col = loc.col + 5,
+            });
+            return;
+        }
+    }
+
+    // Check attribute expressions
+    for (ast.attributes.items) |attr| {
+        const value = attr.value orelse continue;
+        if (!std.mem.startsWith(u8, value, "{")) continue;
+
+        if (containsAwait(value)) |await_pos| {
+            const loc = computeLineCol(ast.source, attr.start + await_pos);
+            try diagnostics.append(allocator, .{
+                .source = .svelte,
+                .severity = .@"error",
+                .code = "experimental_async",
+                .message = EXPERIMENTAL_ASYNC_ERROR,
+                .file_path = ast.file_path,
+                .start_line = loc.line,
+                .start_col = loc.col,
+                .end_line = loc.line,
+                .end_col = loc.col + 5,
+            });
+            return;
+        }
+    }
+}
+
+/// Find first top-level await in script content.
+/// Tracks nesting depth to skip await inside functions.
+fn findTopLevelAwait(content: []const u8) ?u32 {
+    var i: usize = 0;
+    var brace_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Skip string literals
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        // Skip comments
+        if (c == '/' and i + 1 < content.len) {
+            if (content[i + 1] == '/') {
+                // Line comment
+                while (i < content.len and content[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (content[i + 1] == '*') {
+                // Block comment
+                i += 2;
+                while (i + 1 < content.len) {
+                    if (content[i] == '*' and content[i + 1] == '/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // Track nesting
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+        if (c == '(') paren_depth += 1;
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+
+        // Check for "await" at top level (not inside braces)
+        if (brace_depth == 0 and startsWithKeyword(content[i..], "await")) {
+            // Make sure it's not "awaited" or similar
+            const after = i + 5;
+            if (after >= content.len or !isIdentChar(content[after])) {
+                return @intCast(i);
+            }
+        }
+
+        i += 1;
+    }
+
+    return null;
+}
+
+/// Check if expression contains await keyword (not inside a string).
+fn containsAwait(text: []const u8) ?u32 {
+    var search_start: usize = 0;
+
+    while (std.mem.indexOfPos(u8, text, search_start, "await")) |pos| {
+        // Check right boundary: must not be part of larger identifier
+        const after = pos + 5;
+        if (after < text.len and isIdentChar(text[after])) {
+            search_start = pos + 1;
+            continue;
+        }
+
+        // Check left boundary: must not be part of larger identifier
+        if (pos > 0 and isIdentChar(text[pos - 1])) {
+            search_start = pos + 1;
+            continue;
+        }
+
+        // Check if inside string
+        if (isInsideString(text, pos)) {
+            search_start = pos + 1;
+            continue;
+        }
+
+        return @intCast(pos);
+    }
+
+    return null;
 }
 
 /// Detects rune calls ($state, $derived, etc.) in template expressions.
@@ -921,5 +1098,120 @@ test "slot-element-deprecated: regular elements not affected" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     try runDiagnostics(allocator, &ast, &diagnostics);
 
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+// ============================================================================
+// experimental_async tests
+// ============================================================================
+
+test "experimental_async: await at top level in script" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script>
+        \\  const foo = await fetch('/api');
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("experimental_async", diagnostics.items[0].code.?);
+}
+
+test "experimental_async: await inside function is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script>
+        \\  async function load() {
+        \\    const data = await fetch('/api');
+        \\    return data;
+        \\  }
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "experimental_async: await in template expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<p>{await promise}</p>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("experimental_async", diagnostics.items[0].code.?);
+}
+
+test "experimental_async: await in if block condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "{#if await promise}<p>yes</p>{/if}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("experimental_async", diagnostics.items[0].code.?);
+}
+
+test "experimental_async: await in each block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "{#each await items as item}<li>{item}</li>{/each}";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+}
+
+test "experimental_async: string containing await is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<p>{'await is a keyword'}</p>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // "await" inside a string is not an await expression
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
