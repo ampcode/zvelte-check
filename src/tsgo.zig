@@ -940,6 +940,14 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         if (std.mem.indexOf(u8, message, "All imports in import declaration are unused") != null) {
             return true;
         }
+
+        // Skip "Top-level 'await' expressions are only allowed" errors
+        // Svelte has its own validation for await in templates/deriveds (experimental.async),
+        // so TypeScript's module-level await errors are misleading. Svelte compiles await
+        // expressions specially in templates, making TS's static analysis incorrect.
+        if (std.mem.indexOf(u8, message, "Top-level 'await' expressions are only allowed") != null) {
+            return true;
+        }
     }
 
     // Errors to skip for both .svelte and .ts files
