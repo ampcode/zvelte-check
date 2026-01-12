@@ -197,6 +197,10 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             \\declare function __svelte_store_get<T>(store: SvelteStore<T>): T;
             \\declare function __svelte_store_get<Store extends SvelteStore<any> | undefined | null>(store: Store): Store extends SvelteStore<infer T> ? T : Store;
             \\
+            \\// Array type validation for {#each} blocks
+            \\// Ensures the iterable is actually array-like, generating type errors for incompatible types
+            \\declare function __svelte_ensureArray<T extends ArrayLike<unknown> | null | undefined>(array: T): T extends ArrayLike<infer U> ? U[] : any[];
+            \\
             \\
         );
     } else {
@@ -287,7 +291,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         if (instance_generics != null) {
             // For generic components, emit template expressions INSIDE __render
             // so they can access script variables (which are scoped to __render).
-            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names);
+            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript);
             try output.appendSlice(allocator, "\n}\n\n");
         } else {
             try output.appendSlice(allocator, "\n\n");
@@ -296,7 +300,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
 
     // For non-generic components, emit template expressions at module level
     if (instance_generics == null) {
-        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names);
+        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript);
     }
 
     // Extract props from instance script
@@ -1416,6 +1420,7 @@ fn emitTemplateExpressions(
     output: *std.ArrayList(u8),
     mappings: *std.ArrayList(SourceMap.Mapping),
     declared_names: std.StringHashMapUnmanaged(void),
+    is_typescript: bool,
 ) !void {
     var has_expressions = false;
 
@@ -1511,7 +1516,7 @@ fn emitTemplateExpressions(
                         try output.appendSlice(allocator, "// Template expressions\n");
                         has_expressions = true;
                     }
-                    try emitEachBindingDeclarations(allocator, output, binding, binding.iterable);
+                    try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
                 }
             },
 
@@ -1616,7 +1621,7 @@ fn emitTemplateExpressions(
 
     // Fallback: scan template source directly for {#each} patterns not captured by AST
     // The parser sometimes misses {#each} blocks inside component elements
-    try scanTemplateForEachBlocks(allocator, ast, output, &template_refs, &has_expressions);
+    try scanTemplateForEachBlocks(allocator, ast, output, mappings, &template_refs, &has_expressions, is_typescript);
 
     // Emit void statements for template-referenced identifiers
     // This marks them as "used" for noUnusedLocals checking
@@ -1973,8 +1978,10 @@ fn scanTemplateForEachBlocks(
     allocator: std.mem.Allocator,
     ast: *const Ast,
     output: *std.ArrayList(u8),
+    mappings: *std.ArrayList(SourceMap.Mapping),
     template_refs: *std.StringHashMapUnmanaged(u32),
     has_expressions: *bool,
+    is_typescript: bool,
 ) !void {
     // Find template portion (after scripts, before styles)
     var template_start: usize = 0;
@@ -2049,12 +2056,15 @@ fn scanTemplateForEachBlocks(
 
         // Special handling for {#each} - emit binding declarations
         if (std.mem.startsWith(u8, full_expr, "{#each ")) {
-            if (extractEachBindings(template, @intCast(expr_start), @intCast(j))) |binding| {
+            // Compute absolute offset for source mapping (template_start + expr_start)
+            const abs_start: u32 = @intCast(template_start + expr_start);
+            const abs_end: u32 = @intCast(template_start + j);
+            if (extractEachBindings(ast.source, abs_start, abs_end)) |binding| {
                 if (!has_expressions.*) {
                     try output.appendSlice(allocator, "// Template expressions\n");
                     has_expressions.* = true;
                 }
-                try emitEachBindingDeclarations(allocator, output, binding, binding.iterable);
+                try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
             }
         }
 
@@ -2260,20 +2270,38 @@ fn isJsKeywordOrBuiltin(name: []const u8) bool {
 fn emitEachBindingDeclarations(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
+    mappings: *std.ArrayList(SourceMap.Mapping),
     binding: EachBindingInfo,
     iterable: []const u8,
+    is_typescript: bool,
 ) !void {
-    // Emit item binding: var item = ((iterable) ?? [])[0];
+    // Emit item binding: var item = __svelte_ensureArray(iterable)[0];
     // Using var allows redeclaration for multiple blocks with same name
-    // The ?? [] fallback handles null/undefined iterables (Svelte treats them as empty)
+    // The __svelte_ensureArray validates the iterable is array-like (generating TS errors if not)
+    // and handles null/undefined by returning empty array
     // Also transform [...x] spreads inside the iterable to [...(x ?? [])] for null safety
     const safe_iterable = try makeIterableNullSafe(allocator, iterable);
 
     try output.appendSlice(allocator, "var ");
     try output.appendSlice(allocator, binding.item_binding);
-    try output.appendSlice(allocator, " = ((");
-    try output.appendSlice(allocator, safe_iterable);
-    try output.appendSlice(allocator, ") ?? [])[0];\n");
+    if (is_typescript) {
+        // Use __svelte_ensureArray for type validation in TypeScript
+        try output.appendSlice(allocator, " = __svelte_ensureArray(");
+        // Add source map for the iterable expression inside __svelte_ensureArray()
+        // This maps TS errors on the iterable back to the {#each} block in Svelte source
+        try mappings.append(allocator, .{
+            .svelte_offset = binding.offset,
+            .ts_offset = @intCast(output.items.len),
+            .len = @intCast(safe_iterable.len),
+        });
+        try output.appendSlice(allocator, safe_iterable);
+        try output.appendSlice(allocator, ")[0];\n");
+    } else {
+        // For JavaScript, just use simple indexing with null coalescing
+        try output.appendSlice(allocator, " = ((");
+        try output.appendSlice(allocator, safe_iterable);
+        try output.appendSlice(allocator, ") ?? [])[0];\n");
+    }
 
     // Emit index binding if present: var i = 0;
     if (binding.index_binding) |idx| {
@@ -2547,26 +2575,57 @@ fn extractEachExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
 }
 
 /// Extracts iterable and bindings from {#each items as item, i (key)}
+/// Also handles {#each expr} without bindings (generates synthetic item binding)
 fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInfo {
     const content = source[start..end];
-    // Format: {#each expr as item, index (key)}
+    // Format: {#each expr as item, index (key)} or just {#each expr}
     const prefix = "{#each ";
     const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
     const expr_start = idx + prefix.len;
 
-    // Find " as " keyword
-    const as_pos = findAsKeyword(content[expr_start..]) orelse return null;
-    const iterable = std.mem.trim(u8, content[expr_start .. expr_start + as_pos], " \t\n\r");
-    if (iterable.len == 0) return null;
+    // Find " as " keyword - may not exist for {#each expr} without bindings
+    const as_pos_opt = findAsKeyword(content[expr_start..]);
 
-    // Parse bindings after "as"
-    const binding_start = expr_start + as_pos + 4; // skip " as "
-    const binding_end = findEachBindingEnd(content, binding_start);
-    const bindings = std.mem.trim(u8, content[binding_start..binding_end], " \t\n\r");
-    if (bindings.len == 0) return null;
+    var iterable: []const u8 = undefined;
+    var item_binding: []const u8 = "$$each_item"; // synthetic binding for no-as case
+    var index_binding: ?[]const u8 = null;
+    var key_expr: ?[]const u8 = null;
+    var binding_end: usize = content.len;
+
+    if (as_pos_opt) |as_pos| {
+        iterable = std.mem.trim(u8, content[expr_start .. expr_start + as_pos], " \t\n\r");
+        if (iterable.len == 0) return null;
+
+        // Parse bindings after "as"
+        const bind_start = expr_start + as_pos + 4; // skip " as "
+        binding_end = findEachBindingEnd(content, bind_start);
+        const bindings = std.mem.trim(u8, content[bind_start..binding_end], " \t\n\r");
+        if (bindings.len == 0) return null;
+
+        // Split on comma to get item and optional index, respecting brackets
+        item_binding = bindings;
+
+        // Find comma at top level (not inside brackets)
+        if (findTopLevelComma(bindings)) |comma_pos| {
+            item_binding = std.mem.trim(u8, bindings[0..comma_pos], " \t\n\r");
+            const after_comma = std.mem.trim(u8, bindings[comma_pos + 1 ..], " \t\n\r");
+            // Index might be followed by (key) - extract just the identifier
+            if (std.mem.indexOf(u8, after_comma, "(")) |paren_pos| {
+                index_binding = std.mem.trim(u8, after_comma[0..paren_pos], " \t\n\r");
+            } else {
+                index_binding = after_comma;
+            }
+        }
+    } else {
+        // No "as" keyword - {#each expr} without bindings
+        // Find the closing } to get the expression
+        const close_pos = std.mem.indexOf(u8, content[expr_start..], "}") orelse return null;
+        iterable = std.mem.trim(u8, content[expr_start .. expr_start + close_pos], " \t\n\r");
+        if (iterable.len == 0) return null;
+        binding_end = expr_start + close_pos;
+    }
 
     // Extract key expression if present: (key) after bindings
-    var key_expr: ?[]const u8 = null;
     if (binding_end < content.len and content[binding_end] == '(') {
         // Find the matching closing paren
         var paren_depth: u32 = 1;
@@ -2583,28 +2642,12 @@ fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInf
         }
     }
 
-    // Split on comma to get item and optional index, respecting brackets
-    var item_binding: []const u8 = bindings;
-    var index_binding: ?[]const u8 = null;
-
-    // Find comma at top level (not inside brackets)
-    if (findTopLevelComma(bindings)) |comma_pos| {
-        item_binding = std.mem.trim(u8, bindings[0..comma_pos], " \t\n\r");
-        const after_comma = std.mem.trim(u8, bindings[comma_pos + 1 ..], " \t\n\r");
-        // Index might be followed by (key) - extract just the identifier
-        if (std.mem.indexOf(u8, after_comma, "(")) |paren_pos| {
-            index_binding = std.mem.trim(u8, after_comma[0..paren_pos], " \t\n\r");
-        } else {
-            index_binding = after_comma;
-        }
-    }
-
     return .{
         .iterable = iterable,
         .item_binding = item_binding,
         .index_binding = index_binding,
         .key_expr = key_expr,
-        .offset = @intCast(expr_start),
+        .offset = start + @as(u32, @intCast(expr_start)),
     };
 }
 
@@ -5797,8 +5840,8 @@ test "spread props in lowercase tags are detected" {
 
 test "each block with nullable iterable emits null-safe fallback" {
     // Svelte tolerates null/undefined iterables in {#each} (treats them as empty).
-    // The generated TS must use ?? [] fallback to avoid "Type 'null' must have
-    // a '[Symbol.iterator]()' method" errors.
+    // For TypeScript files, we use __svelte_ensureArray which validates the iterable type
+    // and handles null/undefined. For JS files, we use ?? [] fallback directly.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -5818,8 +5861,8 @@ test "each block with nullable iterable emits null-safe fallback" {
 
     const virtual = try transform(allocator, ast);
 
-    // The generated binding should use ?? [] fallback for null safety
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "((items) ?? [])[0]") != null);
+    // For TypeScript, we use __svelte_ensureArray for type validation
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "__svelte_ensureArray(items)[0]") != null);
 }
 
 test "each block with spread of nullable array emits null-safe fallback" {
