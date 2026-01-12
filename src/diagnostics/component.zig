@@ -49,6 +49,7 @@ pub fn runDiagnostics(
     try checkInvalidRuneUsage(allocator, ast, diagnostics);
     try checkUnusedExportLet(allocator, ast, diagnostics);
     try checkSlotDeprecation(allocator, ast, diagnostics);
+    try checkNonHoistableDeclarations(allocator, ast, diagnostics);
 }
 
 /// Detects await usage where experimental_async is required.
@@ -460,6 +461,124 @@ fn checkSlotDeprecation(
             .end_line = loc.line,
             .end_col = loc.col + @as(u32, @intCast(elem.tag_name.len)) + 1, // +1 for <
         });
+    }
+}
+
+/// Detects non-hoistable TypeScript declarations in instance scripts.
+/// TypeScript `namespace` and `enum` declarations are not supported in Svelte instance
+/// scripts because they cannot be hoisted out of the component's scope. These constructs
+/// should be moved to a separate .ts module and imported.
+///
+/// Note: This only applies to TypeScript (lang="ts") instance scripts. Module scripts
+/// (context="module") are at module scope where these declarations are valid.
+fn checkNonHoistableDeclarations(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    // Find instance script (not context="module") with lang="ts"
+    for (ast.scripts.items) |script| {
+        // Skip module scripts - they're at module scope where namespace/enum are allowed
+        if (script.context != null and std.mem.eql(u8, script.context.?, "module")) {
+            continue;
+        }
+
+        // Only check TypeScript instance scripts
+        const is_typescript = if (script.lang) |lang|
+            std.mem.eql(u8, lang, "ts") or std.mem.eql(u8, lang, "typescript")
+        else
+            false;
+
+        // generics attribute also implies TypeScript mode
+        const has_generics = script.generics != null;
+
+        if (!is_typescript and !has_generics) continue;
+
+        // For generic components, the script is wrapped in a function which makes
+        // namespace/enum naturally invalid - TypeScript will report the error.
+        // We only need to catch this for non-generic TypeScript scripts.
+        if (has_generics) continue;
+
+        const script_content = ast.source[script.content_start..script.content_end];
+
+        // Scan for namespace/enum declarations at top level
+        try scanNonHoistableDeclarations(allocator, script_content, script.content_start, ast.source, ast.file_path, diagnostics);
+    }
+}
+
+/// Scans script content for top-level namespace/enum declarations.
+fn scanNonHoistableDeclarations(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    base_offset: u32,
+    full_source: []const u8,
+    file_path: []const u8,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    var i: usize = 0;
+    var brace_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Track nesting depth
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+        if (c == '(') paren_depth += 1;
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        // Skip single-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
+            while (i < content.len and content[i] != '\n') : (i += 1) {}
+            continue;
+        }
+
+        // Skip multi-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < content.len) {
+                if (content[i] == '*' and content[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Only look at top-level declarations
+        if (brace_depth == 0 and paren_depth == 0 and isIdentStart(c)) {
+            const kw_start = i;
+            while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+            const ident = content[kw_start..i];
+
+            if (std.mem.eql(u8, ident, "namespace")) {
+                const abs_offset = base_offset + @as(u32, @intCast(kw_start));
+                const location = computeLineCol(full_source, abs_offset);
+
+                try diagnostics.append(allocator, .{
+                    .source = .svelte,
+                    .severity = .@"error",
+                    .code = "non_hoistable_declaration",
+                    .message = "A namespace declaration is only allowed at the top level of a namespace or module.",
+                    .file_path = file_path,
+                    .start_line = location.line,
+                    .start_col = location.col,
+                    .end_line = location.line,
+                    .end_col = location.col + @as(u32, @intCast(ident.len)),
+                });
+            }
+            continue;
+        }
+
+        i += 1;
     }
 }
 
@@ -1213,5 +1332,101 @@ test "experimental_async: string containing await is valid" {
     try runDiagnostics(allocator, &ast, &diagnostics);
 
     // "await" inside a string is not an await expression
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+// ============================================================================
+// non-hoistable-declaration tests
+// ============================================================================
+
+test "non-hoistable-declaration: namespace in TypeScript instance script" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\namespace A {
+        \\    export type Abc = number;
+        \\}
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("non_hoistable_declaration", diagnostics.items[0].code.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "namespace") != null);
+}
+
+test "non-hoistable-declaration: namespace in module script is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script context="module" lang="ts">
+        \\namespace A {
+        \\    export type Abc = number;
+        \\}
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Module scripts are at module scope where namespace is valid
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "non-hoistable-declaration: namespace in JavaScript script is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script>
+        \\const namespace = { A: 1 };
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // JavaScript scripts don't have TypeScript namespace declarations
+    // "namespace" here is just a variable name
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "non-hoistable-declaration: namespace inside function is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\function foo() {
+        \\    const namespace = 1;
+        \\}
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // "namespace" inside a function is just a variable, not a declaration
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
