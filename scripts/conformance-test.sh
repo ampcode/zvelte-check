@@ -137,6 +137,7 @@ normalize_output() {
     # Also normalize escaped quotes (\") to unescaped quotes (") for comparison
     # Truncate multi-line error messages (TypeScript adds context lines that vary between implementations)
     # Normalize trailing quote (some get truncated, some don't)
+    # Deduplicate because svelte-check reports parser errors from both Svelte and TS sources
     grep -E "^[0-9]+ (ERROR|WARNING)" "$input" 2>/dev/null | \
         sed -E 's/^[0-9]+ //' | \
         sed -E "s|\"[^\"]*/$sample_name/([^\"]+)\"|\"\\1\"|g" | \
@@ -144,7 +145,7 @@ normalize_output() {
         sed 's/\\"/"/g' | \
         sed -E 's/\\n.*//' | \
         sed -E 's/"$//' | \
-        sort || true
+        sort -u || true
 }
 
 # Run tests

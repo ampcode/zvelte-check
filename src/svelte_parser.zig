@@ -85,6 +85,12 @@ pub const CommentData = struct {
     ignore_codes_end: u32, // Exclusive end index
 };
 
+/// Info about an open element for unclosed tag tracking
+pub const OpenElement = struct {
+    tag_name: []const u8,
+    start: u32, // Position in source
+};
+
 pub const Ast = struct {
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -97,6 +103,7 @@ pub const Ast = struct {
     attributes: std.ArrayList(AttributeData),
     comments: std.ArrayList(CommentData),
     ignore_codes: std.ArrayList([]const u8), // Parsed svelte-ignore codes
+    parse_errors: std.ArrayList(Diagnostic), // Parser errors (unclosed tags, etc.)
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8, file_path: []const u8) Ast {
         return .{
@@ -110,6 +117,7 @@ pub const Ast = struct {
             .attributes = .empty,
             .comments = .empty,
             .ignore_codes = .empty,
+            .parse_errors = .empty,
         };
     }
 
@@ -126,6 +134,9 @@ pub const Ast = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         sources: DiagnosticSources,
     ) !void {
+        // Include parser errors (unclosed tags, etc.)
+        try diagnostics.appendSlice(allocator, self.parse_errors.items);
+
         if (sources.svelte) {
             try a11y.runDiagnostics(allocator, self, diagnostics);
             try component.runDiagnostics(allocator, self, diagnostics);
@@ -136,12 +147,26 @@ pub const Ast = struct {
     }
 };
 
+/// HTML void elements that don't need closing tags
+const VOID_ELEMENTS = [_][]const u8{
+    "area", "base", "br",    "col",    "embed", "hr",  "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+};
+
+fn isVoidElement(tag_name: []const u8) bool {
+    for (VOID_ELEMENTS) |void_tag| {
+        if (std.ascii.eqlIgnoreCase(tag_name, void_tag)) return true;
+    }
+    return false;
+}
+
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     lexer: Lexer,
     current: Token,
     source: []const u8,
     file_path: []const u8,
+    element_stack: std.ArrayList(OpenElement),
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8, file_path: []const u8) Parser {
         var lexer = Lexer.init(source, file_path);
@@ -152,6 +177,7 @@ pub const Parser = struct {
             .current = first,
             .source = source,
             .file_path = file_path,
+            .element_stack = .empty,
         };
     }
 
@@ -182,6 +208,26 @@ pub const Parser = struct {
             }
         }
 
+        // Report any unclosed elements
+        for (self.element_stack.items) |open_elem| {
+            const loc = computeLineCol(self.source, open_elem.start);
+            try ast.parse_errors.append(self.allocator, .{
+                .source = .svelte,
+                .severity = .@"error",
+                .code = null,
+                .message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "`<{s}>` was left open",
+                    .{open_elem.tag_name},
+                ),
+                .file_path = self.file_path,
+                .start_line = loc.line,
+                .start_col = loc.col,
+                .end_line = loc.line,
+                .end_col = loc.col + @as(u32, @intCast(open_elem.tag_name.len)) + 1, // +1 for <
+            });
+        }
+
         return ast;
     }
 
@@ -195,6 +241,10 @@ pub const Parser = struct {
             },
             .text => try self.parseText(ast),
             .lt => try self.parseElement(ast),
+            .lt_slash => {
+                try self.parseClosingTag();
+                return Node.NONE;
+            },
             .lbrace => try self.parseExpression(ast),
             .comment => try self.parseComment(ast),
             else => {
@@ -419,7 +469,66 @@ pub const Parser = struct {
             .data = data_idx,
         });
 
+        // Track open elements for unclosed tag detection
+        // Don't track self-closing elements, void elements, or components
+        if (!is_self_closing and !is_component and !isVoidElement(tag_name)) {
+            try self.element_stack.append(self.allocator, .{
+                .tag_name = tag_name,
+                .start = start,
+            });
+        }
+
         return node_idx;
+    }
+
+    /// Parse closing tag </tagname> and pop from element stack
+    fn parseClosingTag(self: *Parser) !void {
+        self.advance(); // consume </
+
+        // Get tag name
+        if (self.current.kind != .identifier) {
+            // Skip malformed closing tag
+            while (self.current.kind != .gt and self.current.kind != .eof) {
+                self.advance();
+            }
+            if (self.current.kind == .gt) self.advance();
+            return;
+        }
+
+        const tag_name_start = self.current.start;
+        var tag_name_end = self.current.end;
+        const initial_name = self.current.slice(self.source);
+        self.advance();
+
+        // Handle svelte: special tags
+        if (std.mem.eql(u8, initial_name, "svelte") and self.current.kind == .colon) {
+            self.advance(); // consume :
+            if (self.current.kind == .identifier) {
+                tag_name_end = self.current.end;
+                self.advance();
+            }
+        }
+
+        const tag_name = self.source[tag_name_start..tag_name_end];
+
+        // Skip to >
+        while (self.current.kind != .gt and self.current.kind != .eof) {
+            self.advance();
+        }
+        if (self.current.kind == .gt) self.advance();
+
+        // Pop matching element from stack
+        // Search from top of stack (most recent) to find matching tag
+        var i = self.element_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.element_stack.items[i].tag_name, tag_name)) {
+                _ = self.element_stack.orderedRemove(i);
+                return;
+            }
+        }
+        // No matching opening tag found - that's a different error (unmatched close tag)
+        // For now we just ignore it
     }
 
     fn parseExpression(self: *Parser, ast: *Ast) !u32 {
@@ -755,6 +864,22 @@ fn parseScriptTagAttrs(tag: []const u8) ScriptTagAttrs {
     }
 
     return .{ .lang = lang, .context = context, .generics = generics };
+}
+
+/// Convert byte offset to line and column (1-indexed).
+fn computeLineCol(source: []const u8, pos: u32) struct { line: u32, col: u32 } {
+    var line: u32 = 1;
+    var col: u32 = 1;
+
+    for (source[0..@min(pos, source.len)]) |c| {
+        if (c == '\n') {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    return .{ .line = line, .col = col };
 }
 
 test "parse simple svelte" {
@@ -2072,4 +2197,72 @@ test "parse complex snippet with multiple const and regex" {
     }
     try std.testing.expect(found_snippet);
     try std.testing.expectEqual(@as(u32, 2), const_count);
+}
+
+// ============================================================================
+// Unclosed element detection tests
+// ============================================================================
+
+test "unclosed element detected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<div>\n\t<p></p>\n\t\n\t<div></div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    // Should have one parse error for unclosed <div>
+    try std.testing.expectEqual(@as(usize, 1), ast.parse_errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, ast.parse_errors.items[0].message, "<div>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ast.parse_errors.items[0].message, "left open") != null);
+}
+
+test "properly closed elements no error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<div><p>Hello</p></div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    try std.testing.expectEqual(@as(usize, 0), ast.parse_errors.items.len);
+}
+
+test "self-closing element no error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<div><img src=\"test.png\" /></div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    try std.testing.expectEqual(@as(usize, 0), ast.parse_errors.items.len);
+}
+
+test "void elements no closing tag needed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<div><br><hr><input type=\"text\"></div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    try std.testing.expectEqual(@as(usize, 0), ast.parse_errors.items.len);
+}
+
+test "multiple unclosed elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<div><span><p>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    // Should have three parse errors
+    try std.testing.expectEqual(@as(usize, 3), ast.parse_errors.items.len);
 }

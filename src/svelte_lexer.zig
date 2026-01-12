@@ -143,7 +143,9 @@ pub const Lexer = struct {
                 self.in_style = false;
                 return .{ .kind = .style_end, .start = start, .end = self.pos };
             }
-            return .{ .kind = .lt_slash, .start = start, .end = start + 2 };
+            // Backtrack to just after </ so the tag name can be lexed separately
+            self.pos = name_start;
+            return .{ .kind = .lt_slash, .start = start, .end = name_start };
         }
 
         // Check for script/style start
