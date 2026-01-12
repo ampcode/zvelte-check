@@ -179,42 +179,10 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         try output.appendSlice(allocator, "\n\n");
     }
 
-    // Emit instance script content (if any)
-    // For generic components, wrap in a render function to preserve type parameter semantics
-    if (instance_script) |script| {
-        if (instance_generics) |generics| {
-            // Wrap in generic render function like svelte2tsx does.
-            // This ensures type parameters like T in $state<T>(0) trigger proper type checking.
-            try output.appendSlice(allocator, "// <script>\nfunction __render<");
-            try output.appendSlice(allocator, generics);
-            try output.appendSlice(allocator, ">() {\n");
-        } else {
-            try output.appendSlice(allocator, "// <script>\n");
-        }
-
-        const raw_content = ast.source[script.content_start..script.content_end];
-        const filtered = try filterSvelteImports(allocator, raw_content);
-        const reactive_transformed = try transformReactiveStatements(allocator, filtered);
-        const content = try transformStoreSubscriptions(allocator, reactive_transformed);
-
-        try mappings.append(allocator, .{
-            .svelte_offset = script.content_start,
-            .ts_offset = @intCast(output.items.len),
-            .len = @intCast(raw_content.len),
-        });
-
-        try output.appendSlice(allocator, content);
-
-        if (instance_generics != null) {
-            try output.appendSlice(allocator, "\n}\n\n");
-        } else {
-            try output.appendSlice(allocator, "\n\n");
-        }
-    }
-
     // Extract declared names from scripts to avoid snippet declaration conflicts.
     // In Svelte, template snippets like {#snippet filter()} can shadow script imports,
     // but in generated TS they'd conflict at module scope.
+    // We need this before emitTemplateExpressions, so extract it first.
     var declared_names: std.StringHashMapUnmanaged(void) = .empty;
     defer declared_names.deinit(allocator);
 
@@ -237,8 +205,53 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         }
     }
 
-    // Extract and emit template expressions for type checking
-    try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names);
+    // Emit instance script content (if any)
+    // For generic components, wrap in a render function to preserve type parameter semantics
+    if (instance_script) |script| {
+        if (instance_generics) |generics| {
+            // Wrap in async generic render function like svelte2tsx does.
+            // async allows await expressions to be valid TypeScript syntax.
+            // This ensures type parameters like T in $state<T>(0) trigger proper type checking.
+            try output.appendSlice(allocator, "// <script>\nasync function __render<");
+            try output.appendSlice(allocator, generics);
+            try output.appendSlice(allocator, ">() {\n");
+        } else {
+            try output.appendSlice(allocator, "// <script>\n");
+        }
+
+        const raw_content = ast.source[script.content_start..script.content_end];
+        const filtered = try filterSvelteImports(allocator, raw_content);
+        const reactive_transformed = try transformReactiveStatements(allocator, filtered);
+        const store_transformed = try transformStoreSubscriptions(allocator, reactive_transformed);
+        // For generic components, strip 'export' keyword since it's invalid inside a function.
+        // The exports are already tracked in $$Exports interface.
+        const content = if (instance_generics != null)
+            try stripExportKeyword(allocator, store_transformed)
+        else
+            store_transformed;
+
+        try mappings.append(allocator, .{
+            .svelte_offset = script.content_start,
+            .ts_offset = @intCast(output.items.len),
+            .len = @intCast(raw_content.len),
+        });
+
+        try output.appendSlice(allocator, content);
+
+        if (instance_generics != null) {
+            // For generic components, emit template expressions INSIDE __render
+            // so they can access script variables (which are scoped to __render).
+            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names);
+            try output.appendSlice(allocator, "\n}\n\n");
+        } else {
+            try output.appendSlice(allocator, "\n\n");
+        }
+    }
+
+    // For non-generic components, emit template expressions at module level
+    if (instance_generics == null) {
+        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names);
+    }
 
     // Extract props from instance script
     var props: std.ArrayList(PropInfo) = .empty;
@@ -2851,6 +2864,59 @@ fn filterMixedImport(allocator: std.mem.Allocator, line: []const u8) !?[]const u
     try new_line.appendSlice(allocator, line[brace_end..]);
 
     return try new_line.toOwnedSlice(allocator);
+}
+
+/// Strips 'export' keyword from function/const/let/var declarations.
+/// Used when script content is wrapped inside a function (for generic components),
+/// where 'export' is not valid TypeScript syntax.
+/// Patterns transformed:
+/// - `export function foo()` → `function foo()`
+/// - `export const x = ...` → `const x = ...`
+/// - `export let y` → `let y`
+/// - `export var z` → `var z`
+/// - `export async function f()` → `async function f()`
+fn stripExportKeyword(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
+    // Early exit: skip if no exports to strip
+    if (std.mem.indexOf(u8, content, "export ") == null) return content;
+
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+    try result.ensureTotalCapacity(allocator, content.len);
+
+    var i: usize = 0;
+    while (i < content.len) {
+        // Check for "export " at a word boundary
+        if (i + 7 <= content.len and std.mem.eql(u8, content[i .. i + 7], "export ")) {
+            // Make sure this is at the start of a line (or start of content)
+            const at_line_start = (i == 0) or (i > 0 and content[i - 1] == '\n') or
+                (i > 0 and std.ascii.isWhitespace(content[i - 1]) and !isIdentChar(content[i - 1]));
+
+            if (at_line_start) {
+                // Check what follows: function, const, let, var, async
+                const rest = content[i + 7 ..];
+                const stripped = std.mem.trimLeft(u8, rest, " \t");
+
+                const valid_export = std.mem.startsWith(u8, stripped, "function ") or
+                    std.mem.startsWith(u8, stripped, "function(") or
+                    std.mem.startsWith(u8, stripped, "const ") or
+                    std.mem.startsWith(u8, stripped, "let ") or
+                    std.mem.startsWith(u8, stripped, "var ") or
+                    std.mem.startsWith(u8, stripped, "async ");
+
+                if (valid_export) {
+                    // Skip "export " (7 chars)
+                    i += 7;
+                    continue;
+                }
+            }
+        }
+
+        // Copy character as-is
+        try result.append(allocator, content[i]);
+        i += 1;
+    }
+
+    return try result.toOwnedSlice(allocator);
 }
 
 /// Transforms Svelte store auto-subscriptions ($storeName) to __svelte_store(storeName).v.
