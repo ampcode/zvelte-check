@@ -56,6 +56,7 @@ Some differences between `zvelte-check` and `svelte-check` are expected:
 1. **Top-level await**: tsgo/tsc may report different errors about module options
 2. **Slot deprecation warnings**: svelte-check warns about deprecated `<slot>`, zvelte-check may not
 3. **Unused export warnings**: svelte-check reports these, zvelte-check may skip them
+4. **Parsing errors for TS syntax in JS**: svelte-check uses Svelte's parser which emits "Unexpected token" errors when encountering TypeScript syntax (like `:` for type annotations) in non-lang=ts scripts. zvelte-check passes the transformed code directly to tsgo which reports semantic errors like "Type annotations can only be used in TypeScript files". Both tools correctly identify the issue, just with different error messages.
 
 ## License
 
