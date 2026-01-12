@@ -1311,7 +1311,7 @@ fn emitTemplateExpressions(
     allocator: std.mem.Allocator,
     ast: *const Ast,
     output: *std.ArrayList(u8),
-    _: *std.ArrayList(SourceMap.Mapping),
+    mappings: *std.ArrayList(SourceMap.Mapping),
     declared_names: std.StringHashMapUnmanaged(void),
 ) !void {
     var has_expressions = false;
@@ -1335,15 +1335,26 @@ fn emitTemplateExpressions(
                         has_expressions = true;
                     }
 
-                    // Emit snippet variable declaration: var snippetName: any = null;
-                    try output.appendSlice(allocator, "var ");
+                    // Emit snippet as arrow function to preserve parameter type checking.
+                    // This ensures TypeScript reports "implicit any" for untyped params.
+                    // Format: const snippetName = (params) => {};
+                    try output.appendSlice(allocator, "const ");
                     try output.appendSlice(allocator, info.name);
-                    try output.appendSlice(allocator, ": any = null;\n");
+                    try output.appendSlice(allocator, " = (");
 
-                    // Emit param declarations if present
+                    // Add source mapping for parameters so TypeScript errors map back correctly
                     if (info.params) |params| {
-                        try emitSnippetParamDeclarations(allocator, output, params);
+                        // Calculate Svelte offset: node.start + offset to params within the snippet tag
+                        // The snippet format is {#snippet name(params)} - info.offset is relative to node.start
+                        const params_svelte_offset = node.start + info.offset + @as(u32, @intCast(info.name.len)) + 1; // +1 for '('
+                        try mappings.append(allocator, .{
+                            .svelte_offset = params_svelte_offset,
+                            .ts_offset = @intCast(output.items.len),
+                            .len = @intCast(params.len),
+                        });
+                        try output.appendSlice(allocator, params);
                     }
+                    try output.appendSlice(allocator, ") => {};\n");
                 }
             },
 
@@ -4316,9 +4327,9 @@ test "transform snippet with params" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should have param declarations with types and initializers
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name: string = undefined as any;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var age: number = undefined as any;") != null);
+    // Snippets are emitted as arrow functions with original parameter syntax
+    // This preserves type checking including "implicit any" errors for untyped params
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const greeting = (name: string, age: number) => {};") != null);
 }
 
 test "transform snippet with import type param" {
@@ -4342,9 +4353,8 @@ test "transform snippet with import type param" {
 
     // We don't auto-import Snippet (users import it themselves if needed)
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") == null);
-    // Should handle import() types with parentheses correctly (with initializers)
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var key: import('svelte').Snippet | string = undefined as any;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var label: string = undefined as any;") != null);
+    // Snippets are emitted as arrow functions with original parameter syntax
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const shortcut = (key: import('svelte').Snippet | string, label: string) => {};") != null);
 }
 
 test "transform const binding" {
@@ -4394,9 +4404,8 @@ test "debug Svelte5EdgeCases optional param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should generate valid TypeScript with | undefined and initializer, not ?
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name: string | undefined = undefined as any;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var name?: string;") == null);
+    // Snippets are emitted as arrow functions with original parameter syntax
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const optionalParam = (name?: string) => {};") != null);
 }
 
 test "snippet with object destructuring param" {
@@ -4422,10 +4431,8 @@ test "snippet with object destructuring param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should handle object destructuring as a single pattern with initializer
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { wrapperProps, props, open }: any = {} as any;") != null);
-    // Should NOT have broken syntax
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { wrapperProps: any;") == null);
+    // Snippets are emitted as arrow functions with original parameter syntax
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const child = ({ wrapperProps, props, open }) => {};") != null);
 }
 
 test "const tag with template literal" {
@@ -5177,13 +5184,13 @@ test "snippet name shadowing import should not emit var declaration" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should NOT emit var declarations for snippet names that shadow imports
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var filter: any = null;") == null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var map: any = null;") == null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var Default: any = null;") == null);
+    // Should NOT emit snippet arrow functions for names that shadow imports
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const filter = (") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const map = (") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const Default = (") == null);
 
-    // SHOULD emit var declaration for snippet that doesn't shadow an import
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var other: any = null;") != null);
+    // SHOULD emit snippet arrow function for snippet that doesn't shadow an import
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const other = () => {};") != null);
 
     // The imports should still be present
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import { filter, map } from 'rxjs'") != null);

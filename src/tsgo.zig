@@ -319,7 +319,9 @@ fn writeGeneratedTsconfig(
     // Compiler options for Svelte checking
     // Template variable references are emitted as void statements, so noUnusedLocals
     // correctly identifies truly unused variables without false positives.
+    // strict: true enables noImplicitAny and other strict checks (same as svelte-check)
     try w.writeAll("  \"compilerOptions\": {\n");
+    try w.writeAll("    \"strict\": true,\n");
     try w.writeAll("    \"noEmit\": true,\n");
     try w.writeAll("    \"skipLibCheck\": true,\n");
     try w.writeAll("    \"allowJs\": true,\n");
@@ -814,9 +816,13 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Cannot find name" errors for Svelte files
-        // These are often snippet bindings or template variables that our
-        // transformer doesn't emit declarations for yet
+        // Skip "Cannot find name" errors for Svelte files.
+        // Our transformer extracts identifiers from template expressions and emits void
+        // statements for noUnusedLocals checking. This causes false positives for:
+        // - Arrow function parameters (e, evt, event)
+        // - Type names in type annotations
+        // - Names in snippet bodies
+        // TODO: Fix the transformer to not emit void statements for these cases.
         if (std.mem.startsWith(u8, message, "Cannot find name")) {
             return true;
         }
@@ -966,11 +972,9 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         return true;
     }
 
-    // Skip "implicitly has an 'any' type" errors
-    // These are often cascade errors from missing $types imports in SvelteKit routes
-    if (std.mem.indexOf(u8, message, "implicitly has an 'any' type") != null) {
-        return true;
-    }
+    // Note: We do NOT skip "implicitly has an 'any' type" errors.
+    // While some may be cascade errors from missing $types imports, many are
+    // real errors (e.g., snippet parameters without type annotations).
 
     // Skip "Untyped function calls may not accept type arguments" errors
     // These are tsgo-specific errors that tsc doesn't report

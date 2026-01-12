@@ -5,3 +5,4 @@ pnpm-lock.yaml
 
 # Conformance test samples (downloaded from sveltejs/language-tools)
 test-fixtures/conformance/samples/
+.zvelte-check/
