@@ -751,6 +751,15 @@ fn parseTsgoOutput(
         // Skip errors that are false positives for Svelte files
         if (shouldSkipError(message, is_svelte_file, is_test_file, is_typescript_svelte)) continue;
 
+        // Skip "Type assertion expressions can only be used in TypeScript files" for `as any`
+        // The `as any` pattern is a common escape hatch that svelte-check doesn't report,
+        // while `as SomeType` is reported. Check if the error points to `any` in the source.
+        if (cached) |cf| {
+            if (shouldSkipAsAnyTypeAssertion(message, cf.svelte_line_table, cf.vf.source_map.svelte_source, svelte_line, svelte_col)) {
+                continue;
+            }
+        }
+
         try diagnostics.append(allocator, .{
             .source = .js,
             .severity = if (is_error) .@"error" else .warning,
@@ -1069,6 +1078,32 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
     }
 
     return false;
+}
+
+/// Returns true if this is a "Type assertion expressions can only be used in TypeScript files"
+/// error and the type being asserted to is `any`. The `as any` pattern is a common escape hatch
+/// that svelte-check doesn't report, while `as SomeType` is reported.
+fn shouldSkipAsAnyTypeAssertion(message: []const u8, line_table: LineTable, source: []const u8, line: u32, col: u32) bool {
+    if (!std.mem.eql(u8, message, "Type assertion expressions can only be used in TypeScript files.")) {
+        return false;
+    }
+
+    // Get the offset into the source for this line/col
+    const offset = line_table.lineColToOffset(line, col) orelse return false;
+
+    // Check if the source at this position is "any" followed by a non-identifier char
+    if (offset + 3 > source.len) return false;
+    if (!std.mem.eql(u8, source[offset .. offset + 3], "any")) return false;
+
+    // Make sure it's not a prefix of a longer identifier (e.g., "anything")
+    if (offset + 3 < source.len) {
+        const next_char = source[offset + 3];
+        if (std.ascii.isAlphanumeric(next_char) or next_char == '_') {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 /// Returns true if the path is a test file.
