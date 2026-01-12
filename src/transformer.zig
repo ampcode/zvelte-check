@@ -152,6 +152,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         // Import Component for Svelte 5 type compatibility (makes ComponentProps work)
         // Use a private alias to avoid conflicts with user imports of Component
         try output.appendSlice(allocator, "import type { Component as __SvelteComponentType__ } from \"svelte\";\n");
+        // Import SvelteHTMLElements for validating HTML element props
+        try output.appendSlice(allocator, "import type { SvelteHTMLElements as __SvelteElements__ } from \"svelte/elements\";\n");
         // Note: We don't auto-import Snippet - if users need it, they import it themselves.
         // Auto-importing caused "declared but never used" errors for files that don't use Snippet types.
 
@@ -1654,6 +1656,107 @@ fn emitTemplateExpressions(
         }
     }
 
+    // Emit HTML element props validation using SvelteHTMLElements type assertion
+    // This validates that attributes are valid for the element type
+    if (is_typescript) {
+        var elem_counter: u32 = 0;
+        for (ast.nodes.items) |node| {
+            if (node.kind != .element) continue;
+
+            const elem_data = ast.elements.items[node.data];
+
+            // Skip special Svelte elements that have custom prop handling
+            if (std.mem.eql(u8, elem_data.tag_name, "slot")) continue;
+            if (std.mem.startsWith(u8, elem_data.tag_name, "svelte:")) continue;
+            const attrs = ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end];
+
+            // Collect validatable attributes (exclude Svelte directives and shorthand props)
+            var has_validatable_attrs = false;
+            for (attrs) |attr| {
+                if (isValidatableHtmlAttr(attr.name)) {
+                    has_validatable_attrs = true;
+                    break;
+                }
+            }
+
+            if (!has_validatable_attrs) continue;
+
+            if (!has_expressions) {
+                try output.appendSlice(allocator, "// Template expressions\n");
+                has_expressions = true;
+            }
+
+            // Emit: const __elem_N__: __SvelteElements__['tag'] = { attr1: value1, attr2: value2 };
+            try output.appendSlice(allocator, "const __elem_");
+            // Format the counter as a string
+            var counter_buf: [16]u8 = undefined;
+            const counter_str = std.fmt.bufPrint(&counter_buf, "{d}", .{elem_counter}) catch "0";
+            try output.appendSlice(allocator, counter_str);
+            elem_counter += 1;
+            try output.appendSlice(allocator, "__: __SvelteElements__['");
+            try output.appendSlice(allocator, elem_data.tag_name);
+            try output.appendSlice(allocator, "'] = { ");
+
+            var first_attr = true;
+            for (attrs) |attr| {
+                if (!isValidatableHtmlAttr(attr.name)) continue;
+
+                if (!first_attr) {
+                    try output.appendSlice(allocator, ", ");
+                }
+                first_attr = false;
+
+                // Check if attribute name needs to be quoted (contains non-identifier chars like -)
+                const needs_quote = blk: {
+                    for (attr.name) |ch| {
+                        if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '$') {
+                            break :blk true;
+                        }
+                    }
+                    break :blk false;
+                };
+
+                // Add source mapping for the attribute name
+                // Include the quote in the mapping if present, since TS errors point to the quote
+                try mappings.append(allocator, .{
+                    .svelte_offset = attr.start,
+                    .ts_offset = @intCast(output.items.len),
+                    .len = @intCast(attr.name.len + (if (needs_quote) @as(u32, 2) else 0)),
+                });
+                if (needs_quote) {
+                    try output.appendSlice(allocator, "'");
+                }
+                try output.appendSlice(allocator, attr.name);
+                if (needs_quote) {
+                    try output.appendSlice(allocator, "'");
+                }
+                try output.appendSlice(allocator, ": ");
+
+                // Emit value (or undefined for valueless attrs)
+                if (attr.value) |val| {
+                    if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}') {
+                        // Expression value: strip { } and emit the expression
+                        const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
+                        try output.appendSlice(allocator, expr);
+                    } else if (val.len > 0 and val[0] == '{') {
+                        // Malformed expression - just emit as-is
+                        try output.appendSlice(allocator, val);
+                    } else {
+                        // Static string value - emit as string literal
+                        try output.appendSlice(allocator, "\"");
+                        try output.appendSlice(allocator, val);
+                        try output.appendSlice(allocator, "\"");
+                    }
+                } else {
+                    // Valueless attribute (e.g., disabled, hidden)
+                    try output.appendSlice(allocator, "true");
+                }
+            }
+
+            try output.appendSlice(allocator, " };\n");
+        }
+    }
+
     // Fallback: scan template source directly for {#each} patterns not captured by AST
     // The parser sometimes misses {#each} blocks inside component elements
     try scanTemplateForEachBlocks(allocator, ast, output, mappings, &template_refs, &has_expressions, is_typescript);
@@ -2269,6 +2372,27 @@ fn detectDirectiveIdentifier(template: []const u8, pos: usize) ?DirectiveInfo {
         }
     }
     return null;
+}
+
+/// Returns true if an HTML attribute name should be validated against Svelte's type definitions.
+/// Excludes Svelte-specific directives that have special handling.
+fn isValidatableHtmlAttr(name: []const u8) bool {
+    // Skip Svelte directives
+    if (std.mem.startsWith(u8, name, "on:")) return false;
+    if (std.mem.startsWith(u8, name, "bind:")) return false;
+    if (std.mem.startsWith(u8, name, "use:")) return false;
+    if (std.mem.startsWith(u8, name, "class:")) return false;
+    if (std.mem.startsWith(u8, name, "style:")) return false;
+    if (std.mem.startsWith(u8, name, "transition:")) return false;
+    if (std.mem.startsWith(u8, name, "in:")) return false;
+    if (std.mem.startsWith(u8, name, "out:")) return false;
+    if (std.mem.startsWith(u8, name, "animate:")) return false;
+    if (std.mem.startsWith(u8, name, "let:")) return false;
+    // Skip slot attribute (for named slots)
+    if (std.mem.eql(u8, name, "slot")) return false;
+    // Skip this attribute (for svelte:component)
+    if (std.mem.eql(u8, name, "this")) return false;
+    return true;
 }
 
 /// Returns true if the identifier is a JavaScript keyword or built-in.
