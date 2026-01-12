@@ -140,15 +140,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         }
     }
 
-    // Emit instance script generic type declarations FIRST (before module script).
-    // This ensures generics like `T extends boolean` shadow any module script types
-    // with the same name (e.g., `type T = unknown`). In Svelte, instance script
-    // generics are in scope for both scripts when referenced from props/template.
-    if (instance_script) |script| {
-        if (script.generics) |generics| {
-            try emitGenericTypeDeclarations(allocator, &output, generics);
-        }
-    }
+    // Get generics from instance script (if any)
+    const instance_generics = if (instance_script) |script| script.generics else null;
 
     // Emit module script content (if any)
     if (module_script) |script| {
@@ -169,8 +162,17 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     }
 
     // Emit instance script content (if any)
+    // For generic components, wrap in a render function to preserve type parameter semantics
     if (instance_script) |script| {
-        try output.appendSlice(allocator, "// <script>\n");
+        if (instance_generics) |generics| {
+            // Wrap in generic render function like svelte2tsx does.
+            // This ensures type parameters like T in $state<T>(0) trigger proper type checking.
+            try output.appendSlice(allocator, "// <script>\nfunction __render<");
+            try output.appendSlice(allocator, generics);
+            try output.appendSlice(allocator, ">() {\n");
+        } else {
+            try output.appendSlice(allocator, "// <script>\n");
+        }
 
         const raw_content = ast.source[script.content_start..script.content_end];
         const filtered = try filterSvelteImports(allocator, raw_content);
@@ -184,7 +186,12 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         });
 
         try output.appendSlice(allocator, content);
-        try output.appendSlice(allocator, "\n\n");
+
+        if (instance_generics != null) {
+            try output.appendSlice(allocator, "\n}\n\n");
+        } else {
+            try output.appendSlice(allocator, "\n\n");
+        }
     }
 
     // Extract declared names from scripts to avoid snippet declaration conflicts.
@@ -4531,8 +4538,8 @@ test "transform with generics attribute" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should have generic type declaration
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "type T = SomeInterface;") != null);
+    // Should wrap instance script in generic render function
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function __render<T extends SomeInterface>()") != null);
 }
 
 test "transform with module and instance generics" {
@@ -4556,8 +4563,8 @@ test "transform with module and instance generics" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should have generic type declaration for T
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "type T = unknown;") != null);
+    // Should wrap instance script in generic render function
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function __render<T>()") != null);
     // Should also have the module script content
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type ComboboxItem<T>") != null);
 }

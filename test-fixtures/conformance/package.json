@@ -8,6 +8,7 @@
   "devDependencies": {
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",
+    "svelte2tsx": "^0.7.46",
     "typescript": "^5.0.0"
   }
 }

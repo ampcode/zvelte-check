@@ -135,11 +135,15 @@ normalize_output() {
     
     # Extract ERROR/WARNING lines, normalize paths, sort
     # Also normalize escaped quotes (\") to unescaped quotes (") for comparison
+    # Truncate multi-line error messages (TypeScript adds context lines that vary between implementations)
+    # Normalize trailing quote (some get truncated, some don't)
     grep -E "^[0-9]+ (ERROR|WARNING)" "$input" 2>/dev/null | \
         sed -E 's/^[0-9]+ //' | \
         sed -E "s|\"[^\"]*/$sample_name/([^\"]+)\"|\"\\1\"|g" | \
         sed -E 's|"samples/[^/]+/([^"]+)"|"\1"|g' | \
         sed 's/\\"/"/g' | \
+        sed -E 's/\\n.*//' | \
+        sed -E 's/"$//' | \
         sort || true
 }
 
