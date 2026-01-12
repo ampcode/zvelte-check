@@ -211,8 +211,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
 
     // Emit forward declarations for template snippets (hoisting).
     // Svelte hoists snippets so they're visible in both module and instance scripts,
-    // even though they're defined in the template. We emit `let snippetName;` (JS) or
-    // `let snippetName: any;` (TS) before scripts so TypeScript sees them as declared.
+    // even though they're defined in the template. We emit function declarations
+    // with proper signatures so TypeScript validates argument counts at call sites.
     // Skip snippets whose names conflict with script declarations.
     var emitted_snippet_header = false;
     for (ast.nodes.items) |node| {
@@ -223,13 +223,22 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
                         try output.appendSlice(allocator, "// Hoisted snippet declarations\n");
                         emitted_snippet_header = true;
                     }
-                    try output.appendSlice(allocator, "let ");
+                    // Emit as function declaration to validate parameter counts at call sites.
+                    // Format: function name(p0: any, p1: any, ...): void {}
+                    // We use generic parameter names with `any` type to avoid referencing
+                    // types that may not be imported yet (hoisting happens before imports).
+                    try output.appendSlice(allocator, "function ");
                     try output.appendSlice(allocator, info.name);
-                    // Only emit type annotation for TypeScript files
-                    if (is_typescript) {
-                        try output.appendSlice(allocator, ": any");
+                    try output.appendSlice(allocator, "(");
+                    // Emit parameters with any type (count-only, no original type info)
+                    if (info.params) |params| {
+                        try emitAnyTypedParams(allocator, &output, params, is_typescript);
                     }
-                    try output.appendSlice(allocator, ";\n");
+                    try output.appendSlice(allocator, ")");
+                    if (is_typescript) {
+                        try output.appendSlice(allocator, ": void");
+                    }
+                    try output.appendSlice(allocator, " {}\n");
                 }
             }
         }
@@ -1501,7 +1510,31 @@ fn emitTemplateExpressions(
                 }
             },
 
-            .expression, .if_block, .await_block, .key_block, .render, .html, .const_tag, .debug_tag => {
+            .render => {
+                // Emit the full render expression to validate snippet call signatures.
+                // {@render snippet(args)} → void (snippet(args));
+                // This allows TypeScript to check argument count/types against snippet definition.
+                const expr = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
+
+                if (extractRenderExpression(ast.source, node.start, node.end)) |render_info| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    try output.appendSlice(allocator, "void (");
+                    // Add source mapping for the render expression
+                    try mappings.append(allocator, .{
+                        .svelte_offset = node.start + render_info.offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(render_info.expr.len),
+                    });
+                    try output.appendSlice(allocator, render_info.expr);
+                    try output.appendSlice(allocator, ");\n");
+                }
+            },
+
+            .expression, .if_block, .await_block, .key_block, .html, .const_tag, .debug_tag => {
                 // Extract identifiers from template expressions
                 const expr = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
@@ -2837,6 +2870,82 @@ fn extractSnippetName(source: []const u8, start: u32, end: u32) ?SnippetNameInfo
         .params = params,
         .offset = @intCast(name_start),
     };
+}
+
+/// Emits parameter declarations with `any` type for hoisted snippet functions.
+/// Counts parameters in `params` string and emits `_0: any, _1: any, ...`.
+/// This preserves parameter arity for call-site validation without referencing
+/// types that may not be imported yet.
+fn emitAnyTypedParams(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    params: []const u8,
+    is_typescript: bool,
+) !void {
+    const count = countParams(params);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (i > 0) try output.appendSlice(allocator, ", ");
+        try output.appendSlice(allocator, "_");
+        // Emit parameter index as string
+        var buf: [16]u8 = undefined;
+        const idx_str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+        try output.appendSlice(allocator, idx_str);
+        if (is_typescript) {
+            try output.appendSlice(allocator, ": any");
+        }
+    }
+}
+
+/// Counts the number of parameters in a params string.
+/// Handles destructuring patterns and type annotations.
+fn countParams(params: []const u8) usize {
+    if (params.len == 0) return 0;
+
+    var count: usize = 0;
+    var i: usize = 0;
+    var depth: u32 = 0;
+    var in_type: bool = false;
+
+    while (i < params.len) {
+        const c = params[i];
+
+        // Track nesting depth for destructuring and generics
+        if (c == '{' or c == '[' or c == '(' or c == '<') depth += 1;
+        if (c == '}' or c == ']' or c == ')' or c == '>') {
+            if (depth > 0) depth -= 1;
+        }
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(params, i);
+            continue;
+        }
+
+        // ':' at depth 0 starts a type annotation
+        if (c == ':' and depth == 0) {
+            in_type = true;
+            i += 1;
+            continue;
+        }
+
+        // ',' at depth 0 separates parameters
+        if (c == ',' and depth == 0) {
+            count += 1;
+            in_type = false;
+            i += 1;
+            continue;
+        }
+
+        // First non-whitespace at depth 0 (not in type) starts a parameter
+        if (depth == 0 and !in_type and !std.ascii.isWhitespace(c) and count == 0) {
+            count = 1;
+        }
+
+        i += 1;
+    }
+
+    return count;
 }
 
 /// Extracts parameter names from a function parameter string.
