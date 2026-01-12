@@ -128,6 +128,7 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
             .virtual_path = "",
             .content = "",
             .source_map = .{ .mappings = &.{}, .svelte_source = "" },
+            .is_typescript = false,
         },
         .diagnostics = &.{},
         .arena = null,
@@ -192,14 +193,24 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
 
     // 5. Run tsgo (skip when js diagnostics disabled or --no-tsconfig)
     if (!args.no_tsconfig and args.diagnostic_sources.js) {
-        // Collect files with fatal Svelte errors that make TS checking unreliable
-        var files_with_fatal_errors: std.StringHashMapUnmanaged(void) = .empty;
+        // Collect JavaScript files (not TypeScript) with fatal Svelte errors.
+        // For JS files with experimental_async errors, the generated TS is invalid
+        // and produces spurious type errors. svelte-check only reports the Svelte error
+        // for JS files, but reports both Svelte and TS errors for TypeScript files.
+        var js_files_with_fatal_errors: std.StringHashMapUnmanaged(void) = .empty;
         for (all_diagnostics.items) |d| {
             if (d.source == .svelte and d.severity == .@"error") {
                 if (d.code) |code| {
-                    // experimental_async is a fatal compiler error - generated TS is invalid
                     if (std.mem.eql(u8, code, "experimental_async")) {
-                        try files_with_fatal_errors.put(allocator, d.file_path, {});
+                        // Check if this file is JavaScript (not TypeScript)
+                        for (virtual_files.items) |vf| {
+                            if (std.mem.eql(u8, vf.original_path, d.file_path)) {
+                                if (!vf.is_typescript) {
+                                    try js_files_with_fatal_errors.put(allocator, d.file_path, {});
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -218,8 +229,9 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
         };
 
         for (ts_diagnostics) |d| {
-            // Skip TS errors for files with fatal Svelte errors (TS output is invalid)
-            if (files_with_fatal_errors.contains(d.file_path)) continue;
+            // Skip TS errors for JavaScript files with fatal Svelte errors
+            // (TypeScript files report both Svelte and TS errors)
+            if (js_files_with_fatal_errors.contains(d.file_path)) continue;
             try all_diagnostics.append(allocator, d);
         }
     }

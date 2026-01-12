@@ -1059,6 +1059,7 @@ test "parse tsgo output with stub directory paths" {
         .virtual_path = "my-project/App.svelte.ts",
         .content = "",
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
+        .is_typescript = false,
     };
 
     const cached_files = [_]CachedVirtualFile{.{
@@ -1095,6 +1096,7 @@ test "parse tsgo output with nested stub directory paths" {
         .virtual_path = "project/src/routes/+page.svelte.ts",
         .content = "",
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
+        .is_typescript = false,
     };
 
     const cached_files = [_]CachedVirtualFile{.{
@@ -1128,6 +1130,7 @@ test "parse tsgo output with Windows-style backslash paths" {
         .virtual_path = "project/src/routes/+page.svelte.ts",
         .content = "",
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
+        .is_typescript = false,
     };
 
     const cached_files = [_]CachedVirtualFile{.{
@@ -1181,6 +1184,7 @@ test "writeGeneratedTsconfig generates valid config" {
         .virtual_path = "src/routes/+page.svelte.ts",
         .content = "const x = 1;",
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
+        .is_typescript = false,
     }};
 
     // Test with no project tsconfig (empty string as workspace path since paths are already relative)
@@ -1222,6 +1226,7 @@ test "writeGeneratedTsconfig extends project config when available" {
         .virtual_path = "src/routes/+page.svelte.ts",
         .content = "const x = 1;",
         .source_map = .{ .mappings = &.{}, .svelte_source = "" },
+        .is_typescript = false,
     }};
 
     // Test with project tsconfig auto-detection (empty string as workspace path since paths are already relative)

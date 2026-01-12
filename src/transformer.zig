@@ -29,6 +29,7 @@ pub const VirtualFile = struct {
     virtual_path: []const u8,
     content: []const u8,
     source_map: SourceMap,
+    is_typescript: bool, // true if script has lang="ts"
 };
 
 const PropInfo = struct {
@@ -142,6 +143,23 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
 
     // Get generics from instance script (if any)
     const instance_generics = if (instance_script) |script| script.generics else null;
+
+    // Check if any script has lang="ts" (TypeScript mode)
+    var is_typescript = false;
+    if (module_script) |script| {
+        if (script.lang) |lang| {
+            if (std.mem.eql(u8, lang, "ts") or std.mem.eql(u8, lang, "typescript")) {
+                is_typescript = true;
+            }
+        }
+    }
+    if (instance_script) |script| {
+        if (script.lang) |lang| {
+            if (std.mem.eql(u8, lang, "ts") or std.mem.eql(u8, lang, "typescript")) {
+                is_typescript = true;
+            }
+        }
+    }
 
     // Emit module script content (if any)
     if (module_script) |script| {
@@ -394,6 +412,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             .mappings = try mappings.toOwnedSlice(allocator),
             .svelte_source = ast.source,
         },
+        .is_typescript = is_typescript,
     };
 }
 
