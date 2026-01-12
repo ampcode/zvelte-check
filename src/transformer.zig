@@ -199,7 +199,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             \\
             \\// Array type validation for {#each} blocks
             \\// Ensures the iterable is actually array-like, generating type errors for incompatible types
-            \\declare function __svelte_ensureArray<T extends ArrayLike<unknown> | null | undefined>(array: T): T extends ArrayLike<infer U> ? U[] : any[];
+            \\// When the type doesn't match ArrayLike, returns unknown[] so accessing properties on items reports proper errors
+            \\declare function __svelte_ensureArray<T extends ArrayLike<unknown> | null | undefined>(array: T): T extends ArrayLike<infer U> ? U[] : unknown[];
             \\
             \\
         );
@@ -1184,6 +1185,7 @@ const EachBindingInfo = struct {
     item_binding: []const u8,
     index_binding: ?[]const u8,
     key_expr: ?[]const u8, // Key expression from (key) in keyed each
+    key_offset: u32, // Svelte source offset for key expression (for source mapping)
     offset: u32,
 };
 
@@ -2310,11 +2312,19 @@ fn emitEachBindingDeclarations(
         try output.appendSlice(allocator, " = 0;\n");
     }
 
-    // Emit void statement for key expression to mark it as used.
+    // Emit void statement for key expression to mark it as used and type-checked.
     // This handles cases like {#each items as [key, value] (key)} where key
     // is only used in the key expression, not in the loop body.
+    // Source mapping allows TypeScript errors on the key expression (e.g., 'item' is of type 'unknown')
+    // to be traced back to the correct Svelte position.
     if (binding.key_expr) |key| {
         try output.appendSlice(allocator, "void (");
+        // Add source map for the key expression
+        try mappings.append(allocator, .{
+            .svelte_offset = binding.key_offset,
+            .ts_offset = @intCast(output.items.len),
+            .len = @intCast(key.len),
+        });
         try output.appendSlice(allocator, key);
         try output.appendSlice(allocator, ");\n");
     }
@@ -2626,6 +2636,7 @@ fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInf
     }
 
     // Extract key expression if present: (key) after bindings
+    var key_offset: u32 = 0;
     if (binding_end < content.len and content[binding_end] == '(') {
         // Find the matching closing paren
         var paren_depth: u32 = 1;
@@ -2639,6 +2650,9 @@ fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInf
         const key = std.mem.trim(u8, content[key_start..key_end], " \t\n\r");
         if (key.len > 0) {
             key_expr = key;
+            // Compute offset of key expression in original source
+            // key_start is relative to content, which starts at `start`
+            key_offset = start + @as(u32, @intCast(key_start));
         }
     }
 
@@ -2647,6 +2661,7 @@ fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInf
         .item_binding = item_binding,
         .index_binding = index_binding,
         .key_expr = key_expr,
+        .key_offset = key_offset,
         .offset = start + @as(u32, @intCast(expr_start)),
     };
 }
