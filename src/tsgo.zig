@@ -745,9 +745,11 @@ fn parseTsgoOutput(
         // Determine if this is a Svelte file (for Svelte-specific filtering)
         const is_svelte_file = std.mem.endsWith(u8, original_path, ".svelte");
         const is_test_file = isTestFile(original_path);
+        // Check if this is a TypeScript Svelte file (has lang="ts" in script tag)
+        const is_typescript_svelte = if (cached) |cf| cf.vf.is_typescript else false;
 
         // Skip errors that are false positives for Svelte files
-        if (shouldSkipError(message, is_svelte_file, is_test_file)) continue;
+        if (shouldSkipError(message, is_svelte_file, is_test_file, is_typescript_svelte)) continue;
 
         try diagnostics.append(allocator, .{
             .source = .js,
@@ -766,15 +768,26 @@ fn parseTsgoOutput(
 /// Returns true if the error should be skipped.
 /// Some errors are Svelte-specific false positives (only skipped for .svelte files).
 /// Others are general false positives from our code generation.
-fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool) bool {
+///
+/// @param is_typescript_svelte: true if the .svelte file has lang="ts" in its script tag.
+///        JavaScript Svelte files get less strict checking to match svelte-check behavior.
+fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool, is_typescript_svelte: bool) bool {
     if (is_svelte_file) {
         // Svelte-specific type errors (only for .svelte files)
         // These are false positives from our code generation
 
+        // For JavaScript Svelte files (no lang="ts"), skip all "Cannot find name" errors.
+        // svelte-check does not report these errors for JS files because TypeScript's
+        // checkJs mode is more lenient with undefined identifiers in JavaScript.
+        // This matches patterns like `let { g = foo } = $props()` where `foo` is undefined.
+        if (!is_typescript_svelte and std.mem.startsWith(u8, message, "Cannot find name '")) {
+            return true;
+        }
+
         // NOTE: We previously filtered "Cannot find name 'Component'" etc. as Svelte types
         // that users commonly import. However, this was incorrect - if a component like
         // <Component /> is used without importing it, we should report the error.
-        // The more targeted filtering below handles actual false positives.
+        // The more targeted filtering below handles actual false positives for TS files.
 
         // Skip "Property X does not exist on type 'never'" errors
         // False positives from $state(null) patterns where TypeScript

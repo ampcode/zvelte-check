@@ -5542,3 +5542,33 @@ test "regression: destructuring from empty object is preserved for type-checking
     // The user's destructuring statement must be preserved for TypeScript to type-check
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let { destructured } = {};") != null);
 }
+
+test "JS Svelte files with undefined identifiers in $props defaults" {
+    // Regression test for runes-best-effort-types.v5 conformance sample.
+    // JavaScript Svelte files (no lang="ts") with undefined identifiers like
+    // `let { g = foo } = $props()` should not cause type errors because
+    // svelte-check doesn't strictly check JavaScript files for undefined names.
+    //
+    // The fix is in tsgo.zig's shouldSkipError() which skips "Cannot find name"
+    // errors for JavaScript Svelte files (is_typescript_svelte = false).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script>
+        \\    let { a, b = true, g = foo } = $props(); 
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "input.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // The script content should be preserved as-is (including the undefined `foo`)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let { a, b = true, g = foo } = $props();") != null);
+    // This is a JavaScript file, so is_typescript should be false
+    try std.testing.expect(!virtual.is_typescript);
+}
