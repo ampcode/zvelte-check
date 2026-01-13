@@ -1761,11 +1761,11 @@ fn emitTemplateExpressions(
                     }
 
                     if (attr.value) |val| {
-                        // Expression values are wrapped in {}
+                        // Expression values are wrapped in {} - may be single or mixed (e.g., "{foo} text")
                         if (val.len > 0 and val[0] == '{') {
-                            // Compute offset within source for this attribute value
-                            // attr.start points to attr start, we need to find the { in the value
-                            try extractIdentifiersFromExpr(allocator, val, attr.start, &template_refs);
+                            // Use extractIdentifiersFromAttributeValue to handle mixed values
+                            // that contain both expressions and static text
+                            try extractIdentifiersFromAttributeValue(allocator, val, attr.start, &template_refs);
                         }
                     }
                     // Shorthand attributes like {foo} use attr name as expression
@@ -1826,8 +1826,11 @@ fn emitTemplateExpressions(
                     // e.g., style:color, style:--custom-property
                     if (std.mem.startsWith(u8, attr.name, "style:")) {
                         if (attr.value) |val| {
-                            // Full syntax: style:prop={expr} - extract identifiers from expr
-                            try extractIdentifiersFromExpr(allocator, val, attr.start, &template_refs);
+                            // Full syntax: style:prop={expr} or style:prop="css {expr} more"
+                            // Use extractIdentifiersFromAttributeValue to handle mixed CSS/expr values
+                            if (val.len > 0 and val[0] == '{') {
+                                try extractIdentifiersFromAttributeValue(allocator, val, attr.start, &template_refs);
+                            }
                         }
                         // Note: shorthand style:foo (without value) is rarely used with variables
                         // because style properties are usually CSS names, not JS identifiers
@@ -2095,6 +2098,60 @@ fn isSingleExpression(val: []const u8) bool {
     return remaining.len == 0;
 }
 
+/// Extracts identifier references from an attribute value that may contain mixed text and expressions.
+/// For example, in `class="{foo} static-class"`, this extracts identifiers only from `{foo}`,
+/// not from the static text "static-class". Handles multiple expressions like `{a} text {b}`.
+fn extractIdentifiersFromAttributeValue(
+    allocator: std.mem.Allocator,
+    val: []const u8,
+    base_offset: u32,
+    refs: *std.StringHashMapUnmanaged(u32),
+) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+    while (i < val.len) {
+        if (val[i] == '{') {
+            // Find matching closing brace
+            const expr_start = i;
+            var depth: usize = 1;
+            var j = i + 1;
+            while (j < val.len and depth > 0) : (j += 1) {
+                switch (val[j]) {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    '"', '\'' => {
+                        // Skip string literal
+                        const quote = val[j];
+                        j += 1;
+                        while (j < val.len and val[j] != quote) : (j += 1) {
+                            if (val[j] == '\\' and j + 1 < val.len) j += 1;
+                        }
+                    },
+                    '`' => {
+                        // Skip template literal
+                        j += 1;
+                        while (j < val.len and val[j] != '`') : (j += 1) {
+                            if (val[j] == '\\' and j + 1 < val.len) j += 1;
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            if (depth == 0) {
+                // Extract identifiers only from the expression content (between { and })
+                const expr = val[expr_start..j];
+                try extractIdentifiersFromExpr(allocator, expr, base_offset + @as(u32, @intCast(expr_start)), refs);
+                i = j;
+            } else {
+                i += 1;
+            }
+        } else {
+            // Skip static text (not inside {})
+            i += 1;
+        }
+    }
+}
+
 /// Extracts identifier references from a template expression string.
 /// Handles expressions like {foo}, {foo.bar}, {foo + bar}, onclick={handler}, etc.
 /// Skips identifiers that are arrow function parameters (e.g., `e` in `e => e`).
@@ -2125,13 +2182,28 @@ fn extractIdentifiersFromExpr(
     defer local_decls.deinit(allocator);
     try collectLocalDeclarations(allocator, expr, &local_decls);
 
+    // Use internal function with exclusion context for recursive calls
+    try extractIdentifiersFromExprWithContext(allocator, expr, base_offset, refs, &arrow_params, &local_decls, param_regions.items);
+}
+
+/// Internal version that accepts pre-collected exclusion sets for recursive calls.
+/// This ensures local declarations from outer scopes are respected in template literal interpolations.
+fn extractIdentifiersFromExprWithContext(
+    allocator: std.mem.Allocator,
+    expr: []const u8,
+    base_offset: u32,
+    refs: *std.StringHashMapUnmanaged(u32),
+    arrow_params: *const std.StringHashMapUnmanaged(void),
+    local_decls: *const std.StringHashMapUnmanaged(void),
+    param_regions: []const ParamRegion,
+) std.mem.Allocator.Error!void {
     var i: usize = 0;
     while (i < expr.len) {
         const c = expr[i];
 
         // Check if we're inside a parameter region - skip entirely
         var in_param_region = false;
-        for (param_regions.items) |region| {
+        for (param_regions) |region| {
             if (i >= region.start and i < region.end) {
                 in_param_region = true;
                 i = region.end;
@@ -2146,11 +2218,11 @@ fn extractIdentifiersFromExpr(
             continue;
         }
         if (c == '`') {
-            i = try skipStringLiteralAndExtract(allocator, expr, i, base_offset, refs);
+            i = try skipStringLiteralAndExtractWithContext(allocator, expr, i, base_offset, refs, arrow_params, local_decls);
             continue;
         }
 
-        // Skip comments
+        // Skip comments and regex literals
         if (i + 1 < expr.len and c == '/') {
             if (expr[i + 1] == '/') {
                 while (i < expr.len and expr[i] != '\n') : (i += 1) {}
@@ -2160,6 +2232,12 @@ fn extractIdentifiersFromExpr(
                 i += 2;
                 while (i + 1 < expr.len and !(expr[i] == '*' and expr[i + 1] == '/')) : (i += 1) {}
                 if (i + 1 < expr.len) i += 2;
+                continue;
+            }
+            // Check for regex literal: /pattern/flags
+            // Regex follows operators, punctuation, or start - not expressions
+            if (couldBeRegex(expr, i)) {
+                i = skipRegexLiteral(expr, i);
                 continue;
             }
         }
@@ -2187,6 +2265,9 @@ fn extractIdentifiersFromExpr(
 
             // Skip locally declared variables (const/let/var inside callbacks)
             if (local_decls.contains(ident)) continue;
+
+            // Skip JavaScript keywords that may appear in expressions
+            if (isJavaScriptKeyword(ident)) continue;
 
             // Skip object literal property keys (identifier followed by : in object context)
             // Pattern: { key: value } - 'key' is not a variable reference
@@ -2327,12 +2408,19 @@ fn collectArrowFunctionParamsAndRegions(
             var j = i;
             while (j < expr.len and std.ascii.isWhitespace(expr[j])) : (j += 1) {}
 
-            // Check for => after the parentheses
+            // Handle TypeScript return type annotation: (params): ReturnType => body
+            var return_type_end: usize = paren_end;
+            if (j < expr.len and expr[j] == ':') {
+                j = skipReturnTypeAnnotation(expr, j);
+                return_type_end = j;
+            }
+
+            // Check for => after the parentheses (or after return type)
             if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
                 // Extract parameter names from inside parentheses
                 try extractArrowParamsFromParens(allocator, expr[paren_start + 1 .. paren_end], params);
-                // Record region covering the parenthesized params (including parens)
-                try regions.append(allocator, .{ .start = paren_start, .end = paren_end + 1 });
+                // Record region covering the params AND return type annotation (to skip `c` in `c is Type`)
+                try regions.append(allocator, .{ .start = paren_start, .end = return_type_end + 1 });
             } else {
                 // Not an arrow function - but the content might contain arrow functions
                 // Recursively scan the parenthesized content for nested arrow functions
@@ -2403,9 +2491,15 @@ fn collectArrowFunctionParamsAndRegionsWithOffset(
                 const paren_end = j;
                 if (j < expr.len) j += 1;
                 while (j < expr.len and std.ascii.isWhitespace(expr[j])) : (j += 1) {}
+                // Handle TypeScript return type annotation
+                var async_return_type_end: usize = paren_end;
+                if (j < expr.len and expr[j] == ':') {
+                    j = skipReturnTypeAnnotation(expr, j);
+                    async_return_type_end = j;
+                }
                 if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
                     try extractArrowParamsFromParens(allocator, expr[paren_start + 1 .. paren_end], params);
-                    try regions.append(allocator, .{ .start = offset + paren_start, .end = offset + paren_end + 1 });
+                    try regions.append(allocator, .{ .start = offset + paren_start, .end = offset + async_return_type_end + 1 });
                 }
                 i = j;
             }
@@ -2427,9 +2521,16 @@ fn collectArrowFunctionParamsAndRegionsWithOffset(
             var j = i;
             while (j < expr.len and std.ascii.isWhitespace(expr[j])) : (j += 1) {}
 
+            // Handle TypeScript return type annotation
+            var return_type_end2: usize = paren_end;
+            if (j < expr.len and expr[j] == ':') {
+                j = skipReturnTypeAnnotation(expr, j);
+                return_type_end2 = j;
+            }
+
             if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
                 try extractArrowParamsFromParens(allocator, expr[paren_start + 1 .. paren_end], params);
-                try regions.append(allocator, .{ .start = offset + paren_start, .end = offset + paren_end + 1 });
+                try regions.append(allocator, .{ .start = offset + paren_start, .end = offset + return_type_end2 + 1 });
             } else {
                 const inner_start = paren_start + 1;
                 try collectArrowFunctionParamsAndRegionsWithOffset(allocator, expr[inner_start..paren_end], offset + inner_start, params, regions);
@@ -2765,6 +2866,144 @@ fn skipStringLiteral(expr: []const u8, start: usize) usize {
     return i;
 }
 
+/// Context-aware version that passes exclusion sets to recursive calls.
+/// This ensures local variables declared in outer scopes are excluded from interpolations.
+fn skipStringLiteralAndExtractWithContext(
+    allocator: std.mem.Allocator,
+    expr: []const u8,
+    start: usize,
+    base_offset: u32,
+    refs: *std.StringHashMapUnmanaged(u32),
+    arrow_params: *const std.StringHashMapUnmanaged(void),
+    local_decls: *const std.StringHashMapUnmanaged(void),
+) std.mem.Allocator.Error!usize {
+    if (start >= expr.len) return start;
+    const quote = expr[start];
+    var i = start + 1;
+    while (i < expr.len) {
+        if (expr[i] == '\\' and i + 1 < expr.len) {
+            i += 2;
+            continue;
+        }
+        if (expr[i] == quote) {
+            return i + 1;
+        }
+        // Template literal interpolation - extract identifiers from inside
+        if (quote == '`' and expr[i] == '$' and i + 1 < expr.len and expr[i + 1] == '{') {
+            const interp_start = i + 2;
+            i += 2;
+            var depth: u32 = 1;
+            while (i < expr.len and depth > 0) {
+                if (expr[i] == '{') depth += 1;
+                if (expr[i] == '}') depth -= 1;
+                if (depth > 0) i += 1;
+            }
+            const interp_end = i;
+            // Recursively extract identifiers, passing along exclusion context
+            const interp_offset = base_offset + @as(u32, @intCast(interp_start));
+            try extractIdentifiersFromExprWithContext(allocator, expr[interp_start..interp_end], interp_offset, refs, arrow_params, local_decls, &.{});
+            if (i < expr.len) i += 1; // skip closing }
+            continue;
+        }
+        i += 1;
+    }
+    return i;
+}
+
+/// Skips a TypeScript return type annotation in an arrow function.
+/// Handles type predicates like `x is Type`, generics like `Promise<T>`, etc.
+/// Returns the position just before `=>`.
+fn skipReturnTypeAnnotation(expr: []const u8, start: usize) usize {
+    if (start >= expr.len or expr[start] != ':') return start;
+    var j = start + 1;
+    var angle_depth: u32 = 0;
+    while (j < expr.len) {
+        if (expr[j] == '<') angle_depth += 1;
+        if (expr[j] == '>' and angle_depth > 0) angle_depth -= 1;
+        if (angle_depth == 0 and j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
+            return j;
+        }
+        j += 1;
+    }
+    return j;
+}
+
+/// Heuristic to determine if a `/` is the start of a regex literal.
+/// Regex can appear after operators, punctuation, or keywords that expect an expression.
+/// This is a conservative check - may have false negatives but avoids false positives.
+fn couldBeRegex(expr: []const u8, pos: usize) bool {
+    if (pos == 0) return true; // At start, must be regex
+
+    // Look backward, skipping whitespace
+    var i = pos;
+    while (i > 0) {
+        i -= 1;
+        const c = expr[i];
+        if (std.ascii.isWhitespace(c)) continue;
+
+        // Regex follows these tokens (operators, punctuation, keywords)
+        return switch (c) {
+            '(', ',', '=', ':', '[', '!', '&', '|', '?', '{', ';', '\n' => true,
+            // Could also be after keywords like `return`, `if`, `while`, etc.
+            // But checking those is complex - be conservative
+            else => false,
+        };
+    }
+    return true; // At start
+}
+
+/// Skips a regex literal /pattern/flags.
+/// Returns position after the regex (after closing / and optional flags).
+fn skipRegexLiteral(expr: []const u8, start: usize) usize {
+    if (start >= expr.len or expr[start] != '/') return start;
+    var i = start + 1;
+
+    // Find closing /
+    while (i < expr.len) {
+        const c = expr[i];
+        if (c == '\\' and i + 1 < expr.len) {
+            i += 2; // Skip escaped char
+            continue;
+        }
+        if (c == '/') {
+            i += 1;
+            // Skip optional flags (gimsuvy)
+            while (i < expr.len and std.ascii.isAlphabetic(expr[i])) : (i += 1) {}
+            return i;
+        }
+        if (c == '\n') {
+            // Regex can't span lines - this isn't a regex
+            return start + 1;
+        }
+        i += 1;
+    }
+    return i;
+}
+
+/// Checks if an identifier is a JavaScript keyword that shouldn't be extracted as a reference.
+fn isJavaScriptKeyword(ident: []const u8) bool {
+    const keywords = [_][]const u8{
+        "true",      "false",    "null",      "undefined",  "NaN",       "Infinity",
+        "this",      "super",    "arguments", "if",         "else",      "for",
+        "while",     "do",       "switch",    "case",       "default",   "break",
+        "continue",  "return",   "try",       "catch",      "finally",   "throw",
+        "new",       "delete",   "typeof",    "instanceof", "in",        "of",
+        "function",  "class",    "extends",   "static",     "get",       "set",
+        "const",     "let",      "var",       "async",      "await",     "yield",
+        "import",    "export",   "from",      "as",         "void",      "with",
+        "debugger",
+        // TypeScript keywords
+         "readonly", "keyof",     "type",       "interface", "enum",
+        "namespace", "module",   "declare",   "abstract",   "private",   "protected",
+        "public",    "override", "infer",     "never",      "unknown",   "any",
+        "is",        "asserts",  "satisfies",
+    };
+    for (keywords) |kw| {
+        if (std.mem.eql(u8, ident, kw)) return true;
+    }
+    return false;
+}
+
 /// Check if an identifier at position `ident_start` is in an object literal key context.
 /// Returns true if the identifier appears to be a property key (e.g., `{ key: value }`).
 /// Looks backward for `{` or `,` that would indicate object literal context.
@@ -2910,6 +3149,33 @@ fn scanTemplateForEachBlocks(
     // Scan for ALL {expression} patterns (including {#if}, {#each}, {@render}, plain {expr})
     var i: usize = 0;
     while (i < template.len) {
+        // Skip HTML comments <!-- ... --> to avoid extracting {expr} from documentation
+        if (template[i] == '<' and i + 3 < template.len and
+            template[i + 1] == '!' and template[i + 2] == '-' and template[i + 3] == '-')
+        {
+            i += 4;
+            while (i + 2 < template.len) {
+                if (template[i] == '-' and template[i + 1] == '-' and template[i + 2] == '>') {
+                    i += 3;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip <style> blocks to avoid extracting identifiers from CSS
+        // This catches <style> inside <svelte:head> which may not be at column 0
+        if (template[i] == '<' and std.mem.startsWith(u8, template[i..], "<style")) {
+            // Find matching </style>
+            if (std.mem.indexOf(u8, template[i..], "</style>")) |end_offset| {
+                i = i + end_offset + 8; // Skip past </style>
+                continue;
+            }
+            // No closing tag found, skip to end
+            break;
+        }
+
         if (template[i] != '{') {
             i += 1;
             continue;
@@ -3117,11 +3383,23 @@ const DirectiveInfo = struct {
 /// Detects Svelte directives that reference identifiers:
 /// transition:xxx, in:xxx, out:xxx, animate:xxx, use:xxx
 /// Returns the identifier name and position after it, or null if not a directive.
+/// Note: Must check for word boundary before matching short prefixes like "in:" and "out:"
+/// to avoid false matches in CSS like "focus-within:inset" or "fade-out:slide".
 fn detectDirectiveIdentifier(template: []const u8, pos: usize) ?DirectiveInfo {
     const directives = [_][]const u8{ "transition:", "animate:", "use:", "in:", "out:" };
 
     for (directives) |prefix| {
         if (pos + prefix.len < template.len and std.mem.startsWith(u8, template[pos..], prefix)) {
+            // For short prefixes like "in:" and "out:", require word boundary before
+            // to avoid matching CSS like "focus-within:inset" or "fade-out:slide"
+            if ((std.mem.eql(u8, prefix, "in:") or std.mem.eql(u8, prefix, "out:")) and pos > 0) {
+                const prev = template[pos - 1];
+                // Must be preceded by whitespace or = (attribute start) or " (quoted value start)
+                // Not an alphanumeric char or hyphen (which would indicate CSS)
+                if (std.ascii.isAlphanumeric(prev) or prev == '-' or prev == '_') {
+                    continue;
+                }
+            }
             const name_start = pos + prefix.len;
             var name_end = name_start;
             // Extract identifier (alphanumeric, underscore, dollar)
