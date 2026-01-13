@@ -1566,35 +1566,63 @@ fn emitTemplateExpressions(
             .then_block => {
                 // {:then value} - emit binding for the resolved value
                 // Don't extract identifiers from the full expression (would extract "then" keyword)
-                if (extractThenCatchBinding(ast.source, node.start, node.end, "then")) |binding_name| {
+                if (extractThenCatchBinding(ast.source, node.start, node.end, "then")) |binding_pattern| {
                     if (!has_expressions) {
                         try output.appendSlice(allocator, "// Template expressions\n");
                         has_expressions = true;
                     }
-                    // Emit: let value: unknown;
-                    try output.appendSlice(allocator, "let ");
-                    try output.appendSlice(allocator, binding_name);
-                    if (is_typescript) {
-                        try output.appendSlice(allocator, ": unknown");
+                    // For destructuring patterns, we need an initializer
+                    // For simple identifiers, type annotation is sufficient
+                    const is_destructuring = binding_pattern.len > 0 and (binding_pattern[0] == '{' or binding_pattern[0] == '[');
+                    if (is_destructuring) {
+                        // Emit: var { x, y } = {} as any;
+                        try output.appendSlice(allocator, "var ");
+                        try output.appendSlice(allocator, binding_pattern);
+                        if (is_typescript) {
+                            try output.appendSlice(allocator, " = {} as any;\n");
+                        } else {
+                            try output.appendSlice(allocator, " = {};\n");
+                        }
+                    } else {
+                        // Emit: let value: unknown;
+                        try output.appendSlice(allocator, "let ");
+                        try output.appendSlice(allocator, binding_pattern);
+                        if (is_typescript) {
+                            try output.appendSlice(allocator, ": unknown");
+                        }
+                        try output.appendSlice(allocator, ";\n");
                     }
-                    try output.appendSlice(allocator, ";\n");
                 }
             },
 
             .catch_block => {
                 // {:catch error} - emit binding for the error
-                if (extractThenCatchBinding(ast.source, node.start, node.end, "catch")) |binding_name| {
+                if (extractThenCatchBinding(ast.source, node.start, node.end, "catch")) |binding_pattern| {
                     if (!has_expressions) {
                         try output.appendSlice(allocator, "// Template expressions\n");
                         has_expressions = true;
                     }
-                    // Emit: let error: unknown;
-                    try output.appendSlice(allocator, "let ");
-                    try output.appendSlice(allocator, binding_name);
-                    if (is_typescript) {
-                        try output.appendSlice(allocator, ": unknown");
+                    // For destructuring patterns, we need an initializer
+                    // For simple identifiers, type annotation is sufficient
+                    const is_destructuring = binding_pattern.len > 0 and (binding_pattern[0] == '{' or binding_pattern[0] == '[');
+                    if (is_destructuring) {
+                        // Emit: var { x, y } = {} as any;
+                        try output.appendSlice(allocator, "var ");
+                        try output.appendSlice(allocator, binding_pattern);
+                        if (is_typescript) {
+                            try output.appendSlice(allocator, " = {} as any;\n");
+                        } else {
+                            try output.appendSlice(allocator, " = {};\n");
+                        }
+                    } else {
+                        // Emit: let error: unknown;
+                        try output.appendSlice(allocator, "let ");
+                        try output.appendSlice(allocator, binding_pattern);
+                        if (is_typescript) {
+                            try output.appendSlice(allocator, ": unknown");
+                        }
+                        try output.appendSlice(allocator, ";\n");
                     }
-                    try output.appendSlice(allocator, ";\n");
                 }
             },
 
@@ -3492,46 +3520,73 @@ fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInf
     };
 }
 
-/// Extracts the binding name from {:then value} or {:catch error}
+/// Extracts the binding pattern from {:then value} or {:catch error}
 /// keyword is "then" or "catch"
+/// Handles simple identifiers: {:then value}
+/// And destructuring patterns: {:then { x, y }} or {:then [a, b]}
 fn extractThenCatchBinding(source: []const u8, start: u32, end: u32, keyword: []const u8) ?[]const u8 {
     const content = source[start..end];
     // Format: {:then value} or {:catch error} or {:then} (no binding)
+    // Or destructuring: {:then { x, y }} or {:then [a, b]}
 
-    // Find the keyword (e.g., ":then " or ":catch ")
+    // Find the keyword (e.g., ":then" or ":catch")
     var search_pattern: [16]u8 = undefined;
-    const pattern = std.fmt.bufPrint(&search_pattern, ":{s} ", .{keyword}) catch return null;
-    const idx = std.mem.indexOf(u8, content, pattern) orelse {
-        // Try without trailing space for {:then} or {:catch} with immediate }
-        const pattern2 = std.fmt.bufPrint(&search_pattern, ":{s}", .{keyword}) catch return null;
-        const idx2 = std.mem.indexOf(u8, content, pattern2) orelse return null;
-        const after_keyword = idx2 + pattern2.len;
-        // Check if followed by } (no binding)
-        if (after_keyword >= content.len) return null;
-        var rest_start = after_keyword;
-        while (rest_start < content.len and std.ascii.isWhitespace(content[rest_start])) : (rest_start += 1) {}
-        if (rest_start >= content.len or content[rest_start] == '}') return null;
-        // Extract binding name
-        const bind_start = rest_start;
-        var bind_end = bind_start;
-        while (bind_end < content.len and (std.ascii.isAlphanumeric(content[bind_end]) or content[bind_end] == '_' or content[bind_end] == '$')) : (bind_end += 1) {}
-        if (bind_end == bind_start) return null;
-        return content[bind_start..bind_end];
-    };
+    const pattern = std.fmt.bufPrint(&search_pattern, ":{s}", .{keyword}) catch return null;
+    const idx = std.mem.indexOf(u8, content, pattern) orelse return null;
 
-    // Extract binding name after the keyword and space
-    const bind_start_idx = idx + pattern.len;
-    var bind_start = bind_start_idx;
+    // Start after the keyword
+    var bind_start = idx + pattern.len;
+
     // Skip whitespace
     while (bind_start < content.len and std.ascii.isWhitespace(content[bind_start])) : (bind_start += 1) {}
     if (bind_start >= content.len) return null;
+
     // Check for immediate closing brace (no binding)
     if (content[bind_start] == '}') return null;
-    // Extract identifier
+
+    // Find the end of the binding pattern
+    // This is either:
+    // - End of identifier for simple bindings
+    // - Matching closing bracket for destructuring patterns
     var bind_end = bind_start;
-    while (bind_end < content.len and (std.ascii.isAlphanumeric(content[bind_end]) or content[bind_end] == '_' or content[bind_end] == '$')) : (bind_end += 1) {}
+
+    if (content[bind_start] == '{') {
+        // Object destructuring: find matching }
+        var brace_depth: u32 = 0;
+        while (bind_end < content.len) {
+            const c = content[bind_end];
+            if (c == '{') brace_depth += 1;
+            if (c == '}') {
+                brace_depth -= 1;
+                if (brace_depth == 0) {
+                    bind_end += 1; // Include the closing }
+                    break;
+                }
+            }
+            bind_end += 1;
+        }
+    } else if (content[bind_start] == '[') {
+        // Array destructuring: find matching ]
+        var bracket_depth: u32 = 0;
+        while (bind_end < content.len) {
+            const c = content[bind_end];
+            if (c == '[') bracket_depth += 1;
+            if (c == ']') {
+                bracket_depth -= 1;
+                if (bracket_depth == 0) {
+                    bind_end += 1; // Include the closing ]
+                    break;
+                }
+            }
+            bind_end += 1;
+        }
+    } else {
+        // Simple identifier
+        while (bind_end < content.len and (std.ascii.isAlphanumeric(content[bind_end]) or content[bind_end] == '_' or content[bind_end] == '$')) : (bind_end += 1) {}
+    }
+
     if (bind_end == bind_start) return null;
-    return content[bind_start..bind_end];
+    return std.mem.trim(u8, content[bind_start..bind_end], " \t\n\r");
 }
 
 /// Finds the position of a comma at the top level (not inside brackets)

@@ -18,6 +18,10 @@
 
     let loadingState: LoadingState = $state({ status: 'idle' });
     let promise: Promise<string> | null = $state(null);
+    
+    // For testing destructuring in {:then}
+    type FetchResult = { items: string[]; total: number };
+    let dataPromise: Promise<FetchResult> | null = $state(null);
 
     async function fetchData(): Promise<string> {
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -76,6 +80,22 @@
                 <p class="success">{value}</p>
             {:catch error}
                 <p class="error">{error.message}</p>
+            {/await}
+        {/if}
+        
+        <!-- Test destructuring in {:then} -->
+        {#if dataPromise}
+            {#await dataPromise}
+                <p>Loading data...</p>
+            {:then { items, total }}
+                <p>Found {total} items:</p>
+                <ul>
+                    {#each items as item}
+                        <li>{item}</li>
+                    {/each}
+                </ul>
+            {:catch { message }}
+                <p class="error">{message}</p>
             {/await}
         {/if}
     </section>
