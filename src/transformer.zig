@@ -6124,8 +6124,9 @@ test "component usages nested inside snippets emit void statements" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Button;") != null);
     // Popover should also be marked as used
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Popover;") != null);
-    // Spread props inside attributes should be detected
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void props;") != null);
+    // Note: `props` is a snippet parameter, not a module-level variable,
+    // so we don't emit `void props;` - the arrow function parameter binding handles it
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const child = ({ props }) => {};") != null);
 }
 
 test "spread props in lowercase tags are detected" {

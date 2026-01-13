@@ -374,6 +374,9 @@ pub const Parser = struct {
             }
         }
 
+        // Note: Dotted component names (Select.Root, Tooltip.Content) are now handled
+        // by the lexer, which produces a single identifier token for the full dotted name.
+
         const tag_name = self.source[tag_name_start..tag_name_end];
         const is_component = (tag_name.len > 0 and tag_name[0] >= 'A' and tag_name[0] <= 'Z') or
             std.mem.startsWith(u8, tag_name, "svelte:");
@@ -508,6 +511,8 @@ pub const Parser = struct {
                 self.advance();
             }
         }
+
+        // Note: Dotted component names are now handled by the lexer.
 
         const tag_name = self.source[tag_name_start..tag_name_end];
 
@@ -2265,4 +2270,29 @@ test "multiple unclosed elements" {
 
     // Should have three parse errors
     try std.testing.expectEqual(@as(usize, 3), ast.parse_errors.items.len);
+}
+
+test "dotted component names should not cause false positives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<div><Component.Root>content</Component.Root></div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    // No parse errors - dotted component names should be fully matched
+    try std.testing.expectEqual(@as(usize, 0), ast.parse_errors.items.len);
+}
+
+test "deeply nested dotted component names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<Select.Root><Select.Trigger>Click</Select.Trigger></Select.Root>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    try std.testing.expectEqual(@as(usize, 0), ast.parse_errors.items.len);
 }

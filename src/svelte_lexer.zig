@@ -228,6 +228,10 @@ pub const Lexer = struct {
                 self.advance();
                 break;
             }
+            // Stop at < to avoid swallowing HTML tags (handles apostrophes in text like "ad's")
+            if (c == '<') {
+                break;
+            }
             if (c == '\\' and self.pos + 1 < self.source.len) {
                 self.advance(); // skip escape
             }
@@ -243,6 +247,19 @@ pub const Lexer = struct {
     fn lexIdentifier(self: *Lexer, start: u32) Token {
         while (self.pos < self.source.len and isIdentChar(self.current())) {
             self.advance();
+        }
+        // Handle dotted component names (Select.Root, Tooltip.Content, etc.)
+        // Continue consuming .identifier patterns as part of the same token
+        while (self.pos < self.source.len and self.current() == '.') {
+            // Check if followed by an identifier (component continuation)
+            if (self.pos + 1 < self.source.len and isIdentStart(self.source[self.pos + 1])) {
+                self.advance(); // consume '.'
+                while (self.pos < self.source.len and isIdentChar(self.current())) {
+                    self.advance();
+                }
+            } else {
+                break;
+            }
         }
         return .{ .kind = .identifier, .start = start, .end = self.pos };
     }
