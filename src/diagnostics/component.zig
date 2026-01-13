@@ -198,7 +198,7 @@ fn findTopLevelAwait(content: []const u8) ?u32 {
     return null;
 }
 
-/// Check if expression contains await keyword (not inside a string).
+/// Check if expression contains await keyword (not inside a string or async function body).
 fn containsAwait(text: []const u8) ?u32 {
     var search_start: usize = 0;
 
@@ -216,8 +216,21 @@ fn containsAwait(text: []const u8) ?u32 {
             continue;
         }
 
+        // Skip Svelte block closing tags: {/await}
+        // Check for preceding {/ pattern
+        if (pos >= 2 and text[pos - 1] == '/' and text[pos - 2] == '{') {
+            search_start = pos + 1;
+            continue;
+        }
+
         // Check if inside string
         if (isInsideString(text, pos)) {
+            search_start = pos + 1;
+            continue;
+        }
+
+        // Check if inside async function body
+        if (isInsideAsyncFunction(text, pos)) {
             search_start = pos + 1;
             continue;
         }
@@ -226,6 +239,179 @@ fn containsAwait(text: []const u8) ?u32 {
     }
 
     return null;
+}
+
+/// Check if position is inside an async function body.
+/// Looks for `async` keyword followed by `=>` or `function` before the brace
+/// that contains the target position.
+fn isInsideAsyncFunction(text: []const u8, target_pos: usize) bool {
+    var i: usize = 0;
+    var brace_stack: [64]bool = undefined; // true if brace opened after async
+    var stack_depth: usize = 0;
+
+    while (i < target_pos and i < text.len) {
+        const c = text[i];
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(text, i);
+            continue;
+        }
+
+        // Skip comments
+        if (c == '/' and i + 1 < text.len) {
+            if (text[i + 1] == '/') {
+                while (i < text.len and text[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (text[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < text.len) {
+                    if (text[i] == '*' and text[i + 1] == '/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // Track braces
+        if (c == '{') {
+            // Check if this brace follows async arrow or async function
+            const is_async_brace = isAsyncFunctionBrace(text, i);
+            if (stack_depth < brace_stack.len) {
+                brace_stack[stack_depth] = is_async_brace;
+                stack_depth += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        if (c == '}') {
+            if (stack_depth > 0) {
+                stack_depth -= 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    // Check if any enclosing brace was an async function brace
+    for (0..stack_depth) |depth| {
+        if (brace_stack[depth]) return true;
+    }
+    return false;
+}
+
+/// Check if the brace at position is the body of an async arrow function or async function.
+fn isAsyncFunctionBrace(text: []const u8, brace_pos: usize) bool {
+    if (brace_pos == 0) return false;
+
+    // Scan backwards to find either:
+    // - `async ... =>`  (arrow function)
+    // - `async function` (function declaration/expression)
+    var i: isize = @intCast(brace_pos - 1);
+
+    // Skip whitespace before brace
+    while (i >= 0 and std.ascii.isWhitespace(text[@intCast(i)])) : (i -= 1) {}
+    if (i < 0) return false;
+
+    // Check for arrow function: must end with `=>`
+    if (i >= 1 and text[@intCast(i)] == '>' and text[@intCast(i - 1)] == '=') {
+        // Scan backwards to find `async` keyword
+        i -= 2;
+        // Skip whitespace and params (parens)
+        var paren_depth: i32 = 0;
+        while (i >= 0) {
+            const c = text[@intCast(i)];
+            if (c == ')') paren_depth += 1;
+            if (c == '(') {
+                paren_depth -= 1;
+                if (paren_depth == 0) {
+                    i -= 1;
+                    break;
+                }
+            }
+            // Simple identifier param (no parens): `async x =>`
+            if (paren_depth == 0 and !std.ascii.isWhitespace(c) and !isIdentChar(c)) {
+                break;
+            }
+            i -= 1;
+        }
+        // Skip whitespace
+        while (i >= 0 and std.ascii.isWhitespace(text[@intCast(i)])) : (i -= 1) {}
+        // Check for "async"
+        if (i >= 4) {
+            const start: usize = @intCast(i - 4);
+            if (std.mem.eql(u8, text[start .. start + 5], "async")) {
+                // Verify it's not part of a larger identifier
+                if (start == 0 or !isIdentChar(text[start - 1])) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Check for `async function ... {` or `async function name() {`
+    // Scan backwards past function name and params
+    const ui: usize = @intCast(i);
+    if (ui >= 1 and text[ui] == ')') {
+        // Skip params
+        var paren_depth: i32 = 1;
+        i -= 1;
+        while (i >= 0 and paren_depth > 0) {
+            const c = text[@intCast(i)];
+            if (c == ')') paren_depth += 1;
+            if (c == '(') paren_depth -= 1;
+            i -= 1;
+        }
+        // Skip whitespace before (
+        while (i >= 0 and std.ascii.isWhitespace(text[@intCast(i)])) : (i -= 1) {}
+        if (i < 0) return false;
+
+        // Find the identifier before params (could be function name or "function" keyword)
+        var ident_end: usize = @intCast(i + 1);
+        while (i >= 0 and isIdentChar(text[@intCast(i)])) : (i -= 1) {}
+        var ident_start: usize = @intCast(i + 1);
+        var ident = text[ident_start..ident_end];
+
+        // If this is NOT "function", it's a function name - skip it and find "function"
+        if (!std.mem.eql(u8, ident, "function")) {
+            // Skip whitespace
+            while (i >= 0 and std.ascii.isWhitespace(text[@intCast(i)])) : (i -= 1) {}
+            if (i < 0) return false;
+
+            // Find "function" keyword
+            ident_end = @intCast(i + 1);
+            while (i >= 0 and isIdentChar(text[@intCast(i)])) : (i -= 1) {}
+            ident_start = @intCast(i + 1);
+            ident = text[ident_start..ident_end];
+        }
+
+        if (std.mem.eql(u8, ident, "function")) {
+            // Skip whitespace and check for "async"
+            while (i >= 0 and std.ascii.isWhitespace(text[@intCast(i)])) : (i -= 1) {}
+            if (i < 0) return false;
+
+            // Find the identifier before "function"
+            const async_end: usize = @intCast(i + 1);
+            while (i >= 0 and isIdentChar(text[@intCast(i)])) : (i -= 1) {}
+            const async_start: usize = @intCast(i + 1);
+
+            if (std.mem.eql(u8, text[async_start..async_end], "async")) {
+                // Verify it's not part of a larger identifier
+                if (async_start == 0 or !isIdentChar(text[async_start - 1])) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
 }
 
 /// Detects rune calls ($state, $derived, etc.) in template expressions.
@@ -1418,6 +1604,98 @@ test "experimental_async: string containing await is valid" {
 
     // "await" inside a string is not an await expression
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "experimental_async: await inside async arrow function is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<button onclick={async () => { await fetch('/api') }}>Click</button>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // await inside async arrow function is allowed
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "experimental_async: await inside async function is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<button onclick={async function() { await fetch('/api') }}>Click</button>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // await inside async function expression is allowed
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "experimental_async: top-level await outside async function is error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<p>{await promise}</p>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // bare await in template is not allowed
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("experimental_async", diagnostics.items[0].code.?);
+}
+
+test "experimental_async: nested async arrow function is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    // Deep nesting: async arrow with nested object containing another async
+    const source = "<button onclick={async () => { const x = { fn: async () => { await inner() } }; await outer() }}>Click</button>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "experimental_async: await inside named async function is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<button onclick={async function handleClick() { await fetch('/api') }}>Click</button>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // await inside named async function expression is allowed
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "experimental_async: await block closing tag is valid" {
+    // The {/await} closing tag should not trigger experimental_async error
+    const result = containsAwait("{/await}");
+    try std.testing.expect(result == null);
 }
 
 // ============================================================================
