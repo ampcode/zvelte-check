@@ -1056,7 +1056,9 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
     }
 
     // Skip "Untyped function calls may not accept type arguments" errors
-    // These are tsgo-specific errors that tsc doesn't report
+    // These occur when the function's type can't be resolved (e.g., db.query<T>()
+    // where db comes from platform.env which may not be typed). Since we don't
+    // include all .ts files in our tsconfig, these are often false positives.
     if (std.mem.indexOf(u8, message, "Untyped function calls may not accept type arguments") != null) {
         return true;
     }
