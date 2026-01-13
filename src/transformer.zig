@@ -52,6 +52,19 @@ const SnippetInfo = struct {
     params: ?[]const u8,
 };
 
+/// Tracks a snippet's body range for scoping purposes.
+/// Expressions inside a snippet body use snippet parameters and should be
+/// emitted inside the snippet function, not at module scope.
+const SnippetBodyRange = struct {
+    name: []const u8,
+    params: ?[]const u8,
+    generics: ?[]const u8,
+    /// Start of snippet body (after the closing } of {#snippet ...})
+    body_start: u32,
+    /// End of snippet body (start of {/snippet})
+    body_end: u32,
+};
+
 const ExportInfo = struct {
     name: []const u8,
     type_repr: ?[]const u8,
@@ -142,6 +155,12 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             try declared_names.put(allocator, entry.key_ptr.*, {});
         }
     }
+
+    // Find snippet body ranges for proper scoping.
+    // Expressions inside snippet bodies need to be emitted inside the snippet function,
+    // not at module scope, so that snippet parameters are in scope.
+    var snippet_body_ranges = try findSnippetBodyRanges(allocator, ast.source);
+    defer snippet_body_ranges.deinit(allocator);
 
     // Header comment
     try output.appendSlice(allocator, "// Generated from ");
@@ -311,7 +330,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         if (instance_generics != null) {
             // For generic components, emit template expressions INSIDE __render
             // so they can access script variables (which are scoped to __render).
-            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript);
+            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items);
             try output.appendSlice(allocator, "\n}\n\n");
         } else {
             try output.appendSlice(allocator, "\n\n");
@@ -320,7 +339,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
 
     // For non-generic components, emit template expressions at module level
     if (instance_generics == null) {
-        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript);
+        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items);
     }
 
     // Extract props from instance script
@@ -1490,6 +1509,7 @@ fn emitTemplateExpressions(
     mappings: *std.ArrayList(SourceMap.Mapping),
     declared_names: std.StringHashMapUnmanaged(void),
     is_typescript: bool,
+    snippet_body_ranges: []const SnippetBodyRange,
 ) !void {
     var has_expressions = false;
 
@@ -1522,17 +1542,42 @@ fn emitTemplateExpressions(
     var current_await_expr: ?[]const u8 = null;
 
     for (ast.nodes.items) |node| {
+        // Skip nodes that are inside snippet bodies - they'll be handled inside the snippet function.
+        // This prevents "Cannot find name" errors for snippet parameters used in body expressions.
+        // Exception: the snippet node itself, which we need to process to emit the full snippet function.
+        if (node.kind != .snippet and isInsideSnippetBody(node.start, snippet_body_ranges)) {
+            continue;
+        }
+
         switch (node.kind) {
             .snippet => {
-                // Snippets are hoisted earlier as function declarations.
-                // Here we just mark the snippet name as "used" to suppress
-                // "declared but never read" warnings for implicitly-used snippets
-                // (e.g., `child` snippets passed to component slot props).
+                // Emit the full snippet function with its body expressions.
+                // This replaces the empty hoisted declaration with a proper implementation
+                // that has snippet parameters in scope for body expressions.
                 if (extractSnippetName(ast.source, node.start, node.end)) |info| {
+                    // Mark snippet name as "used" to suppress "declared but never read" warnings
                     if (!declared_names.contains(info.name)) {
                         const result = try template_refs.getOrPut(allocator, info.name);
                         if (!result.found_existing) {
                             result.value_ptr.* = node.start;
+                        }
+                    }
+
+                    // Find the body range for this snippet
+                    for (snippet_body_ranges) |range| {
+                        if (std.mem.eql(u8, range.name, info.name)) {
+                            // Emit snippet body expressions inside a block.
+                            // This creates a scope where snippet parameters are available.
+                            try emitSnippetBodyExpressions(
+                                allocator,
+                                ast,
+                                output,
+                                mappings,
+                                range,
+                                is_typescript,
+                                &has_expressions,
+                            );
+                            break;
                         }
                     }
                 }
@@ -1800,6 +1845,9 @@ fn emitTemplateExpressions(
         var elem_counter: u32 = 0;
         for (ast.nodes.items) |node| {
             if (node.kind != .element) continue;
+
+            // Skip elements inside snippet bodies - they're handled by emitSnippetBodyExpressions
+            if (isInsideSnippetBody(node.start, snippet_body_ranges)) continue;
 
             const elem_data = ast.elements.items[node.data];
 
@@ -3789,6 +3837,246 @@ fn extractSnippetName(source: []const u8, start: u32, end: u32) ?SnippetNameInfo
         .params = params,
         .offset = @intCast(name_start),
     };
+}
+
+/// Finds all snippet body ranges in the source.
+/// For each {#snippet name(params)}...{/snippet}, returns the body range.
+fn findSnippetBodyRanges(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !std.ArrayList(SnippetBodyRange) {
+    var ranges: std.ArrayList(SnippetBodyRange) = .empty;
+
+    var i: usize = 0;
+    while (i < source.len) {
+        // Look for {#snippet
+        if (i + 9 < source.len and std.mem.eql(u8, source[i .. i + 9], "{#snippet")) {
+            const snippet_start = i;
+
+            // Find the closing } of the opening tag
+            var j = i + 9;
+            var brace_depth: u32 = 1;
+            while (j < source.len and brace_depth > 0) {
+                const c = source[j];
+                if (c == '"' or c == '\'' or c == '`') {
+                    j = skipStringLiteral(source, j);
+                    continue;
+                }
+                if (c == '{') brace_depth += 1;
+                if (c == '}') brace_depth -= 1;
+                if (brace_depth > 0) j += 1;
+            }
+            const body_start: u32 = @intCast(j + 1); // After the closing }
+
+            // Find {/snippet}
+            const close_tag = "{/snippet}";
+            if (std.mem.indexOf(u8, source[j..], close_tag)) |close_offset| {
+                const body_end: u32 = @intCast(j + close_offset);
+
+                // Extract snippet info from the opening tag
+                if (extractSnippetName(source, @intCast(snippet_start), body_start)) |info| {
+                    try ranges.append(allocator, .{
+                        .name = info.name,
+                        .params = info.params,
+                        .generics = info.generics,
+                        .body_start = body_start,
+                        .body_end = body_end,
+                    });
+                }
+
+                i = j + close_offset + close_tag.len;
+                continue;
+            }
+        }
+
+        // Skip strings to avoid false matches
+        if (source[i] == '"' or source[i] == '\'' or source[i] == '`') {
+            i = skipStringLiteral(source, i);
+            continue;
+        }
+
+        i += 1;
+    }
+
+    return ranges;
+}
+
+/// Checks if a source position is inside any snippet body.
+fn isInsideSnippetBody(pos: u32, ranges: []const SnippetBodyRange) bool {
+    for (ranges) |range| {
+        if (pos >= range.body_start and pos < range.body_end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Emits expressions from inside a snippet body, wrapped in a block with snippet parameters in scope.
+/// This ensures that expressions like `{@render threadItem(thread)}` inside `{#snippet children(thread: T)}`
+/// have access to the `thread` parameter.
+fn emitSnippetBodyExpressions(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    output: *std.ArrayList(u8),
+    mappings: *std.ArrayList(SourceMap.Mapping),
+    range: SnippetBodyRange,
+    is_typescript: bool,
+    has_expressions: *bool,
+) !void {
+    // Collect render expressions and other expressions from the snippet body
+    var body_exprs: std.ArrayList(struct { expr: []const u8, offset: u32 }) = .empty;
+    defer body_exprs.deinit(allocator);
+
+    for (ast.nodes.items) |node| {
+        // Only process nodes within this snippet's body range
+        if (node.start < range.body_start or node.start >= range.body_end) continue;
+
+        switch (node.kind) {
+            .render => {
+                if (extractRenderExpression(ast.source, node.start, node.end)) |render_info| {
+                    try body_exprs.append(allocator, .{
+                        .expr = render_info.expr,
+                        .offset = node.start + render_info.offset,
+                    });
+                }
+            },
+            else => {},
+        }
+    }
+
+    // If there are no body expressions, nothing to emit
+    if (body_exprs.items.len == 0) return;
+
+    if (!has_expressions.*) {
+        try output.appendSlice(allocator, "// Template expressions\n");
+        has_expressions.* = true;
+    }
+
+    // Emit a self-invoking function that provides the snippet parameter scope.
+    // Format: ((param1: any, param2: any) => { void (expr1); void (expr2); })(undefined!, undefined!);
+    // Using `undefined!` as arguments satisfies TypeScript while making it clear these are placeholders.
+    try output.appendSlice(allocator, "((");
+
+    // Emit parameters with proper names and any type
+    if (range.params) |params| {
+        try emitSnippetParamsWithNames(allocator, output, params, is_typescript);
+    }
+
+    try output.appendSlice(allocator, ") => {\n");
+
+    // Emit each body expression
+    for (body_exprs.items) |expr_info| {
+        try output.appendSlice(allocator, "  void (");
+        try mappings.append(allocator, .{
+            .svelte_offset = expr_info.offset,
+            .ts_offset = @intCast(output.items.len),
+            .len = @intCast(expr_info.expr.len),
+        });
+        try output.appendSlice(allocator, expr_info.expr);
+        try output.appendSlice(allocator, ");\n");
+    }
+
+    try output.appendSlice(allocator, "})(");
+
+    // Emit undefined! for each parameter as placeholder arguments
+    if (range.params) |params| {
+        const param_count = countParams(params);
+        var i: usize = 0;
+        while (i < param_count) : (i += 1) {
+            if (i > 0) try output.appendSlice(allocator, ", ");
+            if (is_typescript) {
+                try output.appendSlice(allocator, "undefined!");
+            } else {
+                try output.appendSlice(allocator, "undefined");
+            }
+        }
+    }
+
+    try output.appendSlice(allocator, ");\n");
+}
+
+/// Emits snippet parameter declarations with their original names.
+/// Used for snippet body wrapper functions where we need names, not just counts.
+fn emitSnippetParamsWithNames(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    params: []const u8,
+    is_typescript: bool,
+) !void {
+    var i: usize = 0;
+    var param_idx: usize = 0;
+
+    while (i < params.len) {
+        // Skip whitespace
+        while (i < params.len and std.ascii.isWhitespace(params[i])) : (i += 1) {}
+        if (i >= params.len) break;
+
+        // Handle destructuring patterns: { a, b } or [a, b]
+        if (params[i] == '{' or params[i] == '[') {
+            const open_char = params[i];
+            const close_char: u8 = if (open_char == '{') '}' else ']';
+            const pattern_start = i;
+            i += 1;
+            var depth: u32 = 1;
+            while (i < params.len and depth > 0) {
+                if (params[i] == open_char) depth += 1;
+                if (params[i] == close_char) depth -= 1;
+                i += 1;
+            }
+            const pattern_end = i;
+
+            if (param_idx > 0) try output.appendSlice(allocator, ", ");
+            try output.appendSlice(allocator, params[pattern_start..pattern_end]);
+
+            // Skip type annotation
+            while (i < params.len and params[i] != ',') {
+                if (params[i] == '<') {
+                    var angle_depth: u32 = 1;
+                    i += 1;
+                    while (i < params.len and angle_depth > 0) {
+                        if (params[i] == '<') angle_depth += 1;
+                        if (params[i] == '>') angle_depth -= 1;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if (i < params.len and params[i] == ',') i += 1;
+            param_idx += 1;
+            continue;
+        }
+
+        // Simple parameter: name or name: type
+        if (isIdentStartChar(params[i])) {
+            const name_start = i;
+            while (i < params.len and isIdentChar(params[i])) : (i += 1) {}
+            const name = params[name_start..i];
+
+            if (param_idx > 0) try output.appendSlice(allocator, ", ");
+            try output.appendSlice(allocator, name);
+            if (is_typescript) {
+                try output.appendSlice(allocator, ": any");
+            }
+            param_idx += 1;
+        }
+
+        // Skip to next parameter (past : type annotation and , separator)
+        while (i < params.len and params[i] != ',') {
+            if (params[i] == '<') {
+                var depth: u32 = 1;
+                i += 1;
+                while (i < params.len and depth > 0) {
+                    if (params[i] == '<') depth += 1;
+                    if (params[i] == '>') depth -= 1;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if (i < params.len and params[i] == ',') i += 1;
+    }
 }
 
 /// Emits parameter declarations with `any` type for hoisted snippet functions.

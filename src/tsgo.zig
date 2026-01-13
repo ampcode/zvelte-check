@@ -202,6 +202,7 @@ pub fn check(
     const stdout = stdout_buf.items;
     const stderr = stderr_buf.items;
 
+    // DEBUG: comment out to keep generated files for inspection
     cleanupStubDir(workspace_dir);
 
     // Parse tsgo output
