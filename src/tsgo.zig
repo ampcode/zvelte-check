@@ -903,10 +903,15 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "'X' is declared but never used" errors for type-only imports
+        // Skip "'X' is declared but never used" and "'X' is declared but its value is never read"
+        // errors for type-only imports and hoisted snippet declarations.
         // Type-only imports (import type { X }) are only used in type annotations,
         // not runtime code. Our void statements can't mark them as used since they're types.
-        if (std.mem.indexOf(u8, message, "is declared but never used") != null) {
+        // Hoisted snippets like `function child(...) {}` may only be used via @render or
+        // passed as slot props, which our transformer handles but TS can't detect.
+        if (std.mem.indexOf(u8, message, "is declared but never used") != null or
+            std.mem.indexOf(u8, message, "is declared but its value is never read") != null)
+        {
             return true;
         }
 
