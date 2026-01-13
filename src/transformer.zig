@@ -202,10 +202,10 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             \\declare function __svelte_store_get<T>(store: SvelteStore<T>): T;
             \\declare function __svelte_store_get<Store extends SvelteStore<any> | undefined | null>(store: Store): Store extends SvelteStore<infer T> ? T : Store;
             \\
-            \\// Array type validation for {#each} blocks
-            \\// Ensures the iterable is actually array-like, generating type errors for incompatible types
-            \\// When the type doesn't match ArrayLike, returns unknown[] so accessing properties on items reports proper errors
-            \\declare function __svelte_ensureArray<T extends ArrayLike<unknown> | null | undefined>(array: T): T extends ArrayLike<infer U> ? U[] : unknown[];
+            \\// Array type inference for {#each} blocks
+            \\// Extracts element type from arrays, readonly arrays, and ArrayLike types
+            \\// Falls back to any[] for unrecognized types (including `any`) to avoid false positives
+            \\declare function __svelte_ensureArray<T>(array: T): T extends readonly (infer U)[] ? U[] : T extends ArrayLike<infer U> ? U[] : any[];
             \\
             \\
         );
