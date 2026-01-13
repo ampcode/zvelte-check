@@ -1516,6 +1516,11 @@ fn emitTemplateExpressions(
     var template_refs: std.StringHashMapUnmanaged(u32) = .empty;
     defer template_refs.deinit(allocator);
 
+    // Track current await expression for {:then}/{:catch} type inference.
+    // When we see {#await promiseExpr}, we store promiseExpr so that
+    // subsequent {:then value} can emit `let value = await (promiseExpr);`
+    var current_await_expr: ?[]const u8 = null;
+
     for (ast.nodes.items) |node| {
         switch (node.kind) {
             .snippet => {
@@ -1557,10 +1562,23 @@ fn emitTemplateExpressions(
                 }
             },
 
-            .expression, .if_block, .await_block, .key_block, .html, .const_tag, .debug_tag => {
+            .expression, .if_block, .key_block, .html, .const_tag, .debug_tag => {
                 // Extract identifiers from template expressions
                 const expr = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
+            },
+
+            .await_block => {
+                // {#await promise} - extract identifiers and track the promise expression
+                // for use in subsequent {:then} blocks
+                const expr = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
+                // Store the await expression for {:then}/{:catch} type inference
+                if (extractAwaitExpression(ast.source, node.start, node.end)) |await_info| {
+                    current_await_expr = await_info.expr;
+                } else {
+                    current_await_expr = null;
+                }
             },
 
             .then_block => {
@@ -1572,25 +1590,36 @@ fn emitTemplateExpressions(
                         has_expressions = true;
                     }
                     // For destructuring patterns, we need an initializer
-                    // For simple identifiers, type annotation is sufficient
+                    // For simple identifiers, we can use await to infer the type
                     const is_destructuring = binding_pattern.len > 0 and (binding_pattern[0] == '{' or binding_pattern[0] == '[');
                     if (is_destructuring) {
-                        // Emit: var { x, y } = {} as any;
+                        // Emit: var { x, y } = await (promiseExpr);
+                        // This infers the type from the promise's resolved value
                         try output.appendSlice(allocator, "var ");
                         try output.appendSlice(allocator, binding_pattern);
-                        if (is_typescript) {
+                        if (current_await_expr) |await_expr| {
+                            try output.appendSlice(allocator, " = await (");
+                            try output.appendSlice(allocator, await_expr);
+                            try output.appendSlice(allocator, ");\n");
+                        } else if (is_typescript) {
                             try output.appendSlice(allocator, " = {} as any;\n");
                         } else {
                             try output.appendSlice(allocator, " = {};\n");
                         }
                     } else {
-                        // Emit: let value: unknown;
+                        // Emit: let value = await (promiseExpr);
+                        // This infers the type from the promise's resolved value
                         try output.appendSlice(allocator, "let ");
                         try output.appendSlice(allocator, binding_pattern);
-                        if (is_typescript) {
-                            try output.appendSlice(allocator, ": unknown");
+                        if (current_await_expr) |await_expr| {
+                            try output.appendSlice(allocator, " = await (");
+                            try output.appendSlice(allocator, await_expr);
+                            try output.appendSlice(allocator, ");\n");
+                        } else if (is_typescript) {
+                            try output.appendSlice(allocator, ": unknown;\n");
+                        } else {
+                            try output.appendSlice(allocator, ";\n");
                         }
-                        try output.appendSlice(allocator, ";\n");
                     }
                 }
             },
@@ -7427,4 +7456,63 @@ test "extractIdentifiersFromExpr excludes async arrow destructured params" {
     try std.testing.expect(!refs.contains("enhanceFormEl"));
     // form should NOT be extracted (it's a property key, not a binding)
     try std.testing.expect(!refs.contains("form"));
+}
+
+test "transform {:then} bindings with type inference from await expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  async function fetchData(): Promise<{ count: number }> {
+        \\    return { count: 42 };
+        \\  }
+        \\  let promise = fetchData();
+        \\</script>
+        \\{#await promise}
+        \\  <p>Loading...</p>
+        \\{:then result}
+        \\  <p>{result.count}</p>
+        \\{/await}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // Should emit `let result = await (promise);` to infer type from promise
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let result = await (promise);") != null);
+    // Should NOT emit `let result: unknown;`
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "let result: unknown") == null);
+}
+
+test "transform {:then} destructuring with type inference from await expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let dataPromise: Promise<{ items: string[]; total: number }> | null = null;
+        \\</script>
+        \\{#if dataPromise}
+        \\  {#await dataPromise}
+        \\    <p>Loading...</p>
+        \\  {:then { items, total }}
+        \\    <p>{total} items</p>
+        \\  {/await}
+        \\{/if}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // Should emit `var { items, total } = await (dataPromise);` to infer type
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { items, total } = await (dataPromise);") != null);
+    // Should NOT emit `var { items, total } = {} as any;`
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "= {} as any") == null);
 }
