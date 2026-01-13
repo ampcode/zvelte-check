@@ -219,11 +219,16 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // even though they're defined in the template. We emit function declarations
     // with proper signatures so TypeScript validates argument counts at call sites.
     // Skip snippets whose names conflict with script declarations.
+    // Also skip duplicate snippet names - only hoist the first occurrence.
+    var hoisted_snippets: std.StringHashMapUnmanaged(void) = .empty;
+    defer hoisted_snippets.deinit(allocator);
     var emitted_snippet_header = false;
     for (ast.nodes.items) |node| {
         if (node.kind == .snippet) {
             if (extractSnippetName(ast.source, node.start, node.end)) |info| {
-                if (!declared_names.contains(info.name)) {
+                // Skip if conflicts with script declarations or already hoisted
+                if (!declared_names.contains(info.name) and !hoisted_snippets.contains(info.name)) {
+                    try hoisted_snippets.put(allocator, info.name, {});
                     if (!emitted_snippet_header) {
                         try output.appendSlice(allocator, "// Hoisted snippet declarations\n");
                         emitted_snippet_header = true;
@@ -1514,52 +1519,17 @@ fn emitTemplateExpressions(
     for (ast.nodes.items) |node| {
         switch (node.kind) {
             .snippet => {
+                // Snippets are hoisted earlier as function declarations.
+                // Here we just mark the snippet name as "used" to suppress
+                // "declared but never read" warnings for implicitly-used snippets
+                // (e.g., `child` snippets passed to component slot props).
                 if (extractSnippetName(ast.source, node.start, node.end)) |info| {
-                    // Skip snippet declarations for names already declared in script.
-                    // In Svelte, {#snippet filter()} can shadow imported `filter`,
-                    // but in generated TS they'd conflict at module scope.
-                    if (declared_names.contains(info.name)) continue;
-
-                    if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
-                        has_expressions = true;
-                    }
-
-                    // Emit snippet as arrow function to preserve parameter type checking.
-                    // This ensures TypeScript reports "implicit any" for untyped params.
-                    // Format: const snippetName = <T>(params) => {}; (with optional generics)
-                    try output.appendSlice(allocator, "const ");
-                    try output.appendSlice(allocator, info.name);
-                    try output.appendSlice(allocator, " = ");
-
-                    // Emit generic type parameters if present
-                    if (info.generics) |generics| {
-                        try output.appendSlice(allocator, "<");
-                        try output.appendSlice(allocator, generics);
-                        try output.appendSlice(allocator, ">");
-                    }
-
-                    try output.appendSlice(allocator, "(");
-
-                    // Add source mapping for parameters so TypeScript errors map back correctly
-                    if (info.params) |params| {
-                        // Calculate Svelte offset: node.start + offset to params within the snippet tag
-                        // The snippet format is {#snippet name(params)} or {#snippet name<T>(params)}
-                        // info.offset is position of name start; need to add name length + generics + 1 for '('
-                        var params_offset = info.offset + @as(u32, @intCast(info.name.len));
-                        if (info.generics) |generics| {
-                            params_offset += @as(u32, @intCast(generics.len)) + 2; // +2 for '<' and '>'
+                    if (!declared_names.contains(info.name)) {
+                        const result = try template_refs.getOrPut(allocator, info.name);
+                        if (!result.found_existing) {
+                            result.value_ptr.* = node.start;
                         }
-                        params_offset += 1; // +1 for '('
-                        const params_svelte_offset = node.start + params_offset;
-                        try mappings.append(allocator, .{
-                            .svelte_offset = params_svelte_offset,
-                            .ts_offset = @intCast(output.items.len),
-                            .len = @intCast(params.len),
-                        });
-                        try output.appendSlice(allocator, params);
                     }
-                    try output.appendSlice(allocator, ") => {};\n");
                 }
             },
 
@@ -1591,6 +1561,53 @@ fn emitTemplateExpressions(
                 // Extract identifiers from template expressions
                 const expr = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
+            },
+
+            .then_block => {
+                // {:then value} - emit binding for the resolved value
+                // Don't extract identifiers from the full expression (would extract "then" keyword)
+                if (extractThenCatchBinding(ast.source, node.start, node.end, "then")) |binding_name| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    // Emit: let value: unknown;
+                    try output.appendSlice(allocator, "let ");
+                    try output.appendSlice(allocator, binding_name);
+                    if (is_typescript) {
+                        try output.appendSlice(allocator, ": unknown");
+                    }
+                    try output.appendSlice(allocator, ";\n");
+                }
+            },
+
+            .catch_block => {
+                // {:catch error} - emit binding for the error
+                if (extractThenCatchBinding(ast.source, node.start, node.end, "catch")) |binding_name| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    // Emit: let error: unknown;
+                    try output.appendSlice(allocator, "let ");
+                    try output.appendSlice(allocator, binding_name);
+                    if (is_typescript) {
+                        try output.appendSlice(allocator, ": unknown");
+                    }
+                    try output.appendSlice(allocator, ";\n");
+                }
+            },
+
+            .else_block => {
+                // {:else} or {:else if condition} - don't extract "else" keyword
+                // If it's {:else if condition}, extract identifiers from the condition
+                const expr = ast.source[node.start..node.end];
+                // Skip {:else prefix and extract from the rest
+                if (std.mem.indexOf(u8, expr, ":else if ")) |idx| {
+                    const condition = expr[idx + ":else if ".len ..];
+                    try extractIdentifiersFromExpr(allocator, condition, node.start + @as(u32, @intCast(idx + ":else if ".len)), &template_refs);
+                }
+                // Plain {:else} has no expressions to extract
             },
 
             .each_block => {
@@ -1628,6 +1645,19 @@ fn emitTemplateExpressions(
                 }
 
                 for (ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end]) |attr| {
+                    // Skip spread attributes
+                    if (std.mem.eql(u8, attr.name, "...")) continue;
+
+                    // Handle @attach directive: extract the attached function as "used"
+                    // {@attach tooltip(args)} → extract 'tooltip' so import isn't flagged as unused
+                    if (std.mem.eql(u8, attr.name, "@attach")) {
+                        if (attr.value) |val| {
+                            // Value is the full expression like {tooltip(args)}
+                            try extractIdentifiersFromExpr(allocator, val, attr.start, &template_refs);
+                        }
+                        continue;
+                    }
+
                     if (attr.value) |val| {
                         // Expression values are wrapped in {}
                         if (val.len > 0 and val[0] == '{') {
@@ -1737,16 +1767,10 @@ fn emitTemplateExpressions(
                 has_expressions = true;
             }
 
-            // Emit: const __elem_N__: __SvelteElements__['tag'] = { attr1: value1, attr2: value2 };
-            try output.appendSlice(allocator, "const __elem_");
-            // Format the counter as a string
-            var counter_buf: [16]u8 = undefined;
-            const counter_str = std.fmt.bufPrint(&counter_buf, "{d}", .{elem_counter}) catch "0";
-            try output.appendSlice(allocator, counter_str);
+            // Emit: void ({ attr1: value1 } satisfies Partial<__SvelteElements__['tag']>);
+            // Use 'satisfies' to check attribute types without declaring variables
             elem_counter += 1;
-            try output.appendSlice(allocator, "__: __SvelteElements__['");
-            try output.appendSlice(allocator, elem_data.tag_name);
-            try output.appendSlice(allocator, "'] = { ");
+            try output.appendSlice(allocator, "void ({ ");
 
             var first_attr = true;
             for (attrs) |attr| {
@@ -1785,13 +1809,24 @@ fn emitTemplateExpressions(
 
                 // Emit value (or undefined for valueless attrs)
                 if (attr.value) |val| {
-                    if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}') {
-                        // Expression value: strip { } and emit the expression
+                    if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}' and isSingleExpression(val)) {
+                        // Pure expression value: strip { } and emit the expression
                         const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
                         try output.appendSlice(allocator, expr);
-                    } else if (val.len > 0 and val[0] == '{') {
-                        // Malformed expression - just emit as-is
-                        try output.appendSlice(allocator, val);
+                    } else if (std.mem.indexOf(u8, val, "{") != null) {
+                        // Mixed value with embedded expressions (e.g., "text {expr} more", "{a} {b}")
+                        // Emit as template literal to handle multi-line values correctly
+                        try emitMixedAttributeValue(allocator, output, mappings, val, attr.start);
+                    } else if (std.mem.indexOf(u8, val, "\n") != null) {
+                        // Multi-line static value - emit as template literal
+                        try output.appendSlice(allocator, "`");
+                        for (val) |c| {
+                            if (c == '`' or c == '$') {
+                                try output.append(allocator, '\\');
+                            }
+                            try output.append(allocator, c);
+                        }
+                        try output.appendSlice(allocator, "`");
                     } else {
                         // Static string value - emit as string literal
                         try output.appendSlice(allocator, "\"");
@@ -1804,7 +1839,9 @@ fn emitTemplateExpressions(
                 }
             }
 
-            try output.appendSlice(allocator, " };\n");
+            try output.appendSlice(allocator, " } satisfies Partial<__SvelteElements__['");
+            try output.appendSlice(allocator, elem_data.tag_name);
+            try output.appendSlice(allocator, "']>);\n");
         }
     }
 
@@ -1845,25 +1882,158 @@ fn emitTemplateExpressions(
     }
 }
 
+/// Emits a mixed attribute value (e.g., "text {expr} more") as a template literal.
+/// Converts Svelte's {expr} syntax to JavaScript's ${expr} template literal syntax.
+/// Handles multi-line values correctly since template literals allow newlines.
+fn emitMixedAttributeValue(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    mappings: *std.ArrayList(SourceMap.Mapping),
+    val: []const u8,
+    attr_start: u32,
+) !void {
+    _ = mappings;
+    _ = attr_start;
+    try output.appendSlice(allocator, "`");
+
+    var i: usize = 0;
+    while (i < val.len) {
+        const c = val[i];
+
+        if (c == '{') {
+            // Find matching closing brace
+            const expr_start = i + 1;
+            var depth: usize = 1;
+            var j = expr_start;
+            while (j < val.len and depth > 0) : (j += 1) {
+                switch (val[j]) {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    '"', '\'' => {
+                        // Skip string literal
+                        const quote = val[j];
+                        j += 1;
+                        while (j < val.len and val[j] != quote) : (j += 1) {
+                            if (val[j] == '\\' and j + 1 < val.len) j += 1;
+                        }
+                    },
+                    '`' => {
+                        // Skip template literal (simplified - doesn't handle nested ${})
+                        j += 1;
+                        while (j < val.len and val[j] != '`') : (j += 1) {
+                            if (val[j] == '\\' and j + 1 < val.len) j += 1;
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            if (depth == 0) {
+                const expr_end = j - 1;
+                try output.appendSlice(allocator, "${");
+                try output.appendSlice(allocator, val[expr_start..expr_end]);
+                try output.appendSlice(allocator, "}");
+                i = j;
+            } else {
+                // Malformed - just emit the brace
+                try output.append(allocator, c);
+                i += 1;
+            }
+        } else if (c == '`' or c == '$') {
+            // Escape backticks and $ in template literals
+            try output.append(allocator, '\\');
+            try output.append(allocator, c);
+            i += 1;
+        } else {
+            try output.append(allocator, c);
+            i += 1;
+        }
+    }
+
+    try output.appendSlice(allocator, "`");
+}
+
+/// Checks if an attribute value is a single expression (just "{expr}").
+/// Returns false for mixed values like "{a} {b}" or "text {expr}".
+fn isSingleExpression(val: []const u8) bool {
+    if (val.len < 2 or val[0] != '{') return false;
+
+    var depth: usize = 1;
+    var i: usize = 1;
+    while (i < val.len and depth > 0) : (i += 1) {
+        const c = val[i];
+        switch (c) {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            '"', '\'' => {
+                // Skip string literal
+                const quote = c;
+                i += 1;
+                while (i < val.len and val[i] != quote) : (i += 1) {
+                    if (val[i] == '\\' and i + 1 < val.len) i += 1;
+                }
+            },
+            '`' => {
+                // Skip template literal (simplified)
+                i += 1;
+                while (i < val.len and val[i] != '`') : (i += 1) {
+                    if (val[i] == '\\' and i + 1 < val.len) i += 1;
+                }
+            },
+            else => {},
+        }
+    }
+
+    // After the first expression closes, there should be nothing left (trimmed)
+    if (depth != 0) return false;
+    const remaining = std.mem.trim(u8, val[i..], " \t\n\r");
+    return remaining.len == 0;
+}
+
 /// Extracts identifier references from a template expression string.
 /// Handles expressions like {foo}, {foo.bar}, {foo + bar}, onclick={handler}, etc.
 /// Skips identifiers that are arrow function parameters (e.g., `e` in `e => e`).
 /// `base_offset` is the Svelte source offset of the start of `expr`.
+const ParamRegion = struct {
+    start: usize,
+    end: usize,
+};
+
 fn extractIdentifiersFromExpr(
     allocator: std.mem.Allocator,
     expr: []const u8,
     base_offset: u32,
     refs: *std.StringHashMapUnmanaged(u32),
 ) std.mem.Allocator.Error!void {
-    // First pass: collect arrow function parameter names to exclude.
-    // This handles patterns like: e => e, (e) => e, (a, b) => a + b, (e: Event) => e
+    // First pass: collect arrow function parameter names AND parameter regions.
+    // Names are used to exclude references in the function body.
+    // Regions are used to skip extracting identifiers from the parameter list itself.
     var arrow_params: std.StringHashMapUnmanaged(void) = .empty;
     defer arrow_params.deinit(allocator);
-    try collectArrowFunctionParams(allocator, expr, &arrow_params);
+    var param_regions: std.ArrayList(ParamRegion) = .empty;
+    defer param_regions.deinit(allocator);
+    try collectArrowFunctionParamsAndRegions(allocator, expr, &arrow_params, &param_regions);
+
+    // First pass: also collect locally declared variables (const/let/var declarations)
+    // These are scoped to the expression and shouldn't be extracted as template refs.
+    var local_decls: std.StringHashMapUnmanaged(void) = .empty;
+    defer local_decls.deinit(allocator);
+    try collectLocalDeclarations(allocator, expr, &local_decls);
 
     var i: usize = 0;
     while (i < expr.len) {
         const c = expr[i];
+
+        // Check if we're inside a parameter region - skip entirely
+        var in_param_region = false;
+        for (param_regions.items) |region| {
+            if (i >= region.start and i < region.end) {
+                in_param_region = true;
+                i = region.end;
+                break;
+            }
+        }
+        if (in_param_region) continue;
 
         // Handle strings - for template literals, extract from interpolations
         if (c == '"' or c == '\'') {
@@ -1910,6 +2080,23 @@ fn extractIdentifiersFromExpr(
             // Skip arrow function parameters - they're scoped to the function, not module scope
             if (arrow_params.contains(ident)) continue;
 
+            // Skip locally declared variables (const/let/var inside callbacks)
+            if (local_decls.contains(ident)) continue;
+
+            // Skip object literal property keys (identifier followed by : in object context)
+            // Pattern: { key: value } - 'key' is not a variable reference
+            // But NOT: ternary expressions (a ? b : c) or type annotations
+            // Check if followed by : (with optional whitespace)
+            var peek_idx = i;
+            while (peek_idx < expr.len and std.ascii.isWhitespace(expr[peek_idx])) : (peek_idx += 1) {}
+            if (peek_idx < expr.len and expr[peek_idx] == ':') {
+                // Check if this looks like an object literal key context
+                // Look backward for { or , that would indicate object literal
+                if (isObjectLiteralKeyContext(expr, start)) {
+                    continue; // Skip this identifier - it's an object key, not a reference
+                }
+            }
+
             // Store identifier reference with its Svelte source offset
             // Only store the first occurrence (don't overwrite with later occurrences)
             if (ident.len > 0) {
@@ -1937,12 +2124,15 @@ fn extractIdentifiersFromExpr(
     }
 }
 
-/// Collects arrow function parameter names from an expression.
-/// Handles patterns: e => ..., (e) => ..., (a, b) => ..., (e: Type) => ...
-fn collectArrowFunctionParams(
+/// Collects arrow function parameter names AND parameter regions from an expression.
+/// Names are used to exclude references in function bodies.
+/// Regions mark the parameter list positions to skip during identifier extraction.
+/// Handles patterns: e => ..., (e) => ..., (a, b) => ..., (e: Type) => ..., async (...) => ...
+fn collectArrowFunctionParamsAndRegions(
     allocator: std.mem.Allocator,
     expr: []const u8,
     params: *std.StringHashMapUnmanaged(void),
+    regions: *std.ArrayList(ParamRegion),
 ) std.mem.Allocator.Error!void {
     var i: usize = 0;
     while (i < expr.len) {
@@ -1969,7 +2159,7 @@ fn collectArrowFunctionParams(
         }
 
         // Look for arrow function patterns
-        // Pattern 1: identifier followed by => (e.g., e => e)
+        // Pattern 1: identifier followed by => (e.g., e => e) or async (...) => ...
         if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
             const ident_start = i;
             while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_' or expr[i] == '$')) : (i += 1) {}
@@ -1983,11 +2173,39 @@ fn collectArrowFunctionParams(
             if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
                 // This identifier is an arrow function parameter
                 try params.put(allocator, ident, {});
+                // Record the region covering just the identifier
+                try regions.append(allocator, .{ .start = ident_start, .end = i });
+            }
+            // Check for async (...) => pattern
+            else if (std.mem.eql(u8, ident, "async") and j < expr.len and expr[j] == '(') {
+                // This is async arrow function - process the parenthesized params
+                const paren_start = j;
+                j += 1;
+                var depth: u32 = 1;
+                while (j < expr.len and depth > 0) {
+                    if (expr[j] == '(') depth += 1;
+                    if (expr[j] == ')') depth -= 1;
+                    if (depth > 0) j += 1;
+                }
+                const paren_end = j;
+                if (j < expr.len) j += 1; // Skip closing )
+
+                // Skip whitespace
+                while (j < expr.len and std.ascii.isWhitespace(expr[j])) : (j += 1) {}
+
+                // Check for => after the parentheses
+                if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
+                    try extractArrowParamsFromParens(allocator, expr[paren_start + 1 .. paren_end], params);
+                    // Record region covering the parenthesized params (including parens)
+                    try regions.append(allocator, .{ .start = paren_start, .end = paren_end + 1 });
+                }
+                i = j;
             }
             continue;
         }
 
         // Pattern 2: parenthesized parameters followed by => (e.g., (e) => ..., (a, b) => ...)
+        // Also handles function call arguments that contain arrow functions
         if (c == '(') {
             const paren_start = i;
             i += 1;
@@ -2008,6 +2226,186 @@ fn collectArrowFunctionParams(
             if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
                 // Extract parameter names from inside parentheses
                 try extractArrowParamsFromParens(allocator, expr[paren_start + 1 .. paren_end], params);
+                // Record region covering the parenthesized params (including parens)
+                try regions.append(allocator, .{ .start = paren_start, .end = paren_end + 1 });
+            } else {
+                // Not an arrow function - but the content might contain arrow functions
+                // Recursively scan the parenthesized content for nested arrow functions
+                // Adjust the region offsets to be relative to the outer expression
+                const inner_start = paren_start + 1;
+                try collectArrowFunctionParamsAndRegionsWithOffset(allocator, expr[inner_start..paren_end], inner_start, params, regions);
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Same as collectArrowFunctionParamsAndRegions but with an offset for nested calls
+fn collectArrowFunctionParamsAndRegionsWithOffset(
+    allocator: std.mem.Allocator,
+    expr: []const u8,
+    offset: usize,
+    params: *std.StringHashMapUnmanaged(void),
+    regions: *std.ArrayList(ParamRegion),
+) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+    while (i < expr.len) {
+        const c = expr[i];
+
+        // Skip string literals
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipStringLiteral(expr, i);
+            continue;
+        }
+
+        // Skip comments
+        if (i + 1 < expr.len and c == '/') {
+            if (expr[i + 1] == '/') {
+                while (i < expr.len and expr[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (expr[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < expr.len and !(expr[i] == '*' and expr[i + 1] == '/')) : (i += 1) {}
+                if (i + 1 < expr.len) i += 2;
+                continue;
+            }
+        }
+
+        // Look for arrow function patterns
+        if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
+            const ident_start = i;
+            while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_' or expr[i] == '$')) : (i += 1) {}
+            const ident = expr[ident_start..i];
+
+            var j = i;
+            while (j < expr.len and std.ascii.isWhitespace(expr[j])) : (j += 1) {}
+
+            if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
+                try params.put(allocator, ident, {});
+                try regions.append(allocator, .{ .start = offset + ident_start, .end = offset + i });
+            } else if (std.mem.eql(u8, ident, "async") and j < expr.len and expr[j] == '(') {
+                const paren_start = j;
+                j += 1;
+                var depth: u32 = 1;
+                while (j < expr.len and depth > 0) {
+                    if (expr[j] == '(') depth += 1;
+                    if (expr[j] == ')') depth -= 1;
+                    if (depth > 0) j += 1;
+                }
+                const paren_end = j;
+                if (j < expr.len) j += 1;
+                while (j < expr.len and std.ascii.isWhitespace(expr[j])) : (j += 1) {}
+                if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
+                    try extractArrowParamsFromParens(allocator, expr[paren_start + 1 .. paren_end], params);
+                    try regions.append(allocator, .{ .start = offset + paren_start, .end = offset + paren_end + 1 });
+                }
+                i = j;
+            }
+            continue;
+        }
+
+        if (c == '(') {
+            const paren_start = i;
+            i += 1;
+            var depth: u32 = 1;
+            while (i < expr.len and depth > 0) {
+                if (expr[i] == '(') depth += 1;
+                if (expr[i] == ')') depth -= 1;
+                if (depth > 0) i += 1;
+            }
+            const paren_end = i;
+            if (i < expr.len) i += 1;
+
+            var j = i;
+            while (j < expr.len and std.ascii.isWhitespace(expr[j])) : (j += 1) {}
+
+            if (j + 1 < expr.len and expr[j] == '=' and expr[j + 1] == '>') {
+                try extractArrowParamsFromParens(allocator, expr[paren_start + 1 .. paren_end], params);
+                try regions.append(allocator, .{ .start = offset + paren_start, .end = offset + paren_end + 1 });
+            } else {
+                const inner_start = paren_start + 1;
+                try collectArrowFunctionParamsAndRegionsWithOffset(allocator, expr[inner_start..paren_end], offset + inner_start, params, regions);
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Collects locally declared variables (const/let/var) from an expression.
+/// These are scoped to the expression and shouldn't be extracted as template refs.
+fn collectLocalDeclarations(
+    allocator: std.mem.Allocator,
+    expr: []const u8,
+    decls: *std.StringHashMapUnmanaged(void),
+) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+    while (i < expr.len) {
+        const c = expr[i];
+
+        // Skip string literals
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipStringLiteral(expr, i);
+            continue;
+        }
+
+        // Skip comments
+        if (i + 1 < expr.len and c == '/') {
+            if (expr[i + 1] == '/') {
+                while (i < expr.len and expr[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (expr[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < expr.len and !(expr[i] == '*' and expr[i + 1] == '/')) : (i += 1) {}
+                if (i + 1 < expr.len) i += 2;
+                continue;
+            }
+        }
+
+        // Look for const/let/var declarations
+        if (std.ascii.isAlphabetic(c)) {
+            const kw_start = i;
+            while (i < expr.len and std.ascii.isAlphanumeric(expr[i])) : (i += 1) {}
+            const keyword = expr[kw_start..i];
+
+            // Check if this is a declaration keyword
+            if (std.mem.eql(u8, keyword, "const") or
+                std.mem.eql(u8, keyword, "let") or
+                std.mem.eql(u8, keyword, "var"))
+            {
+                // Skip whitespace
+                while (i < expr.len and std.ascii.isWhitespace(expr[i])) : (i += 1) {}
+
+                // Check for destructuring pattern: { a, b } or [ a, b ]
+                if (i < expr.len and (expr[i] == '{' or expr[i] == '[')) {
+                    const open_char = expr[i];
+                    const close_char: u8 = if (open_char == '{') '}' else ']';
+                    const destruct_start = i + 1;
+                    i += 1;
+                    var depth: u32 = 1;
+                    while (i < expr.len and depth > 0) {
+                        if (expr[i] == open_char) depth += 1;
+                        if (expr[i] == close_char) depth -= 1;
+                        if (depth > 0) i += 1;
+                    }
+                    // Extract bound names from destructuring pattern
+                    try extractDestructuredNames(allocator, expr[destruct_start..i], decls);
+                    continue;
+                }
+
+                // Extract simple identifier
+                if (i < expr.len and (std.ascii.isAlphabetic(expr[i]) or expr[i] == '_' or expr[i] == '$')) {
+                    const name_start = i;
+                    while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_' or expr[i] == '$')) : (i += 1) {}
+                    const name = expr[name_start..i];
+                    try decls.put(allocator, name, {});
+                }
+                continue;
             }
             continue;
         }
@@ -2033,16 +2431,20 @@ fn extractArrowParamsFromParens(
         if (content[i] == '{' or content[i] == '[') {
             const open_char = content[i];
             const close_char: u8 = if (open_char == '{') '}' else ']';
+            const destruct_start = i + 1;
             i += 1;
             var depth: u32 = 1;
             while (i < content.len and depth > 0) {
                 if (content[i] == open_char) depth += 1;
                 if (content[i] == close_char) depth -= 1;
-                // Don't extract identifiers from destructuring - they're complex patterns
-                i += 1;
+                if (depth > 0) i += 1;
             }
-            // Skip type annotation if present
-            while (i < content.len and content[i] != ',') : (i += 1) {}
+            const destruct_end = i;
+            // Extract bound names from destructuring pattern
+            try extractDestructuredNames(allocator, content[destruct_start..destruct_end], params);
+            if (i < content.len) i += 1; // Skip closing brace
+            // Skip type annotation if present (: Type)
+            while (i < content.len and content[i] != ',' and content[i] != ')') : (i += 1) {}
             if (i < content.len and content[i] == ',') i += 1;
             continue;
         }
@@ -2078,6 +2480,123 @@ fn extractArrowParamsFromParens(
             i += 1;
         }
         if (i < content.len and content[i] == ',') i += 1;
+    }
+}
+
+/// Extracts bound variable names from object/array destructuring patterns.
+/// For `{ a, b: c, d: { e } }` extracts: a, c, e (the bound names, not property keys)
+/// For `[ a, b ]` extracts: a, b
+fn extractDestructuredNames(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    params: *std.StringHashMapUnmanaged(void),
+) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+    while (i < pattern.len) {
+        // Skip whitespace
+        while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+        if (i >= pattern.len) break;
+
+        // Handle nested destructuring
+        if (pattern[i] == '{' or pattern[i] == '[') {
+            const open_char = pattern[i];
+            const close_char: u8 = if (open_char == '{') '}' else ']';
+            const nested_start = i + 1;
+            i += 1;
+            var depth: u32 = 1;
+            while (i < pattern.len and depth > 0) {
+                if (pattern[i] == open_char) depth += 1;
+                if (pattern[i] == close_char) depth -= 1;
+                if (depth > 0) i += 1;
+            }
+            const nested_end = i;
+            // Recursively extract from nested pattern
+            try extractDestructuredNames(allocator, pattern[nested_start..nested_end], params);
+            if (i < pattern.len) i += 1; // Skip closing brace
+            // Skip any trailing content (type annotation, default value) until comma
+            while (i < pattern.len and pattern[i] != ',') : (i += 1) {}
+            if (i < pattern.len and pattern[i] == ',') i += 1;
+            continue;
+        }
+
+        // Handle rest pattern: ...rest
+        if (i + 2 < pattern.len and pattern[i] == '.' and pattern[i + 1] == '.' and pattern[i + 2] == '.') {
+            i += 3;
+            while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+            // Extract the rest identifier
+            if (i < pattern.len and (std.ascii.isAlphabetic(pattern[i]) or pattern[i] == '_' or pattern[i] == '$')) {
+                const name_start = i;
+                while (i < pattern.len and (std.ascii.isAlphanumeric(pattern[i]) or pattern[i] == '_' or pattern[i] == '$')) : (i += 1) {}
+                try params.put(allocator, pattern[name_start..i], {});
+            }
+            continue;
+        }
+
+        // Extract identifier (property name or simple binding)
+        if (std.ascii.isAlphabetic(pattern[i]) or pattern[i] == '_' or pattern[i] == '$') {
+            const ident_start = i;
+            while (i < pattern.len and (std.ascii.isAlphanumeric(pattern[i]) or pattern[i] == '_' or pattern[i] == '$')) : (i += 1) {}
+            const ident = pattern[ident_start..i];
+
+            // Skip whitespace after identifier
+            while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+
+            // Check if this is a rename pattern: key: alias or key: { nested }
+            if (i < pattern.len and pattern[i] == ':') {
+                i += 1; // Skip colon
+                while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+
+                // Check for nested destructuring after colon
+                if (i < pattern.len and (pattern[i] == '{' or pattern[i] == '[')) {
+                    // The identifier before : is the property key, not a binding
+                    // Recursively handle the nested pattern
+                    continue;
+                }
+
+                // Extract the alias (bound name)
+                if (i < pattern.len and (std.ascii.isAlphabetic(pattern[i]) or pattern[i] == '_' or pattern[i] == '$')) {
+                    const alias_start = i;
+                    while (i < pattern.len and (std.ascii.isAlphanumeric(pattern[i]) or pattern[i] == '_' or pattern[i] == '$')) : (i += 1) {}
+                    try params.put(allocator, pattern[alias_start..i], {});
+                }
+            } else {
+                // Simple binding (no colon), the identifier itself is the bound name
+                try params.put(allocator, ident, {});
+            }
+
+            // Skip default value (= ...) and type annotation (: Type) until comma
+            while (i < pattern.len and pattern[i] != ',') {
+                // Skip nested braces/brackets in default values
+                if (pattern[i] == '{' or pattern[i] == '[' or pattern[i] == '(') {
+                    const open = pattern[i];
+                    const close: u8 = switch (open) {
+                        '{' => '}',
+                        '[' => ']',
+                        '(' => ')',
+                        else => unreachable,
+                    };
+                    i += 1;
+                    var depth: u32 = 1;
+                    while (i < pattern.len and depth > 0) {
+                        if (pattern[i] == open) depth += 1;
+                        if (pattern[i] == close) depth -= 1;
+                        i += 1;
+                    }
+                    continue;
+                }
+                // Skip strings
+                if (pattern[i] == '"' or pattern[i] == '\'' or pattern[i] == '`') {
+                    i = skipStringLiteral(pattern, i);
+                    continue;
+                }
+                i += 1;
+            }
+            if (i < pattern.len and pattern[i] == ',') i += 1;
+            continue;
+        }
+
+        // Skip any other characters (commas, etc.)
+        i += 1;
     }
 }
 
@@ -2139,6 +2658,75 @@ fn skipStringLiteral(expr: []const u8, start: usize) usize {
         i += 1;
     }
     return i;
+}
+
+/// Check if an identifier at position `ident_start` is in an object literal key context.
+/// Returns true if the identifier appears to be a property key (e.g., `{ key: value }`).
+/// Looks backward for `{` or `,` that would indicate object literal context.
+/// Skips string literals and nested structures when searching backward.
+fn isObjectLiteralKeyContext(expr: []const u8, ident_start: usize) bool {
+    if (ident_start == 0) return false;
+
+    // Scan backward, skipping whitespace, to find what precedes this identifier
+    var i = ident_start;
+    while (i > 0) {
+        i -= 1;
+        const c = expr[i];
+
+        // Skip whitespace
+        if (std.ascii.isWhitespace(c)) continue;
+
+        // Found { or , - this is an object literal context
+        if (c == '{' or c == ',') {
+            // But NOT if preceded by $ (like ${ in template literal)
+            if (c == '{' and i > 0 and expr[i - 1] == '$') {
+                return false;
+            }
+            return true;
+        }
+
+        // Found [ - this could be array literal or computed property, not object key
+        if (c == '[') return false;
+
+        // Found ( - not in object literal context (function params)
+        if (c == '(') return false;
+
+        // Found : - we're after a value, not before a key
+        if (c == ':') return false;
+
+        // Found ? - could be ternary or optional, check context
+        if (c == '?') return false;
+
+        // Found identifier char - there's something before us, not a fresh key position
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '$') return false;
+
+        // Found closing bracket - scan past the matched opener
+        if (c == ')' or c == ']' or c == '}') {
+            // Skip backward past the matching opening bracket
+            const open_char: u8 = switch (c) {
+                ')' => '(',
+                ']' => '[',
+                '}' => '{',
+                else => unreachable,
+            };
+            var depth: u32 = 1;
+            while (i > 0 and depth > 0) {
+                i -= 1;
+                if (expr[i] == c) depth += 1;
+                if (expr[i] == open_char) depth -= 1;
+            }
+            // After skipping the block, continue scanning backward
+            continue;
+        }
+
+        // Found string end quote - not in key position (value context)
+        if (c == '"' or c == '\'' or c == '`') return false;
+
+        // Other characters - probably not in key position
+        return false;
+    }
+
+    return false;
 }
 
 /// Finds the position after the matching closing brace, starting from the position
@@ -2238,6 +2826,15 @@ fn scanTemplateForEachBlocks(
             continue;
         }
 
+        // Svelte 5 attach directives: {@attach functionName(args)}
+        // Extract identifiers from the expression to mark the function as "used"
+        if (std.mem.startsWith(u8, full_expr, "{@attach ")) {
+            const svelte_offset: u32 = @intCast(template_start + expr_start);
+            try extractIdentifiersFromExpr(allocator, full_expr, svelte_offset, template_refs);
+            i = j;
+            continue;
+        }
+
         // Extract identifiers from the expression
         // template_start + expr_start gives the absolute Svelte source offset
         const svelte_offset: u32 = @intCast(template_start + expr_start);
@@ -2303,9 +2900,23 @@ fn scanTemplateForComponents(
 
         if (template[i] == '<' and i + 1 < template.len) {
             const next_char = template[i + 1];
-            // Skip closing tags, comments, special tags
-            if (next_char == '/' or next_char == '!' or next_char == '?') {
+            // Skip closing tags and special tags
+            if (next_char == '/' or next_char == '?') {
                 i += 1;
+                continue;
+            }
+
+            // Skip HTML comments <!-- ... -->
+            if (next_char == '!' and i + 3 < template.len and template[i + 2] == '-' and template[i + 3] == '-') {
+                // Find end of comment -->
+                i += 4;
+                while (i + 2 < template.len) {
+                    if (template[i] == '-' and template[i + 1] == '-' and template[i + 2] == '>') {
+                        i += 3;
+                        break;
+                    }
+                    i += 1;
+                }
                 continue;
             }
 
@@ -2345,9 +2956,12 @@ fn scanTemplateForComponents(
                         // Find matching brace, skipping strings to handle braces in string content
                         i = findMatchingCloseBrace(template, i + 1);
                         // Extract identifiers from attribute expression (includes spreads like {...props})
+                        // Skip @attach directives - they're handled separately
                         const attr_expr = template[expr_start..i];
-                        const svelte_offset = template_start_offset + @as(u32, @intCast(expr_start));
-                        try extractIdentifiersFromExpr(allocator, attr_expr, svelte_offset, refs);
+                        if (!std.mem.startsWith(u8, attr_expr, "{@attach ")) {
+                            const svelte_offset = template_start_offset + @as(u32, @intCast(expr_start));
+                            try extractIdentifiersFromExpr(allocator, attr_expr, svelte_offset, refs);
+                        }
                     } else if (template[i] == '/' and i + 1 < template.len and template[i + 1] == '>') {
                         i += 2; // Skip />
                         break;
@@ -2439,6 +3053,10 @@ fn isValidatableHtmlAttr(name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "out:")) return false;
     if (std.mem.startsWith(u8, name, "animate:")) return false;
     if (std.mem.startsWith(u8, name, "let:")) return false;
+    // Skip Svelte 5 attach directive
+    if (std.mem.eql(u8, name, "@attach")) return false;
+    // Skip spread attributes
+    if (std.mem.eql(u8, name, "...")) return false;
     // Skip slot attribute (for named slots)
     if (std.mem.eql(u8, name, "slot")) return false;
     // Skip this attribute (for svelte:component)
@@ -2450,25 +3068,25 @@ fn isValidatableHtmlAttr(name: []const u8) bool {
 fn isJsKeywordOrBuiltin(name: []const u8) bool {
     const keywords = [_][]const u8{
         // JS keywords
-        "if",        "else",       "for",        "while",     "do",      "switch",
-        "case",      "default",    "break",      "continue",  "return",  "throw",
-        "try",       "catch",      "finally",    "new",       "delete",  "typeof",
-        "void",      "in",         "instanceof", "this",      "class",   "extends",
-        "super",     "import",     "export",     "from",      "as",      "async",
-        "await",     "yield",      "let",        "const",     "var",     "function",
-        "true",      "false",      "null",       "undefined", "NaN",     "Infinity",
+        "if",        "else",     "for",        "while",     "do",      "switch",
+        "case",      "default",  "break",      "continue",  "return",  "throw",
+        "try",       "catch",    "finally",    "new",       "delete",  "typeof",
+        "void",      "in",       "instanceof", "this",      "class",   "extends",
+        "super",     "import",   "export",     "from",      "as",      "async",
+        "await",     "yield",    "let",        "const",     "var",     "function",
+        "true",      "false",    "null",       "undefined", "NaN",     "Infinity",
         // Reserved keywords (strict mode and future reserved)
-        "with",      "enum",       "implements", "interface", "package", "private",
-        "protected", "public",     "static",
+        "with",      "enum",     "implements", "interface", "package", "private",
+        "protected", "public",   "static",     "satisfies",
         // Built-in objects
-            "Array",     "Object",  "String",
-        "Number",    "Boolean",    "Symbol",     "BigInt",    "Math",    "Date",
-        "RegExp",    "Error",      "JSON",       "Promise",   "Map",     "Set",
-        "WeakMap",   "WeakSet",    "Proxy",      "Reflect",   "console", "window",
-        "document",  "globalThis",
+        "Array",   "Object",
+        "String",    "Number",   "Boolean",    "Symbol",    "BigInt",  "Math",
+        "Date",      "RegExp",   "Error",      "JSON",      "Promise", "Map",
+        "Set",       "WeakMap",  "WeakSet",    "Proxy",     "Reflect", "console",
+        "window",    "document", "globalThis",
         // Svelte keywords in template blocks
-        "each",       "snippet",   "render",  "html",
-        "debug",     "key",
+        "each",      "then",    "snippet",
+        "render",    "html",     "debug",      "key",       "attach",
     };
     for (keywords) |kw| {
         if (std.mem.eql(u8, name, kw)) return true;
@@ -2872,6 +3490,48 @@ fn extractEachBindings(source: []const u8, start: u32, end: u32) ?EachBindingInf
         .key_offset = key_offset,
         .offset = start + @as(u32, @intCast(expr_start)),
     };
+}
+
+/// Extracts the binding name from {:then value} or {:catch error}
+/// keyword is "then" or "catch"
+fn extractThenCatchBinding(source: []const u8, start: u32, end: u32, keyword: []const u8) ?[]const u8 {
+    const content = source[start..end];
+    // Format: {:then value} or {:catch error} or {:then} (no binding)
+
+    // Find the keyword (e.g., ":then " or ":catch ")
+    var search_pattern: [16]u8 = undefined;
+    const pattern = std.fmt.bufPrint(&search_pattern, ":{s} ", .{keyword}) catch return null;
+    const idx = std.mem.indexOf(u8, content, pattern) orelse {
+        // Try without trailing space for {:then} or {:catch} with immediate }
+        const pattern2 = std.fmt.bufPrint(&search_pattern, ":{s}", .{keyword}) catch return null;
+        const idx2 = std.mem.indexOf(u8, content, pattern2) orelse return null;
+        const after_keyword = idx2 + pattern2.len;
+        // Check if followed by } (no binding)
+        if (after_keyword >= content.len) return null;
+        var rest_start = after_keyword;
+        while (rest_start < content.len and std.ascii.isWhitespace(content[rest_start])) : (rest_start += 1) {}
+        if (rest_start >= content.len or content[rest_start] == '}') return null;
+        // Extract binding name
+        const bind_start = rest_start;
+        var bind_end = bind_start;
+        while (bind_end < content.len and (std.ascii.isAlphanumeric(content[bind_end]) or content[bind_end] == '_' or content[bind_end] == '$')) : (bind_end += 1) {}
+        if (bind_end == bind_start) return null;
+        return content[bind_start..bind_end];
+    };
+
+    // Extract binding name after the keyword and space
+    const bind_start_idx = idx + pattern.len;
+    var bind_start = bind_start_idx;
+    // Skip whitespace
+    while (bind_start < content.len and std.ascii.isWhitespace(content[bind_start])) : (bind_start += 1) {}
+    if (bind_start >= content.len) return null;
+    // Check for immediate closing brace (no binding)
+    if (content[bind_start] == '}') return null;
+    // Extract identifier
+    var bind_end = bind_start;
+    while (bind_end < content.len and (std.ascii.isAlphanumeric(content[bind_end]) or content[bind_end] == '_' or content[bind_end] == '$')) : (bind_end += 1) {}
+    if (bind_end == bind_start) return null;
+    return content[bind_start..bind_end];
 }
 
 /// Finds the position of a comma at the top level (not inside brackets)
@@ -5197,9 +5857,9 @@ test "transform snippet with params" {
 
     const virtual = try transform(allocator, ast);
 
-    // Snippets are emitted as arrow functions with original parameter syntax
-    // This preserves type checking including "implicit any" errors for untyped params
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const greeting = (name: string, age: number) => {};") != null);
+    // Snippets are hoisted as function declarations with generic parameter names
+    // This allows call sites to validate argument counts without importing types
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function greeting(_0: any, _1: any): void {}") != null);
 }
 
 test "transform snippet with import type param" {
@@ -5223,8 +5883,8 @@ test "transform snippet with import type param" {
 
     // We don't auto-import Snippet (users import it themselves if needed)
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") == null);
-    // Snippets are emitted as arrow functions with original parameter syntax
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const shortcut = (key: import('svelte').Snippet | string, label: string) => {};") != null);
+    // Snippets are hoisted as function declarations with generic parameter names
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function shortcut(_0: any, _1: any): void {}") != null);
 }
 
 test "transform const binding" {
@@ -5274,8 +5934,8 @@ test "debug Svelte5EdgeCases optional param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Snippets are emitted as arrow functions with original parameter syntax
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const optionalParam = (name?: string) => {};") != null);
+    // Snippets are hoisted as function declarations with generic parameter names
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function optionalParam(_0: any): void {}") != null);
 }
 
 test "snippet with object destructuring param" {
@@ -5301,8 +5961,8 @@ test "snippet with object destructuring param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Snippets are emitted as arrow functions with original parameter syntax
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const child = ({ wrapperProps, props, open }) => {};") != null);
+    // Snippets with destructuring params count the parameter (not individual fields)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function child(_0: any): void {}") != null);
 }
 
 test "const tag with template literal" {
@@ -6054,13 +6714,13 @@ test "snippet name shadowing import should not emit var declaration" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should NOT emit snippet arrow functions for names that shadow imports
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const filter = (") == null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const map = (") == null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const Default = (") == null);
+    // Should NOT emit hoisted function declarations for names that shadow imports
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function filter(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function map(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function Default(") == null);
 
-    // SHOULD emit snippet arrow function for snippet that doesn't shadow an import
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const other = () => {};") != null);
+    // SHOULD emit hoisted function declaration for snippet that doesn't shadow an import
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function other(): void {}") != null);
 
     // The imports should still be present
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import { filter, map } from 'rxjs'") != null);
@@ -6124,9 +6784,8 @@ test "component usages nested inside snippets emit void statements" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Button;") != null);
     // Popover should also be marked as used
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Popover;") != null);
-    // Note: `props` is a snippet parameter, not a module-level variable,
-    // so we don't emit `void props;` - the arrow function parameter binding handles it
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const child = ({ props }) => {};") != null);
+    // Snippet is hoisted as a function declaration
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function child(_0: any): void {}") != null);
 }
 
 test "spread props in lowercase tags are detected" {
@@ -6538,4 +7197,179 @@ fn isImportAsContext(content: []const u8, pos: usize) bool {
 
     // If statement starts with import or export, this is renaming context
     return std.mem.startsWith(u8, stmt, "import") or std.mem.startsWith(u8, stmt, "export");
+}
+
+test "multi-line attribute with mixed expressions" {
+    // Regression test: multi-line class attribute with multiple expressions
+    // should be emitted as a template literal, not a broken string
+    const source =
+        \\<script lang="ts">
+        \\  let hasBorder = true;
+        \\  let isCustomer = false;
+        \\</script>
+        \\
+        \\<div
+        \\  class="p-4 {hasBorder ? 'border' : ''} {isCustomer
+        \\    ? 'bg-gray-50'
+        \\    : ''}"
+        \\>
+        \\  Test
+        \\</div>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var parser = @import("svelte_parser.zig").Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const result = try transform(allocator, ast);
+
+    // Should not contain broken string literals (double quotes spanning multiple lines)
+    // Should use template literals (backticks) for mixed values
+    const has_template_literal = std.mem.indexOf(u8, result.content, "`p-4 ${") != null or
+        std.mem.indexOf(u8, result.content, "`") != null;
+    try std.testing.expect(has_template_literal);
+}
+
+test "multi-line static attribute" {
+    // Regression test: multi-line style attribute without expressions
+    const source =
+        \\<script lang="ts">
+        \\</script>
+        \\
+        \\<div
+        \\  style="
+        \\    background-image: radial-gradient(
+        \\      ellipse 60% 50%,
+        \\      transparent 100%
+        \\    );
+        \\  "
+        \\>
+        \\  Test
+        \\</div>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var parser = @import("svelte_parser.zig").Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const result = try transform(allocator, ast);
+
+    // Should use template literal for multi-line value
+    const has_template_literal = std.mem.indexOf(u8, result.content, "style: `") != null;
+    try std.testing.expect(has_template_literal);
+}
+
+test "svelte 5 attach directive parsing" {
+    // Regression test: {@attach ...} should be parsed correctly and skipped
+    const source =
+        \\<script lang="ts">
+        \\  function tooltip(msg: string) { return {}; }
+        \\  let value = 10;
+        \\</script>
+        \\
+        \\<span
+        \\  class="foo"
+        \\  {@attach tooltip(`Value: ${value}`)}
+        \\>
+        \\  Hover me
+        \\</span>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var parser = @import("svelte_parser.zig").Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    const result = try transform(allocator, ast);
+
+    // Should not contain 'attach' as a standalone identifier reference
+    // (the expression inside @attach should not leak identifiers)
+    const has_attach_ref = std.mem.indexOf(u8, result.content, "void attach;") != null;
+    try std.testing.expect(!has_attach_ref);
+}
+
+// TODO: Spread attribute parsing in the parser is not yet implemented.
+// The parser currently skips over {...} in attribute positions.
+// Spread identifiers are extracted via scanTemplateForComponents instead.
+// Uncomment and implement when proper spread attribute parsing is added.
+//
+// test "spread attribute parsing" {
+//     // Regression test: {...expr} should be parsed as spread and skipped
+//     const source =
+//         \\<script lang="ts">
+//         \\  let props = { class: 'foo' };
+//         \\</script>
+//         \\
+//         \\<div {...props}>
+//         \\  Test
+//         \\</div>
+//     ;
+//
+//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+//     defer arena.deinit();
+//     const allocator = arena.allocator();
+//     var parser = @import("svelte_parser.zig").Parser.init(allocator, source, "test.svelte");
+//     const ast = try parser.parse();
+//
+//     // Check that the parser found the spread attribute
+//     try std.testing.expect(ast.elements.items.len >= 1);
+//     const elem = ast.elements.items[0];
+//     const attrs = ast.attributes.items[elem.attrs_start..elem.attrs_end];
+//
+//     var found_spread = false;
+//     for (attrs) |attr| {
+//         if (std.mem.eql(u8, attr.name, "...")) {
+//             found_spread = true;
+//             break;
+//         }
+//     }
+//     try std.testing.expect(found_spread);
+// }
+
+test "extractDestructuredNames extracts from object pattern" {
+    var params: std.StringHashMapUnmanaged(void) = .empty;
+    defer params.deinit(std.testing.allocator);
+
+    try extractDestructuredNames(std.testing.allocator, " submit, form: enhanceFormEl ", &params);
+
+    try std.testing.expect(params.contains("submit"));
+    try std.testing.expect(params.contains("enhanceFormEl"));
+    try std.testing.expect(!params.contains("form"));
+}
+
+test "collectArrowFunctionParamsAndRegions handles async destructuring" {
+    var params: std.StringHashMapUnmanaged(void) = .empty;
+    defer params.deinit(std.testing.allocator);
+    var regions: std.ArrayList(ParamRegion) = .empty;
+    defer regions.deinit(std.testing.allocator);
+
+    const expr = "async ({ submit, form: enhanceFormEl }) => { await submit(); }";
+    try collectArrowFunctionParamsAndRegions(std.testing.allocator, expr, &params, &regions);
+
+    try std.testing.expect(params.contains("submit"));
+    try std.testing.expect(params.contains("enhanceFormEl"));
+    // Should have one region for the parameter list
+    try std.testing.expect(regions.items.len >= 1);
+}
+
+test "extractIdentifiersFromExpr excludes async arrow destructured params" {
+    const allocator = std.testing.allocator;
+    var refs: std.StringHashMapUnmanaged(u32) = .empty;
+    defer refs.deinit(allocator);
+
+    const expr = "{...formApi.enhance(async ({ submit, form: enhanceFormEl }) => { await submit(); enhanceFormEl.reset(); })}";
+    try extractIdentifiersFromExpr(allocator, expr, 0, &refs);
+
+    // formApi should be extracted (it's the actual identifier reference)
+    try std.testing.expect(refs.contains("formApi"));
+    // submit and enhanceFormEl should NOT be extracted (they're arrow params)
+    try std.testing.expect(!refs.contains("submit"));
+    try std.testing.expect(!refs.contains("enhanceFormEl"));
+    // form should NOT be extracted (it's a property key, not a binding)
+    try std.testing.expect(!refs.contains("form"));
 }

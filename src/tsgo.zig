@@ -744,6 +744,13 @@ fn parseTsgoOutput(
 
         // Determine if this is a Svelte file (for Svelte-specific filtering)
         const is_svelte_file = std.mem.endsWith(u8, original_path, ".svelte");
+
+        // Skip diagnostics from non-.svelte files (raw .ts/.js files).
+        // svelte-check only reports errors from .svelte files, not from the .ts files
+        // they may import. The .ts files are included in the tsconfig only for type
+        // resolution, not for error reporting.
+        if (!is_svelte_file) continue;
+
         const is_test_file = isTestFile(original_path);
         // Check if this is a TypeScript Svelte file (has lang="ts" in script tag)
         const is_typescript_svelte = if (cached) |cf| cf.vf.is_typescript else false;

@@ -23,6 +23,8 @@ pub const NodeKind = enum(u8) {
     expression, // {expr}
     if_block,
     else_block,
+    then_block, // {:then value}
+    catch_block, // {:catch error}
     each_block,
     await_block,
     key_block,
@@ -517,17 +519,81 @@ pub const Parser = struct {
             self.current.kind != .slash_gt and
             self.current.kind != .eof)
         {
+            // Handle spread attributes and expressions: {...expr}
+            // These are NOT regular attributes - skip over them entirely
+            if (self.current.kind == .lbrace) {
+                const expr_start = self.current.start;
+                const expr_end = findMatchingBrace(self.source, expr_start);
+                // Reset lexer position to after the expression
+                self.lexer.pos = expr_end;
+                self.advance();
+                continue;
+            }
+
             if (self.current.kind == .identifier) {
                 const attr_start = self.current.start;
                 var attr_name_end = self.current.end;
                 self.advance();
 
-                // Handle Svelte directives (class:, on:, bind:, use:, etc.)
+                // Handle Svelte directives (class:, on:, bind:, use:, style:, etc.)
                 // These have the form name:modifier or name:modifier|options
-                if (self.current.kind == .colon and self.peek().kind == .identifier) {
-                    self.advance(); // consume :
-                    attr_name_end = self.current.end;
-                    self.advance(); // consume modifier name
+                // Special cases where the lexer can't parse the modifier:
+                // - style:--custom-property for CSS custom properties
+                // - class:!classname for Tailwind's important modifier
+                if (self.current.kind == .colon) {
+                    const first_ident = self.source[attr_start..attr_name_end];
+                    if (self.peek().kind == .identifier) {
+                        self.advance(); // consume :
+                        attr_name_end = self.current.end;
+                        self.advance(); // consume modifier name
+                    } else if (std.mem.eql(u8, first_ident, "style")) {
+                        // style: directive - check for CSS custom property (--name)
+                        // The lexer can't parse -- as part of an identifier, so we scan manually.
+                        // After the colon, check if the source has -- indicating a CSS custom property.
+                        const colon_pos = self.current.start;
+                        // Look past the colon for --
+                        if (colon_pos + 2 < self.source.len and
+                            self.source[colon_pos + 1] == '-' and
+                            self.source[colon_pos + 2] == '-')
+                        {
+                            var css_prop_end: usize = colon_pos + 3;
+                            // CSS custom properties: -- followed by alphanumeric, -, _
+                            while (css_prop_end < self.source.len) {
+                                const c = self.source[css_prop_end];
+                                if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') {
+                                    css_prop_end += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            attr_name_end = @intCast(css_prop_end);
+                            self.lexer.pos = @intCast(css_prop_end);
+                            self.advance();
+                        } else {
+                            self.advance(); // just consume the colon
+                        }
+                    } else if (std.mem.eql(u8, first_ident, "class")) {
+                        // class: directive - check for Tailwind's ! important modifier (!classname)
+                        // The lexer can't parse ! as part of an identifier, so we scan manually.
+                        const colon_pos = self.current.start;
+                        if (colon_pos + 1 < self.source.len and self.source[colon_pos + 1] == '!') {
+                            var class_end: usize = colon_pos + 2;
+                            // Tailwind class names: alphanumeric, -, _
+                            while (class_end < self.source.len) {
+                                const c = self.source[class_end];
+                                if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') {
+                                    class_end += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            attr_name_end = @intCast(class_end);
+                            self.lexer.pos = @intCast(class_end);
+                            self.advance();
+                        } else {
+                            self.advance(); // just consume the colon
+                        }
+                    }
                 }
 
                 const attr_name = self.source[attr_start..attr_name_end];
@@ -800,6 +866,10 @@ pub const Parser = struct {
             const name = self.current.slice(self.source);
             break :blk if (std.mem.eql(u8, name, "else"))
                 .else_block
+            else if (std.mem.eql(u8, name, "then"))
+                .then_block
+            else if (std.mem.eql(u8, name, "catch"))
+                .catch_block
             else
                 .expression;
         } else .expression;

@@ -121,6 +121,7 @@ pub const Lexer = struct {
             '/' => self.lexSlash(start),
             '"' => self.lexString('"', start),
             '\'' => self.lexString('\'', start),
+            '`' => self.lexTemplateString(start),
             else => if (isIdentStart(c)) self.lexIdentifier(start) else self.lexText(start),
         };
     }
@@ -252,6 +253,63 @@ pub const Lexer = struct {
         };
     }
 
+    /// Lex a template literal (backtick string) including ${...} expressions.
+    /// This properly handles nested braces, strings, and embedded expressions.
+    fn lexTemplateString(self: *Lexer, start: u32) Token {
+        self.advance(); // consume opening backtick
+        while (self.pos < self.source.len) {
+            const c = self.current();
+            if (c == '`') {
+                self.advance();
+                break;
+            }
+            if (c == '\\' and self.pos + 1 < self.source.len) {
+                self.advance(); // skip escape
+                self.advance();
+                continue;
+            }
+            // Handle template expression ${...}
+            if (c == '$' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '{') {
+                self.advance(); // skip $
+                self.advance(); // skip {
+                var depth: u32 = 1;
+                while (self.pos < self.source.len and depth > 0) {
+                    const ec = self.current();
+                    if (ec == '{') {
+                        depth += 1;
+                    } else if (ec == '}') {
+                        depth -= 1;
+                    } else if (ec == '"' or ec == '\'') {
+                        // Skip nested string inside expression
+                        const quote = ec;
+                        self.advance();
+                        while (self.pos < self.source.len) {
+                            const sc = self.current();
+                            if (sc == quote) {
+                                self.advance();
+                                break;
+                            }
+                            if (sc == '\\' and self.pos + 1 < self.source.len) {
+                                self.advance();
+                            }
+                            self.advance();
+                        }
+                        continue;
+                    } else if (ec == '`') {
+                        // Skip nested template literal (recursively)
+                        _ = self.lexTemplateString(self.pos);
+                        continue;
+                    }
+                    if (depth > 0) self.advance();
+                }
+                continue;
+            }
+            self.advance();
+        }
+        // Return as text token (the parser doesn't need to differentiate template strings)
+        return .{ .kind = .text, .start = start, .end = self.pos };
+    }
+
     fn lexIdentifier(self: *Lexer, start: u32) Token {
         while (self.pos < self.source.len and isIdentChar(self.current())) {
             self.advance();
@@ -275,7 +333,9 @@ pub const Lexer = struct {
     fn lexText(self: *Lexer, start: u32) Token {
         while (self.pos < self.source.len) {
             const c = self.current();
-            if (c == '<' or c == '{' or c == '}') break;
+            // Stop at HTML delimiters and string/template start characters
+            // so they can be processed as their own tokens
+            if (c == '<' or c == '{' or c == '}' or c == '`' or c == '"' or c == '\'') break;
             self.advance();
         }
         return .{ .kind = .text, .start = start, .end = self.pos };
@@ -356,4 +416,31 @@ test "lex script block" {
     const t2 = lexer.next();
     try std.testing.expectEqual(TokenKind.script_content, t2.kind);
     try std.testing.expectEqualStrings("const x = 1;", t2.slice(source));
+}
+
+test "lex template with backtick expression" {
+    const source =
+        \\<script lang="ts">
+        \\let x = "test";
+        \\</script>
+        \\
+        \\<div>
+        \\    {`"${x}"`}
+        \\</div>
+    ;
+    var lexer = Lexer.init(source, "test.svelte");
+
+    // Just verify we can lex without crashing and find the closing div
+    var found_div_close = false;
+    while (true) {
+        const tok = lexer.next();
+        if (tok.kind == .eof) break;
+        if (tok.kind == .lt_slash) {
+            const next = lexer.next();
+            if (next.kind == .identifier and std.mem.eql(u8, next.slice(source), "div")) {
+                found_div_close = true;
+            }
+        }
+    }
+    try std.testing.expect(found_div_close);
 }
