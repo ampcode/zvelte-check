@@ -228,9 +228,17 @@ pub const Lexer = struct {
                 self.advance();
                 break;
             }
-            // Stop at < to avoid swallowing HTML tags (handles apostrophes in text like "ad's")
+            // Stop at < only if it looks like an HTML tag start (< followed by letter or /)
+            // This avoids breaking on comparison operators like "i < arr.length"
             if (c == '<') {
-                break;
+                if (self.pos + 1 < self.source.len) {
+                    const next_char = self.source[self.pos + 1];
+                    if (isIdentStart(next_char) or next_char == '/') {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
             if (c == '\\' and self.pos + 1 < self.source.len) {
                 self.advance(); // skip escape

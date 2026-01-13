@@ -160,6 +160,131 @@ fn isVoidElement(tag_name: []const u8) bool {
     return false;
 }
 
+/// Find the matching closing brace for an opening brace at `start`.
+/// Properly handles nested braces, strings (single, double, backtick), and comments.
+/// Returns the position AFTER the closing brace.
+fn findMatchingBrace(source: []const u8, start: u32) u32 {
+    var i: usize = start;
+    var depth: u32 = 0;
+
+    while (i < source.len) {
+        const c = source[i];
+
+        // Skip string literals
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipJsString(source, i);
+            continue;
+        }
+
+        // Skip line comments
+        if (c == '/' and i + 1 < source.len and source[i + 1] == '/') {
+            i += 2;
+            while (i < source.len and source[i] != '\n') : (i += 1) {}
+            continue;
+        }
+
+        // Skip block comments
+        if (c == '/' and i + 1 < source.len and source[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < source.len) {
+                if (source[i] == '*' and source[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Track brace depth
+        if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                return @intCast(i + 1); // Return position after the closing brace
+            }
+        }
+
+        i += 1;
+    }
+
+    // If no matching brace found, return end of source
+    return @intCast(source.len);
+}
+
+/// Skip a JavaScript string literal (single, double, or backtick quoted).
+/// Handles escape sequences and template literal expressions.
+/// Returns the position after the closing quote.
+fn skipJsString(source: []const u8, start: usize) usize {
+    if (start >= source.len) return start;
+    const quote = source[start];
+    var i = start + 1;
+
+    while (i < source.len) {
+        const c = source[i];
+
+        if (c == quote) {
+            return i + 1; // Past the closing quote
+        }
+
+        if (c == '\\' and i + 1 < source.len) {
+            i += 2; // Skip escape sequence
+            continue;
+        }
+
+        // For template literals, handle ${...} expressions
+        if (quote == '`' and c == '$' and i + 1 < source.len and source[i + 1] == '{') {
+            // Find the matching } for this template expression
+            var expr_depth: u32 = 0;
+            i += 1; // Skip $
+            while (i < source.len) {
+                const ec = source[i];
+
+                // Skip line comments inside expressions
+                if (ec == '/' and i + 1 < source.len and source[i + 1] == '/') {
+                    i += 2;
+                    while (i < source.len and source[i] != '\n') : (i += 1) {}
+                    continue;
+                }
+
+                // Skip block comments inside expressions
+                if (ec == '/' and i + 1 < source.len and source[i + 1] == '*') {
+                    i += 2;
+                    while (i + 1 < source.len) {
+                        if (source[i] == '*' and source[i + 1] == '/') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+
+                if (ec == '{') expr_depth += 1;
+                if (ec == '}') {
+                    expr_depth -= 1;
+                    if (expr_depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+                // Skip nested strings inside template expressions
+                if (ec == '"' or ec == '\'' or ec == '`') {
+                    i = skipJsString(source, i);
+                    continue;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    return i; // Unterminated string - return end of source
+}
+
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     lexer: Lexer,
@@ -418,22 +543,18 @@ pub const Parser = struct {
                         }
                         self.advance();
                     } else if (self.current.kind == .lbrace) {
-                        // Expression value {expr} - store as expression marker
+                        // Expression value {expr} - count braces manually in source
+                        // because the lexer can't properly handle JavaScript inside templates
+                        // (e.g., apostrophes in comments get misinterpreted as strings)
                         const expr_start = self.current.start;
-                        var expr_end: u32 = self.current.end;
-                        var depth: u32 = 0;
-                        while (self.current.kind != .eof) {
-                            if (self.current.kind == .lbrace) depth += 1;
-                            if (self.current.kind == .rbrace) {
-                                depth -= 1;
-                                if (depth == 0) {
-                                    expr_end = self.current.end; // Include the closing brace
-                                    self.advance();
-                                    break;
-                                }
-                            }
-                            self.advance();
-                        }
+                        const expr_end = findMatchingBrace(self.source, expr_start);
+
+                        // Reset lexer position to after the expression
+                        // We can't use token-by-token advancement because the lexer
+                        // may misparse JavaScript (e.g., apostrophes in comments)
+                        self.lexer.pos = expr_end;
+                        self.advance(); // Get next token after the expression
+
                         attr_value = self.source[expr_start..expr_end];
                     }
                 }
@@ -2291,6 +2412,49 @@ test "deeply nested dotted component names" {
     const allocator = arena.allocator();
 
     const source = "<Select.Root><Select.Trigger>Click</Select.Trigger></Select.Root>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    try std.testing.expectEqual(@as(usize, 0), ast.parse_errors.items.len);
+}
+
+test "complex template literal in attribute doesn't cause false unclosed tag" {
+    // Regression test: multiline template strings with JS comments in attribute expressions
+    // The lexer can't properly parse JavaScript (e.g., apostrophes in comments like "doesn't"),
+    // but the parser's findMatchingBrace + lexer position reset should handle this correctly.
+    const source =
+        \\<div
+        \\    style={`max-height: ${x + 2}px; ${`
+        \\        ${(() => {
+        \\            if (position.rightAligned) {
+        \\                // position.right is a CSS right offset (distance from viewport right edge)
+        \\                // We need to check if there's enough space to the left of the anchor for the menu
+        \\                const leftSpaceFromAnchor = viewportWidth - (position.right || 0)
+        \\                if (leftSpaceFromAnchor >= menuWidth + 10) {
+        \\                    // Enough space to the left of anchor for the menu
+        \\                    return `left: auto; right: ${position.right}px; width: ${menuWidth}px;`
+        \\                } else {
+        \\                    // Not enough space, switch to left alignment
+        \\                    const leftPos = Math.max(10, viewportWidth - menuWidth - 10)
+        \\                    return `left: ${leftPos}px; width: ${menuWidth}px;`
+        \\                }
+        \\            } else {
+        \\                // Left-aligned: ensure it doesn't go off right edge
+        \\                const maxLeft = Math.max(10, viewportWidth - menuWidth - 10)
+        \\                const leftPos = Math.min(position.left || 0, maxLeft)
+        \\                return `left: ${leftPos}px; width: ${menuWidth}px;`
+        \\            }
+        \\        })()}
+        \\    `}`}
+        \\>
+        \\    Content
+        \\</div>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     var parser = Parser.init(allocator, source, "test.svelte");
     const ast = try parser.parse();
 
