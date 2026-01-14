@@ -399,8 +399,9 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         try output.appendSlice(allocator, "\n");
     }
 
-    // For TypeScript files, generate component type interfaces
-    // For JavaScript files, skip these to avoid "X can only be used in TypeScript files" errors
+    // Generate component type interfaces
+    // For TypeScript files: generate $$Props, $$Slots, $$Exports, $$Bindings interfaces
+    // For JavaScript files: skip type interfaces but still emit default export
     if (is_typescript) {
         // Generate $$Props interface
         try output.appendSlice(allocator, "// Component typing\n");
@@ -520,6 +521,17 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             \\declare const __SvelteComponent__: __SvelteComponentType__<$$Props, $$Exports, $$Bindings>;
             \\type __SvelteComponent__ = typeof __SvelteComponent__;
             \\export default __SvelteComponent__;
+            \\
+        );
+    } else {
+        // JavaScript mode: emit a default export that's compatible with Svelte's Component type.
+        // This ensures JS Svelte files are valid modules that can be imported and used
+        // in contexts expecting Component (e.g., Record<string, Component>).
+        // We use a function shape since Component<Props, Exports, Bindings> is a function type.
+        try output.appendSlice(allocator,
+            \\// Component export (JavaScript mode)
+            \\// Use a function with bind/call/apply properties to match the Component interface
+            \\export default function __SvelteComponent__(internal, props) { return {}; };
             \\
         );
     }
