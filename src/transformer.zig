@@ -282,7 +282,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         const raw_content = ast.source[script.content_start..script.content_end];
         const filtered = try filterSvelteImports(allocator, raw_content);
         const reactive_transformed = try transformReactiveStatements(allocator, filtered);
-        const content = try transformStoreSubscriptions(allocator, reactive_transformed);
+        const state_transformed = try transformStateWithTypeAnnotation(allocator, reactive_transformed);
+        const content = try transformStoreSubscriptions(allocator, state_transformed);
 
         try mappings.append(allocator, .{
             .svelte_offset = script.content_start,
@@ -311,7 +312,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         const raw_content = ast.source[script.content_start..script.content_end];
         const filtered = try filterSvelteImports(allocator, raw_content);
         const reactive_transformed = try transformReactiveStatements(allocator, filtered);
-        const store_transformed = try transformStoreSubscriptions(allocator, reactive_transformed);
+        const state_transformed = try transformStateWithTypeAnnotation(allocator, reactive_transformed);
+        const store_transformed = try transformStoreSubscriptions(allocator, state_transformed);
         // For generic components, strip 'export' keyword since it's invalid inside a function.
         // The exports are already tracked in $$Exports interface.
         const content = if (instance_generics != null)
@@ -5495,6 +5497,168 @@ fn collectStoreNames(allocator: std.mem.Allocator, content: []const u8) ![]const
     while (iter.next()) |key| {
         try result.append(allocator, key.*);
     }
+    return try result.toOwnedSlice(allocator);
+}
+
+/// Transforms $state with explicit type annotations to preserve the full type.
+/// TypeScript's control flow analysis narrows `let x: T = $state(v)` to the type of `v`,
+/// which causes false positives like "This comparison appears to be unintentional".
+///
+/// Transforms: `let activeTab: 'cli' | 'vscode' = $state('cli')`
+/// Into:       `let activeTab = $state<'cli' | 'vscode'>('cli')`
+///
+/// The explicit generic parameter ensures TypeScript uses the full union type.
+fn transformStateWithTypeAnnotation(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
+    // Early exit: skip if no $state
+    if (std.mem.indexOf(u8, content, "$state") == null) return content;
+
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+    try result.ensureTotalCapacity(allocator, content.len);
+
+    var i: usize = 0;
+    while (i < content.len) {
+        // Skip strings
+        if (content[i] == '"' or content[i] == '\'' or content[i] == '`') {
+            const start = i;
+            i = skipStringForReactive(content, i);
+            try result.appendSlice(allocator, content[start..i]);
+            continue;
+        }
+
+        // Skip single-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
+            const start = i;
+            while (i < content.len and content[i] != '\n') : (i += 1) {}
+            try result.appendSlice(allocator, content[start..i]);
+            continue;
+        }
+
+        // Skip multi-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '*') {
+            const start = i;
+            i += 2;
+            while (i + 1 < content.len) {
+                if (content[i] == '*' and content[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            try result.appendSlice(allocator, content[start..i]);
+            continue;
+        }
+
+        // Look for 'let' or 'const' keywords
+        if (startsWithKeyword(content[i..], "let") or startsWithKeyword(content[i..], "const")) {
+            const keyword_len: usize = if (startsWithKeyword(content[i..], "const")) 5 else 3;
+            const decl_start = i;
+            i += keyword_len;
+
+            // Skip whitespace after keyword
+            while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
+
+            // Parse identifier
+            const name_start = i;
+            while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+            const name_end = i;
+
+            if (name_end == name_start) {
+                // No identifier found, emit what we have and continue
+                try result.appendSlice(allocator, content[decl_start..i]);
+                continue;
+            }
+
+            // Skip whitespace
+            while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
+
+            // Check for type annotation ':'
+            if (i < content.len and content[i] == ':') {
+                i += 1;
+                // Skip whitespace after colon
+                while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
+
+                // Parse type annotation (stop at '=' that's not inside generics/parens)
+                const type_start = i;
+                var angle_depth: u32 = 0;
+                var paren_depth: u32 = 0;
+                var brace_depth: u32 = 0;
+                while (i < content.len) {
+                    const c = content[i];
+                    if (c == '<') {
+                        angle_depth += 1;
+                    } else if (c == '>' and angle_depth > 0) {
+                        angle_depth -= 1;
+                    } else if (c == '(') {
+                        paren_depth += 1;
+                    } else if (c == ')' and paren_depth > 0) {
+                        paren_depth -= 1;
+                    } else if (c == '{') {
+                        brace_depth += 1;
+                    } else if (c == '}' and brace_depth > 0) {
+                        brace_depth -= 1;
+                    } else if (c == '=' and angle_depth == 0 and paren_depth == 0 and brace_depth == 0) {
+                        break;
+                    } else if (c == ';' or c == '\n') {
+                        // End of statement without '='
+                        break;
+                    }
+                    i += 1;
+                }
+
+                const type_end = i;
+                const type_annotation = std.mem.trim(u8, content[type_start..type_end], " \t");
+
+                // Skip whitespace before '='
+                while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
+
+                // Check for '='
+                if (i < content.len and content[i] == '=') {
+                    i += 1;
+                    // Skip whitespace after '='
+                    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
+
+                    // Check for $state (not $state. like $state.raw)
+                    if (i + 6 < content.len and std.mem.eql(u8, content[i .. i + 6], "$state") and
+                        (i + 6 >= content.len or content[i + 6] == '(' or content[i + 6] == '<'))
+                    {
+                        i += 6;
+
+                        // Check if $state already has a generic parameter
+                        const has_generic = i < content.len and content[i] == '<';
+
+                        if (!has_generic and type_annotation.len > 0) {
+                            // Transform: emit "let name = $state<Type>" instead of "let name: Type = $state"
+                            // Emit "let " (keyword + space)
+                            try result.appendSlice(allocator, content[decl_start..name_start]);
+                            // Emit "name = $state<Type>"
+                            try result.appendSlice(allocator, content[name_start..name_end]);
+                            try result.appendSlice(allocator, " = $state<");
+                            try result.appendSlice(allocator, type_annotation);
+                            try result.appendSlice(allocator, ">");
+
+                            // Continue from after "$state" (don't re-emit it)
+                            continue;
+                        }
+                    }
+                    // Not $state or already has generic, emit unchanged
+                    try result.appendSlice(allocator, content[decl_start..i]);
+                    continue;
+                }
+                // No '=', emit unchanged
+                try result.appendSlice(allocator, content[decl_start..i]);
+                continue;
+            }
+            // No type annotation, emit unchanged
+            try result.appendSlice(allocator, content[decl_start..i]);
+            continue;
+        }
+
+        // Regular character, copy it
+        try result.append(allocator, content[i]);
+        i += 1;
+    }
+
     return try result.toOwnedSlice(allocator);
 }
 
