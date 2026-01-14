@@ -517,9 +517,13 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         // Generate default export using Component interface (Svelte 5 style)
         // This makes ComponentProps<typeof Component> work correctly.
         // The Component interface has the signature: Component<Props, Exports, Bindings>
+        // We export both a value (the component function) and a type with the same name
+        // (the instance type). When users write `let ref: MyComponent`, TypeScript uses
+        // the type alias (ReturnType), which includes the exports, allowing bind:this
+        // refs to access exported methods like focusNext().
         try output.appendSlice(allocator,
             \\declare const __SvelteComponent__: __SvelteComponentType__<$$Props, $$Exports, $$Bindings>;
-            \\type __SvelteComponent__ = typeof __SvelteComponent__;
+            \\type __SvelteComponent__ = ReturnType<typeof __SvelteComponent__>;
             \\export default __SvelteComponent__;
             \\
         );

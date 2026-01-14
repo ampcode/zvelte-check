@@ -1040,14 +1040,10 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Property X does not exist on type 'Component<...>'" errors.
-        // When using bind:this on Svelte components (e.g., `let ref = $state<MyComponent | null>(null)`),
-        // the component type from our .svelte.d.ts shim is `Component<Props, Exports, Bindings>` which
-        // is a function type representing the component constructor, not the instance with methods.
-        // svelte-check uses language-tools that understand component instance types.
-        if (std.mem.indexOf(u8, message, "does not exist on type 'Component<") != null) {
-            return true;
-        }
+        // Note: We previously filtered "Property X does not exist on type 'Component<...>'" errors
+        // because our type __SvelteComponent__ = typeof __SvelteComponent__ gave the function type.
+        // Now we use ReturnType<typeof __SvelteComponent__> which gives the instance type with exports,
+        // so bind:this refs can access exported methods. Filter removed.
     }
 
     // Errors to skip for both .svelte and .ts files
