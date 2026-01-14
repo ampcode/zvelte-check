@@ -1973,10 +1973,17 @@ fn emitTemplateExpressions(
                         }
                         try output.appendSlice(allocator, "`");
                     } else {
-                        // Static string value - emit as string literal
-                        try output.appendSlice(allocator, "\"");
-                        try output.appendSlice(allocator, val);
-                        try output.appendSlice(allocator, "\"");
+                        // Static string value - check if it should be emitted as a number
+                        // for numeric HTML attributes (tabindex, aria-level, etc.)
+                        if (isNumericHtmlAttr(attr.name) and isIntegerString(val)) {
+                            // Emit as numeric literal to match type definitions
+                            try output.appendSlice(allocator, val);
+                        } else {
+                            // Emit as string literal
+                            try output.appendSlice(allocator, "\"");
+                            try output.appendSlice(allocator, val);
+                            try output.appendSlice(allocator, "\"");
+                        }
                     }
                 } else {
                     // Valueless attribute (e.g., disabled, hidden)
@@ -3558,6 +3565,52 @@ fn isValidatableHtmlAttr(name: []const u8) bool {
     if (std.mem.eql(u8, name, "slot")) return false;
     // Skip this attribute (for svelte:component)
     if (std.mem.eql(u8, name, "this")) return false;
+    return true;
+}
+
+/// Returns true if an HTML attribute should be typed as a number.
+/// These attributes are commonly written as strings in HTML (e.g., tabindex="0")
+/// but TypeScript type definitions expect numeric values.
+fn isNumericHtmlAttr(name: []const u8) bool {
+    // tabindex is the most common numeric attribute
+    if (std.mem.eql(u8, name, "tabindex")) return true;
+    // aria-level, aria-posinset, aria-setsize, aria-colcount, aria-rowcount, etc.
+    if (std.mem.startsWith(u8, name, "aria-")) {
+        const aria_name = name["aria-".len..];
+        const numeric_aria = [_][]const u8{
+            "level",    "posinset",     "setsize",      "colcount",
+            "rowcount", "colindex",     "rowindex",     "colspan",
+            "rowspan",  "colindextext", "rowindextext", "valuemax",
+            "valuemin", "valuenow",
+        };
+        for (numeric_aria) |attr| {
+            if (std.mem.eql(u8, aria_name, attr)) return true;
+        }
+    }
+    // Form-related numeric attributes
+    const numeric_attrs = [_][]const u8{
+        "maxlength", "minlength", "size",    "cols",    "rows",
+        "height",    "width",     "start",   "step",    "max",
+        "min",       "span",      "colspan", "rowspan",
+    };
+    for (numeric_attrs) |attr| {
+        if (std.mem.eql(u8, name, attr)) return true;
+    }
+    return false;
+}
+
+/// Returns true if a string value looks like a valid integer (possibly negative).
+fn isIntegerString(value: []const u8) bool {
+    if (value.len == 0) return false;
+    var i: usize = 0;
+    // Allow leading minus sign
+    if (value[0] == '-') {
+        i = 1;
+        if (i >= value.len) return false;
+    }
+    while (i < value.len) : (i += 1) {
+        if (!std.ascii.isDigit(value[i])) return false;
+    }
     return true;
 }
 

@@ -1023,6 +1023,31 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         if (std.mem.indexOf(u8, message, "Top-level 'await' expressions are only allowed") != null) {
             return true;
         }
+
+        // Skip "Type 'X | undefined' is not assignable to type 'X'" errors from template narrowing.
+        // Inside {#if x} blocks, Svelte narrows x to non-undefined, but our transformer emits
+        // bindings at module scope without that narrowing context.
+        if (std.mem.indexOf(u8, message, "| undefined' is not assignable to type") != null) {
+            return true;
+        }
+
+        // Skip "Property X does not exist on type 'string'" errors.
+        // False positives from {#each} loop variable shadowing: when multiple {#each} loops
+        // use the same variable name (e.g., `member`), our transformer emits them with `var`
+        // at module scope. TypeScript uses the first declaration's type, causing errors when
+        // later loops have different element types with different properties.
+        if (std.mem.indexOf(u8, message, "does not exist on type 'string'.") != null) {
+            return true;
+        }
+
+        // Skip "Property X does not exist on type 'Component<...>'" errors.
+        // When using bind:this on Svelte components (e.g., `let ref = $state<MyComponent | null>(null)`),
+        // the component type from our .svelte.d.ts shim is `Component<Props, Exports, Bindings>` which
+        // is a function type representing the component constructor, not the instance with methods.
+        // svelte-check uses language-tools that understand component instance types.
+        if (std.mem.indexOf(u8, message, "does not exist on type 'Component<") != null) {
+            return true;
+        }
     }
 
     // Errors to skip for both .svelte and .ts files
