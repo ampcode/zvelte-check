@@ -4424,18 +4424,99 @@ fn emitAnyTypedParams(
     params: []const u8,
     is_typescript: bool,
 ) !void {
-    const count = countParams(params);
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        if (i > 0) try output.appendSlice(allocator, ", ");
+    // Parse parameters and emit with proper optionality.
+    // We need to preserve whether each param is optional (has ? or = default)
+    // so TypeScript correctly validates argument counts at call sites.
+    var param_list: std.ArrayList(ParamInfo) = .empty;
+    defer param_list.deinit(allocator);
+    try parseParams(params, &param_list, allocator);
+
+    for (param_list.items, 0..) |param, idx| {
+        if (idx > 0) try output.appendSlice(allocator, ", ");
         try output.appendSlice(allocator, "_");
-        // Emit parameter index as string
         var buf: [16]u8 = undefined;
-        const idx_str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+        const idx_str = std.fmt.bufPrint(&buf, "{d}", .{idx}) catch unreachable;
         try output.appendSlice(allocator, idx_str);
         if (is_typescript) {
-            try output.appendSlice(allocator, ": any");
+            if (param.is_optional) {
+                try output.appendSlice(allocator, "?: any");
+            } else {
+                try output.appendSlice(allocator, ": any");
+            }
         }
+    }
+}
+
+const ParamInfo = struct {
+    is_optional: bool,
+};
+
+/// Parses function parameters and extracts their optionality.
+/// Handles: `name`, `name: Type`, `name?: Type`, `name = default`, `name: Type = default`,
+/// `{ destructure }: Type`, and trailing commas.
+fn parseParams(params: []const u8, list: *std.ArrayList(ParamInfo), allocator: std.mem.Allocator) !void {
+    if (params.len == 0) return;
+
+    var i: usize = 0;
+    while (i < params.len) {
+        // Skip leading whitespace
+        while (i < params.len and std.ascii.isWhitespace(params[i])) : (i += 1) {}
+        if (i >= params.len) break;
+
+        // Check for trailing comma (no more params after this)
+        if (params[i] == ',') {
+            i += 1;
+            continue;
+        }
+
+        // Start of a parameter - find where it ends (next comma at depth 0)
+        const param_start = i;
+        var depth: u32 = 0;
+        var has_question: bool = false;
+        var has_equals: bool = false;
+
+        while (i < params.len) {
+            const c = params[i];
+
+            // Track nesting depth
+            if (c == '{' or c == '[' or c == '(' or c == '<') depth += 1;
+            if ((c == '}' or c == ']' or c == ')' or c == '>') and depth > 0) depth -= 1;
+
+            // Skip strings
+            if (c == '"' or c == '\'' or c == '`') {
+                i = skipString(params, i);
+                continue;
+            }
+
+            // Track optionality markers at depth 0
+            if (depth == 0) {
+                // `?` before `:` means optional (like `name?: Type`)
+                // We check for `?` followed by `:` to distinguish from `? :` ternary
+                if (c == '?' and i + 1 < params.len and params[i + 1] == ':') {
+                    has_question = true;
+                }
+                // `=` means has default value (like `name = value` or `name: Type = value`)
+                // Exclude `=>` which is arrow function syntax in types
+                if (c == '=' and (i + 1 >= params.len or params[i + 1] != '>')) {
+                    has_equals = true;
+                }
+                // Comma ends the parameter
+                if (c == ',') break;
+            }
+
+            i += 1;
+        }
+
+        // Only add if we actually found content (not just whitespace before comma)
+        const param_content = std.mem.trim(u8, params[param_start..i], " \t\n\r");
+        if (param_content.len > 0) {
+            try list.append(allocator, .{
+                .is_optional = has_question or has_equals,
+            });
+        }
+
+        // Skip the comma
+        if (i < params.len and params[i] == ',') i += 1;
     }
 }
 
@@ -6641,8 +6722,8 @@ test "debug Svelte5EdgeCases optional param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Snippets are hoisted as function declarations with generic parameter names
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function optionalParam(_0: any): void {}") != null);
+    // Snippets are hoisted with optional params preserved (note `?:` for optional)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function optionalParam(_0?: any): void {}") != null);
 }
 
 test "snippet with object destructuring param" {
@@ -6670,6 +6751,61 @@ test "snippet with object destructuring param" {
 
     // Snippets with destructuring params count the parameter (not individual fields)
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function child(_0: any): void {}") != null);
+}
+
+test "snippet param optionality - default values and trailing commas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Test cases from amp/server:
+    // - Trailing comma shouldn't create extra param
+    // - `name: Type = default` should be optional
+    // - `name = default` should be optional
+    // - Mix of required and optional params
+    const source =
+        \\<script lang="ts">
+        \\    type Item = { id: string };
+        \\</script>
+        \\
+        \\{#snippet trailingComma(
+        \\    label: string,
+        \\    isSelected: boolean,
+        \\    onclick: () => void,
+        \\)}
+        \\    <button>{label}</button>
+        \\{/snippet}
+        \\
+        \\{#snippet withDefault(props: Record<string, unknown> = {})}
+        \\    <span>default</span>
+        \\{/snippet}
+        \\
+        \\{#snippet mixedParams(title: string, count: number, expanded?: boolean, onToggle?: () => void)}
+        \\    <div>{title}: {count}</div>
+        \\{/snippet}
+        \\
+        \\{#snippet simpleDefault(user: Item, isTrigger = false)}
+        \\    <span>{user.id}</span>
+        \\{/snippet}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Trailing comma: 3 required params, not 4
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function trailingComma(_0: any, _1: any, _2: any): void {}") != null);
+
+    // Default value: 1 optional param
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function withDefault(_0?: any): void {}") != null);
+
+    // Mixed: 2 required, 2 optional
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function mixedParams(_0: any, _1: any, _2?: any, _3?: any): void {}") != null);
+
+    // Simple default: 1 required, 1 optional
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function simpleDefault(_0: any, _1?: any): void {}") != null);
 }
 
 test "const tag with template literal" {
