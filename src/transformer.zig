@@ -1626,13 +1626,38 @@ fn emitTemplateExpressions(
             },
 
             .await_block => {
-                // {#await promise} - extract identifiers and track the promise expression
-                // for use in subsequent {:then} blocks
+                // {#await promise} or {#await promise then value} - extract identifiers
+                // and track the promise expression for subsequent {:then} blocks
                 const expr = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
                 // Store the await expression for {:then}/{:catch} type inference
                 if (extractAwaitExpression(ast.source, node.start, node.end)) |await_info| {
                     current_await_expr = await_info.expr;
+
+                    // Handle inline {#await promise then value} syntax
+                    // This is different from {:then value} which gets its own .then_block node
+                    if (extractInlineThenBinding(ast.source, node.start, node.end)) |binding_pattern| {
+                        if (!has_expressions) {
+                            try output.appendSlice(allocator, "// Template expressions\n");
+                            has_expressions = true;
+                        }
+                        const is_destructuring = binding_pattern.len > 0 and (binding_pattern[0] == '{' or binding_pattern[0] == '[');
+                        if (is_destructuring) {
+                            // Emit: var { x, y } = await (promiseExpr);
+                            try output.appendSlice(allocator, "var ");
+                            try output.appendSlice(allocator, binding_pattern);
+                            try output.appendSlice(allocator, " = await (");
+                            try output.appendSlice(allocator, await_info.expr);
+                            try output.appendSlice(allocator, ");\n");
+                        } else {
+                            // Emit: let value = await (promiseExpr);
+                            try output.appendSlice(allocator, "let ");
+                            try output.appendSlice(allocator, binding_pattern);
+                            try output.appendSlice(allocator, " = await (");
+                            try output.appendSlice(allocator, await_info.expr);
+                            try output.appendSlice(allocator, ");\n");
+                        }
+                    }
                 } else {
                     current_await_expr = null;
                 }
@@ -3053,6 +3078,13 @@ fn isObjectLiteralKeyContext(expr: []const u8, ident_start: usize) bool {
         // Found ? - could be ternary or optional, check context
         if (c == '?') return false;
 
+        // Check if we're in a single-line comment: scan this line for //
+        // If the current position is after a // on the same line, skip to before //
+        if (skipLineCommentBackward(expr, i)) |new_i| {
+            i = new_i;
+            continue;
+        }
+
         // Found identifier char - there's something before us, not a fresh key position
         if (std.ascii.isAlphanumeric(c) or c == '_' or c == '$') return false;
 
@@ -3083,6 +3115,54 @@ fn isObjectLiteralKeyContext(expr: []const u8, ident_start: usize) bool {
     }
 
     return false;
+}
+
+/// Checks if position `i` is inside a single-line comment on the same line.
+/// If so, returns the position just before the // to continue scanning.
+/// Returns null if not in a comment.
+fn skipLineCommentBackward(expr: []const u8, i: usize) ?usize {
+    // Find the start of this line (previous newline or start of string)
+    var line_start: usize = 0;
+    var j = i;
+    while (j > 0) {
+        j -= 1;
+        if (expr[j] == '\n') {
+            line_start = j + 1;
+            break;
+        }
+    }
+
+    // Scan forward from line start looking for // that's not in a string
+    var k = line_start;
+    while (k + 1 < expr.len and k < i) {
+        const c = expr[k];
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            k += 1;
+            while (k < expr.len and k <= i) {
+                if (expr[k] == '\\' and k + 1 < expr.len) {
+                    k += 2;
+                    continue;
+                }
+                if (expr[k] == c) {
+                    k += 1;
+                    break;
+                }
+                k += 1;
+            }
+            continue;
+        }
+        // Check for //
+        if (c == '/' and expr[k + 1] == '/') {
+            // i is after //, so we're in a comment
+            if (i > k) {
+                // Return position before the //, or 0 if at start
+                return if (k > 0) k - 1 else 0;
+            }
+        }
+        k += 1;
+    }
+    return null;
 }
 
 /// Finds the position after the matching closing brace, starting from the position
@@ -4809,6 +4889,76 @@ fn findThenKeyword(expr: []const u8) ?usize {
         i += 1;
     }
     return null;
+}
+
+/// Extracts the binding pattern from an inline {#await promise then binding} expression.
+/// Returns the binding pattern (e.g., "result" or "{ x, y }") or null if not found.
+fn extractInlineThenBinding(source: []const u8, start: u32, end: u32) ?[]const u8 {
+    const content = source[start..end];
+    // Format: {#await expr then binding}
+    const prefix = "{#await ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const after_await = content[idx + prefix.len ..];
+
+    // Find " then " keyword
+    const then_pos = findThenKeyword(after_await) orelse return null;
+    // then_pos points to the space before "then", so skip " then"
+    const after_then = after_await[then_pos + 5 ..]; // Skip " then"
+
+    // Skip whitespace after "then"
+    var bind_start: usize = 0;
+    while (bind_start < after_then.len and std.ascii.isWhitespace(after_then[bind_start])) : (bind_start += 1) {}
+    if (bind_start >= after_then.len) return null;
+
+    // Check for immediate closing brace (no binding)
+    if (after_then[bind_start] == '}') return null;
+
+    // Find the end of the binding pattern (up to closing brace)
+    var bind_end = bind_start;
+
+    if (after_then[bind_start] == '{') {
+        // Object destructuring: find matching }
+        var brace_depth: u32 = 0;
+        while (bind_end < after_then.len) {
+            const c = after_then[bind_end];
+            if (c == '{') brace_depth += 1;
+            if (c == '}') {
+                if (brace_depth == 0) break; // End of block (not part of destructuring)
+                brace_depth -= 1;
+                if (brace_depth == 0) {
+                    bind_end += 1; // Include the closing }
+                    break;
+                }
+            }
+            bind_end += 1;
+        }
+    } else if (after_then[bind_start] == '[') {
+        // Array destructuring: find matching ]
+        var bracket_depth: u32 = 0;
+        while (bind_end < after_then.len) {
+            const c = after_then[bind_end];
+            if (c == '[') bracket_depth += 1;
+            if (c == ']') {
+                bracket_depth -= 1;
+                if (bracket_depth == 0) {
+                    bind_end += 1; // Include the closing ]
+                    break;
+                }
+            }
+            if (c == '}') break; // End of block
+            bind_end += 1;
+        }
+    } else {
+        // Simple identifier
+        while (bind_end < after_then.len) {
+            const c = after_then[bind_end];
+            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '$') break;
+            bind_end += 1;
+        }
+    }
+
+    if (bind_end == bind_start) return null;
+    return std.mem.trim(u8, after_then[bind_start..bind_end], " \t\n\r");
 }
 
 /// Extracts the key expression from {#key expr}
