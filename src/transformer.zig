@@ -1955,7 +1955,7 @@ fn emitTemplateExpressions(
 
     // Fallback: scan template source directly for {#each} patterns not captured by AST
     // The parser sometimes misses {#each} blocks inside component elements
-    try scanTemplateForEachBlocks(allocator, ast, output, mappings, &template_refs, &has_expressions, is_typescript);
+    try scanTemplateForEachBlocks(allocator, ast, output, mappings, &template_refs, &has_expressions, is_typescript, snippet_body_ranges);
 
     // Emit void statements for template-referenced identifiers
     // This marks them as "used" for noUnusedLocals checking
@@ -3103,6 +3103,7 @@ fn scanTemplateForEachBlocks(
     template_refs: *std.StringHashMapUnmanaged(u32),
     has_expressions: *bool,
     is_typescript: bool,
+    snippet_body_ranges: []const SnippetBodyRange,
 ) !void {
     // Find template portion (after scripts, before styles)
     var template_start: usize = 0;
@@ -3213,19 +3214,25 @@ fn scanTemplateForEachBlocks(
 
         // Special handling for {#each} - emit binding declarations
         if (std.mem.startsWith(u8, full_expr, "{#each ")) {
-            // Compute absolute offset for source mapping (template_start + expr_start)
-            const abs_start: u32 = @intCast(template_start + expr_start);
+            const abs_start = svelte_offset;
             const abs_end: u32 = @intCast(template_start + j);
             if (extractEachBindings(ast.source, abs_start, abs_end)) |binding| {
                 if (!has_expressions.*) {
                     try output.appendSlice(allocator, "// Template expressions\n");
                     has_expressions.* = true;
                 }
-                try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
+                // If inside snippet body, emit a simplified declaration without referencing
+                // the iterable (which may be a snippet parameter not in scope at module level)
+                if (isInsideSnippetBody(abs_start, snippet_body_ranges)) {
+                    try emitEachBindingDeclarationsSimplified(allocator, output, binding, is_typescript);
+                } else {
+                    try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
+                }
             }
         }
 
         // Special handling for {@const} - emit variable declaration
+        // For snippet bodies, emit with `any` type to avoid referencing snippet params
         if (std.mem.startsWith(u8, full_expr, "{@const ")) {
             if (extractConstBinding(template, @intCast(expr_start), @intCast(j))) |binding| {
                 if (!has_expressions.*) {
@@ -3233,10 +3240,25 @@ fn scanTemplateForEachBlocks(
                     has_expressions.* = true;
                 }
                 try output.appendSlice(allocator, "var ");
-                try output.appendSlice(allocator, binding.name);
-                try output.appendSlice(allocator, " = ");
-                try output.appendSlice(allocator, binding.expr);
-                try output.appendSlice(allocator, ";\n");
+                if (isInsideSnippetBody(svelte_offset, snippet_body_ranges)) {
+                    // Use any type to avoid referencing snippet params.
+                    // Strip any existing type annotation from the name (e.g., "x: number" -> "x")
+                    const name_without_type = if (std.mem.indexOf(u8, binding.name, ":")) |colon_pos|
+                        std.mem.trim(u8, binding.name[0..colon_pos], " \t\n\r")
+                    else
+                        binding.name;
+                    try output.appendSlice(allocator, name_without_type);
+                    if (is_typescript) {
+                        try output.appendSlice(allocator, ": any;\n");
+                    } else {
+                        try output.appendSlice(allocator, ";\n");
+                    }
+                } else {
+                    try output.appendSlice(allocator, binding.name);
+                    try output.appendSlice(allocator, " = ");
+                    try output.appendSlice(allocator, binding.expr);
+                    try output.appendSlice(allocator, ";\n");
+                }
             }
         }
 
@@ -3536,6 +3558,41 @@ fn emitEachBindingDeclarations(
         });
         try output.appendSlice(allocator, key);
         try output.appendSlice(allocator, ");\n");
+    }
+}
+
+/// Emits simplified binding declarations for {#each} blocks inside snippet bodies.
+/// Uses `any` type instead of referencing the iterable, since the iterable may be
+/// a snippet parameter not in scope at module level.
+fn emitEachBindingDeclarationsSimplified(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    binding: EachBindingInfo,
+    is_typescript: bool,
+) !void {
+    // Check if item_binding is a destructuring pattern ({ a, b } or [a, b])
+    const is_destructuring = binding.item_binding.len > 0 and
+        (binding.item_binding[0] == '{' or binding.item_binding[0] == '[');
+
+    // Emit item binding with any type to avoid referencing snippet parameters
+    // For destructuring patterns, use `= undefined as any` to satisfy TypeScript
+    try output.appendSlice(allocator, "var ");
+    try output.appendSlice(allocator, binding.item_binding);
+    if (is_typescript) {
+        if (is_destructuring) {
+            try output.appendSlice(allocator, " = undefined as any;\n");
+        } else {
+            try output.appendSlice(allocator, ": any;\n");
+        }
+    } else {
+        try output.appendSlice(allocator, ";\n");
+    }
+
+    // Emit index binding if present
+    if (binding.index_binding) |idx| {
+        try output.appendSlice(allocator, "var ");
+        try output.appendSlice(allocator, idx);
+        try output.appendSlice(allocator, " = 0;\n");
     }
 }
 
