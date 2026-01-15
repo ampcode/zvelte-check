@@ -1625,20 +1625,142 @@ fn emitTemplateExpressions(
                 }
             },
 
-            .expression, .if_block, .key_block, .html, .const_tag, .debug_tag => {
-                // Extract identifiers from template expressions
-                const expr = ast.source[node.start..node.end];
-                try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
+            .expression => {
+                // Extract identifiers AND emit full expression for property access checking.
+                // For {searchUsers.pending}, we emit both:
+                // - void searchUsers; (for noUnusedLocals)
+                // - void (searchUsers.pending); (for property access type-checking)
+                const raw = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
+
+                if (extractPlainExpression(ast.source, node.start, node.end)) |expr_info| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    try output.appendSlice(allocator, "void (");
+                    try mappings.append(allocator, .{
+                        .svelte_offset = node.start + expr_info.offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(expr_info.expr.len),
+                    });
+                    try output.appendSlice(allocator, expr_info.expr);
+                    try output.appendSlice(allocator, ");\n");
+                }
+            },
+
+            .if_block => {
+                // Extract identifiers AND emit full condition for property access checking.
+                const raw = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
+
+                if (extractIfExpression(ast.source, node.start, node.end)) |expr_info| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    try output.appendSlice(allocator, "void (");
+                    try mappings.append(allocator, .{
+                        .svelte_offset = node.start + expr_info.offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(expr_info.expr.len),
+                    });
+                    try output.appendSlice(allocator, expr_info.expr);
+                    try output.appendSlice(allocator, ");\n");
+                }
+            },
+
+            .key_block => {
+                // Extract identifiers AND emit full key expression.
+                const raw = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
+
+                if (extractKeyExpression(ast.source, node.start, node.end)) |expr_info| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    try output.appendSlice(allocator, "void (");
+                    try mappings.append(allocator, .{
+                        .svelte_offset = node.start + expr_info.offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(expr_info.expr.len),
+                    });
+                    try output.appendSlice(allocator, expr_info.expr);
+                    try output.appendSlice(allocator, ");\n");
+                }
+            },
+
+            .html => {
+                // Extract identifiers AND emit full expression.
+                const raw = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
+
+                if (extractHtmlExpression(ast.source, node.start, node.end)) |expr_info| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    try output.appendSlice(allocator, "void (");
+                    try mappings.append(allocator, .{
+                        .svelte_offset = node.start + expr_info.offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(expr_info.expr.len),
+                    });
+                    try output.appendSlice(allocator, expr_info.expr);
+                    try output.appendSlice(allocator, ");\n");
+                }
+            },
+
+            .const_tag => {
+                // {@const} is a declaration, just extract identifiers for now
+                const raw = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
+            },
+
+            .debug_tag => {
+                // Extract identifiers AND emit debug expressions.
+                const raw = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
+
+                if (extractDebugExpression(ast.source, node.start, node.end)) |expr_info| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    try output.appendSlice(allocator, "void (");
+                    try mappings.append(allocator, .{
+                        .svelte_offset = node.start + expr_info.offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(expr_info.expr.len),
+                    });
+                    try output.appendSlice(allocator, expr_info.expr);
+                    try output.appendSlice(allocator, ");\n");
+                }
             },
 
             .await_block => {
                 // {#await promise} or {#await promise then value} - extract identifiers
                 // and track the promise expression for subsequent {:then} blocks
-                const expr = ast.source[node.start..node.end];
-                try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
+                const raw = ast.source[node.start..node.end];
+                try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
                 // Store the await expression for {:then}/{:catch} type inference
                 if (extractAwaitExpression(ast.source, node.start, node.end)) |await_info| {
                     current_await_expr = await_info.expr;
+
+                    // Emit the await expression for property access checking
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, "// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    try output.appendSlice(allocator, "void (");
+                    try mappings.append(allocator, .{
+                        .svelte_offset = node.start + await_info.offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(await_info.expr.len),
+                    });
+                    try output.appendSlice(allocator, await_info.expr);
+                    try output.appendSlice(allocator, ");\n");
 
                     // Handle inline {#await promise then value} syntax
                     // This is different from {:then value} which gets its own .then_block node
@@ -4354,25 +4476,55 @@ fn findSnippetBodyRanges(
             }
             const body_start: u32 = @intCast(j + 1); // After the closing }
 
-            // Find {/snippet}
+            // Find matching {/snippet}, handling nested snippets.
+            // Count snippet nesting to find the correct closing tag.
+            const open_tag = "{#snippet";
             const close_tag = "{/snippet}";
-            if (std.mem.indexOf(u8, source[j..], close_tag)) |close_offset| {
-                const body_end: u32 = @intCast(j + close_offset);
-
-                // Extract snippet info from the opening tag
-                if (extractSnippetName(source, @intCast(snippet_start), body_start)) |info| {
-                    try ranges.append(allocator, .{
-                        .name = info.name,
-                        .params = info.params,
-                        .generics = info.generics,
-                        .body_start = body_start,
-                        .body_end = body_end,
-                    });
+            var snippet_depth: u32 = 1;
+            var k = j + 1;
+            while (k < source.len and snippet_depth > 0) {
+                // Skip strings
+                if (source[k] == '"' or source[k] == '\'' or source[k] == '`') {
+                    k = skipStringLiteral(source, k);
+                    continue;
                 }
+                // Check for nested {#snippet
+                if (k + open_tag.len <= source.len and std.mem.eql(u8, source[k .. k + open_tag.len], open_tag)) {
+                    snippet_depth += 1;
+                    k += open_tag.len;
+                    continue;
+                }
+                // Check for {/snippet}
+                if (k + close_tag.len <= source.len and std.mem.eql(u8, source[k .. k + close_tag.len], close_tag)) {
+                    snippet_depth -= 1;
+                    if (snippet_depth == 0) {
+                        const body_end: u32 = @intCast(k);
 
-                i = j + close_offset + close_tag.len;
-                continue;
+                        // Extract snippet info from the opening tag
+                        if (extractSnippetName(source, @intCast(snippet_start), body_start)) |info| {
+                            try ranges.append(allocator, .{
+                                .name = info.name,
+                                .params = info.params,
+                                .generics = info.generics,
+                                .body_start = body_start,
+                                .body_end = body_end,
+                            });
+                        }
+
+                        i = k + close_tag.len;
+                        break;
+                    }
+                    k += close_tag.len;
+                    continue;
+                }
+                k += 1;
             }
+
+            // If we didn't find a matching close tag, advance past the opening
+            if (snippet_depth > 0) {
+                i = j + 1;
+            }
+            continue;
         }
 
         // Skip strings to avoid false matches
@@ -4423,6 +4575,54 @@ fn emitSnippetBodyExpressions(
                     try body_exprs.append(allocator, .{
                         .expr = render_info.expr,
                         .offset = node.start + render_info.offset,
+                    });
+                }
+            },
+            .expression => {
+                if (extractPlainExpression(ast.source, node.start, node.end)) |expr_info| {
+                    try body_exprs.append(allocator, .{
+                        .expr = expr_info.expr,
+                        .offset = node.start + expr_info.offset,
+                    });
+                }
+            },
+            .if_block => {
+                if (extractIfExpression(ast.source, node.start, node.end)) |expr_info| {
+                    try body_exprs.append(allocator, .{
+                        .expr = expr_info.expr,
+                        .offset = node.start + expr_info.offset,
+                    });
+                }
+            },
+            .key_block => {
+                if (extractKeyExpression(ast.source, node.start, node.end)) |expr_info| {
+                    try body_exprs.append(allocator, .{
+                        .expr = expr_info.expr,
+                        .offset = node.start + expr_info.offset,
+                    });
+                }
+            },
+            .html => {
+                if (extractHtmlExpression(ast.source, node.start, node.end)) |expr_info| {
+                    try body_exprs.append(allocator, .{
+                        .expr = expr_info.expr,
+                        .offset = node.start + expr_info.offset,
+                    });
+                }
+            },
+            .debug_tag => {
+                if (extractDebugExpression(ast.source, node.start, node.end)) |expr_info| {
+                    try body_exprs.append(allocator, .{
+                        .expr = expr_info.expr,
+                        .offset = node.start + expr_info.offset,
+                    });
+                }
+            },
+            .await_block => {
+                if (extractAwaitExpression(ast.source, node.start, node.end)) |expr_info| {
+                    try body_exprs.append(allocator, .{
+                        .expr = expr_info.expr,
+                        .offset = node.start + expr_info.offset,
                     });
                 }
             },
@@ -5125,6 +5325,55 @@ fn extractRenderExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
     const expr_start = idx + prefix.len;
 
     // Find closing brace, respecting template literals and nested braces
+    const expr_end = findExpressionEnd(content, expr_start);
+    const expr = std.mem.trim(u8, content[expr_start..expr_end], " \t\n\r");
+    if (expr.len == 0) return null;
+    return .{ .expr = expr, .offset = @intCast(expr_start) };
+}
+
+/// Extracts expression from plain {expr} template syntax.
+/// Returns the expression content without braces.
+/// Skips block markers like {/if}, {/each}, {:else}, {@const}, {@debug}, etc.
+fn extractPlainExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
+    const content = source[start..end];
+    // Format: {expr}
+    if (content.len < 2 or content[0] != '{') return null;
+
+    // Skip block end markers ({/if}, {/each}, etc.) and block continuation ({:else}, {:then}, etc.)
+    // These are parsed as expression nodes but aren't expressions to type-check
+    if (content.len >= 2 and (content[1] == '/' or content[1] == ':' or content[1] == '#' or content[1] == '@')) {
+        return null;
+    }
+
+    const expr_start: usize = 1;
+    const expr_end = findExpressionEnd(content, expr_start);
+    const expr = std.mem.trim(u8, content[expr_start..expr_end], " \t\n\r");
+    if (expr.len == 0) return null;
+    return .{ .expr = expr, .offset = 1 };
+}
+
+/// Extracts expression from {@html expr} template syntax.
+fn extractHtmlExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
+    const content = source[start..end];
+    // Format: {@html expr}
+    const prefix = "{@html ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const expr_start = idx + prefix.len;
+
+    const expr_end = findExpressionEnd(content, expr_start);
+    const expr = std.mem.trim(u8, content[expr_start..expr_end], " \t\n\r");
+    if (expr.len == 0) return null;
+    return .{ .expr = expr, .offset = @intCast(expr_start) };
+}
+
+/// Extracts expression from {@debug expr1, expr2, ...} template syntax.
+fn extractDebugExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
+    const content = source[start..end];
+    // Format: {@debug expr1, expr2, ...}
+    const prefix = "{@debug ";
+    const idx = std.mem.indexOf(u8, content, prefix) orelse return null;
+    const expr_start = idx + prefix.len;
+
     const expr_end = findExpressionEnd(content, expr_start);
     const expr = std.mem.trim(u8, content[expr_start..expr_end], " \t\n\r");
     if (expr.len == 0) return null;
