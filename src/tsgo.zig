@@ -916,18 +916,14 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         }
 
         // Skip "Object is possibly 'null'" and "is possibly 'undefined'" errors for Svelte files.
-        // These are often false positives because our transformer doesn't fully support
-        // template narrowing for all contexts. Specifically:
-        // - {#if variable} narrows `variable` to truthy in the body
-        // - {:else if variable} also narrows
-        // - {#each iterable as item} should be narrowed by enclosing {#if}
+        // These are still false positives from:
+        // 1. Snippet bodies - emitSnippetBodyExpressions doesn't apply if_branch narrowing
+        // 2. Some fallback template expressions
         //
-        // We've implemented narrowing for simple expressions, but {#each} iterables and
-        // some complex patterns still produce false positives. svelte-check handles this
-        // by generating code that preserves narrowing context (control flow analysis).
+        // The {#each} and {@const} narrowing in transformer.zig is working correctly,
+        // but snippet body expressions need additional work.
         //
-        // TODO: Implement proper narrowing for {#each} blocks and remove this filter.
-        // See task tracking {#each} narrowing improvements.
+        // TODO: Implement narrowing for snippet body expressions (see emitSnippetBodyExpressions).
         if (std.mem.indexOf(u8, message, "is possibly 'null'") != null or
             std.mem.indexOf(u8, message, "is possibly 'undefined'") != null)
         {

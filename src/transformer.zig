@@ -1889,15 +1889,13 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
 
                 // Parse and emit each block bindings (item, index variables)
-                // Note: We don't emit a separate narrowed expression for the iterable because
-                // emitEachBindingDeclarations already handles the source mapping for error reporting.
-                // Emitting twice would cause duplicate errors.
+                // Use narrowed emission so {#each} inside {#if} respects type narrowing
                 if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
                     if (!has_expressions) {
                         try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
-                    try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
+                    try emitNarrowedEachBindingDeclarations(allocator, output, mappings, binding, is_typescript, if_branches);
                 }
             },
 
@@ -2157,7 +2155,7 @@ fn emitTemplateExpressions(
 
     // Fallback: scan template source directly for {#each} patterns not captured by AST
     // The parser sometimes misses {#each} blocks inside component elements
-    try scanTemplateForEachBlocks(allocator, ast, output, mappings, &template_refs, &has_expressions, is_typescript, snippet_body_ranges);
+    try scanTemplateForEachBlocks(allocator, ast, output, mappings, &template_refs, &has_expressions, is_typescript, snippet_body_ranges, if_branches);
 
     // Emit void statements for template-referenced identifiers
     // This marks them as "used" for noUnusedLocals checking
@@ -3361,6 +3359,7 @@ fn scanTemplateForEachBlocks(
     has_expressions: *bool,
     is_typescript: bool,
     snippet_body_ranges: []const SnippetBodyRange,
+    if_branches: []const IfBranch,
 ) !void {
     // Find template portion (after scripts, before styles)
     var template_start: usize = 0;
@@ -3469,7 +3468,7 @@ fn scanTemplateForEachBlocks(
         const svelte_offset: u32 = @intCast(template_start + expr_start);
         try extractIdentifiersFromExpr(allocator, full_expr, svelte_offset, template_refs);
 
-        // Special handling for {#each} - emit binding declarations
+        // Special handling for {#each} - emit binding declarations with narrowing
         if (std.mem.startsWith(u8, full_expr, "{#each ")) {
             const abs_start = svelte_offset;
             const abs_end: u32 = @intCast(template_start + j);
@@ -3483,12 +3482,13 @@ fn scanTemplateForEachBlocks(
                 if (isInsideSnippetBody(abs_start, snippet_body_ranges)) {
                     try emitEachBindingDeclarationsSimplified(allocator, output, binding, is_typescript);
                 } else {
-                    try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
+                    // Use narrowed emission so {#each} inside {#if} respects type narrowing
+                    try emitNarrowedEachBindingDeclarations(allocator, output, mappings, binding, is_typescript, if_branches);
                 }
             }
         }
 
-        // Special handling for {@const} - emit variable declaration
+        // Special handling for {@const} - emit variable declaration with narrowing
         // For snippet bodies, emit with `any` type to avoid referencing snippet params
         if (std.mem.startsWith(u8, full_expr, "{@const ")) {
             if (extractConstBinding(template, @intCast(expr_start), @intCast(j))) |binding| {
@@ -3496,7 +3496,6 @@ fn scanTemplateForEachBlocks(
                     try output.appendSlice(allocator, ";// Template expressions\n");
                     has_expressions.* = true;
                 }
-                try output.appendSlice(allocator, "var ");
                 if (isInsideSnippetBody(svelte_offset, snippet_body_ranges)) {
                     // Use any type to avoid referencing snippet params.
                     // Strip any existing type annotation from the name (e.g., "x: number" -> "x")
@@ -3504,6 +3503,7 @@ fn scanTemplateForEachBlocks(
                         std.mem.trim(u8, binding.name[0..colon_pos], " \t\n\r")
                     else
                         binding.name;
+                    try output.appendSlice(allocator, "var ");
                     try output.appendSlice(allocator, name_without_type);
                     if (is_typescript) {
                         try output.appendSlice(allocator, ": any;\n");
@@ -3511,10 +3511,8 @@ fn scanTemplateForEachBlocks(
                         try output.appendSlice(allocator, ";\n");
                     }
                 } else {
-                    try output.appendSlice(allocator, binding.name);
-                    try output.appendSlice(allocator, " = ");
-                    try output.appendSlice(allocator, binding.expr);
-                    try output.appendSlice(allocator, ";\n");
+                    // Emit with narrowing so {@const} inside {#if} respects type narrowing
+                    try emitNarrowedConstBinding(allocator, output, binding, svelte_offset, if_branches);
                 }
             }
         }
@@ -4831,6 +4829,83 @@ fn emitNarrowedExpression(
         try output.appendSlice(allocator, " }");
     }
     try output.appendSlice(allocator, "\n");
+}
+
+/// Emits {#each} binding declarations wrapped in the appropriate if conditions for type narrowing.
+/// This ensures that {#each data.items as item} inside {#if data} has narrowing applied.
+fn emitNarrowedEachBindingDeclarations(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    mappings: *std.ArrayList(SourceMap.Mapping),
+    binding: EachBindingInfo,
+    is_typescript: bool,
+    if_branches: []const IfBranch,
+) !void {
+    // Find all enclosing if branches for this {#each} block
+    var enclosing = try findAllEnclosingIfBranches(allocator, binding.offset, if_branches);
+    defer enclosing.deinit(allocator);
+
+    // Count how many if conditions we need to open
+    var conditions_opened: u32 = 0;
+
+    // Emit if wrappers for each enclosing branch that has a condition
+    for (enclosing.items) |branch| {
+        if (branch.condition) |cond| {
+            try output.appendSlice(allocator, "if (");
+            try output.appendSlice(allocator, cond);
+            try output.appendSlice(allocator, ") {\n");
+            conditions_opened += 1;
+        }
+    }
+
+    // Emit the binding declarations (using the existing function)
+    try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
+
+    // Close all opened if blocks
+    var j: u32 = 0;
+    while (j < conditions_opened) : (j += 1) {
+        try output.appendSlice(allocator, "}\n");
+    }
+}
+
+/// Emits {@const} binding declarations wrapped in the appropriate if conditions for type narrowing.
+/// This ensures that {@const x = data.value} inside {#if data} has narrowing applied.
+fn emitNarrowedConstBinding(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    binding: ConstBindingInfo,
+    svelte_offset: u32,
+    if_branches: []const IfBranch,
+) !void {
+    // Find all enclosing if branches for this {@const}
+    var enclosing = try findAllEnclosingIfBranches(allocator, svelte_offset, if_branches);
+    defer enclosing.deinit(allocator);
+
+    // Count how many if conditions we need to open
+    var conditions_opened: u32 = 0;
+
+    // Emit if wrappers for each enclosing branch that has a condition
+    for (enclosing.items) |branch| {
+        if (branch.condition) |cond| {
+            try output.appendSlice(allocator, "if (");
+            try output.appendSlice(allocator, cond);
+            try output.appendSlice(allocator, ") {\n");
+            conditions_opened += 1;
+        }
+    }
+
+    // Emit the const binding
+    try output.appendSlice(allocator, "var ");
+    try output.appendSlice(allocator, binding.name);
+    try output.appendSlice(allocator, " = ");
+    try output.appendSlice(allocator, binding.expr);
+    try output.appendSlice(allocator, ";\n");
+
+    // Close all opened if blocks
+    var j: u32 = 0;
+    while (j < conditions_opened) : (j += 1) {
+        try output.appendSlice(allocator, "}\n");
+    }
 }
 
 /// Checks if a source position is inside any snippet body.
