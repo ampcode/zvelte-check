@@ -915,8 +915,19 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Object is possibly 'null'" errors for Svelte files
-        // These are often false positives from reactive patterns
+        // Skip "Object is possibly 'null'" and "is possibly 'undefined'" errors for Svelte files.
+        // These are often false positives because our transformer doesn't fully support
+        // template narrowing for all contexts. Specifically:
+        // - {#if variable} narrows `variable` to truthy in the body
+        // - {:else if variable} also narrows
+        // - {#each iterable as item} should be narrowed by enclosing {#if}
+        //
+        // We've implemented narrowing for simple expressions, but {#each} iterables and
+        // some complex patterns still produce false positives. svelte-check handles this
+        // by generating code that preserves narrowing context (control flow analysis).
+        //
+        // TODO: Implement proper narrowing for {#each} blocks and remove this filter.
+        // See task tracking {#each} narrowing improvements.
         if (std.mem.indexOf(u8, message, "is possibly 'null'") != null or
             std.mem.indexOf(u8, message, "is possibly 'undefined'") != null)
         {

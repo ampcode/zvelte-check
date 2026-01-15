@@ -1666,43 +1666,40 @@ fn emitTemplateExpressions(
 
             .if_block => {
                 // Extract identifiers AND emit full condition for property access checking.
+                // Use narrowed expression emission - if this {#if} is nested inside another
+                // {#if}/{:else if} block, the enclosing narrowing should apply.
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractIfExpression(ast.source, node.start, node.end)) |expr_info| {
-                    if (!has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
-                    }
-                    try output.appendSlice(allocator, "void (");
-                    try mappings.append(allocator, .{
-                        .svelte_offset = node.start + expr_info.offset,
-                        .ts_offset = @intCast(output.items.len),
-                        .len = @intCast(expr_info.expr.len),
-                    });
-                    try output.appendSlice(allocator, expr_info.expr);
-                    try output.appendSlice(allocator, ");\n");
+                    try emitNarrowedExpression(
+                        allocator,
+                        output,
+                        mappings,
+                        expr_info.expr,
+                        node.start + expr_info.offset,
+                        if_branches,
+                        &has_expressions,
+                    );
                 }
             },
 
             .key_block => {
                 // Extract identifiers AND emit full key expression.
+                // Use narrowed expression emission for proper type narrowing.
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractKeyExpression(ast.source, node.start, node.end)) |expr_info| {
-                    if (!has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
-                    }
-                    try output.appendSlice(allocator, "void (");
-                    try mappings.append(allocator, .{
-                        .svelte_offset = node.start + expr_info.offset,
-                        .ts_offset = @intCast(output.items.len),
-                        .len = @intCast(expr_info.expr.len),
-                    });
-                    try output.appendSlice(allocator, expr_info.expr);
-                    try output.appendSlice(allocator, ");\n");
+                    try emitNarrowedExpression(
+                        allocator,
+                        output,
+                        mappings,
+                        expr_info.expr,
+                        node.start + expr_info.offset,
+                        if_branches,
+                        &has_expressions,
+                    );
                 }
             },
 
@@ -1733,22 +1730,20 @@ fn emitTemplateExpressions(
 
             .debug_tag => {
                 // Extract identifiers AND emit debug expressions.
+                // Use narrowed expression emission for proper type narrowing.
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractDebugExpression(ast.source, node.start, node.end)) |expr_info| {
-                    if (!has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
-                    }
-                    try output.appendSlice(allocator, "void (");
-                    try mappings.append(allocator, .{
-                        .svelte_offset = node.start + expr_info.offset,
-                        .ts_offset = @intCast(output.items.len),
-                        .len = @intCast(expr_info.expr.len),
-                    });
-                    try output.appendSlice(allocator, expr_info.expr);
-                    try output.appendSlice(allocator, ");\n");
+                    try emitNarrowedExpression(
+                        allocator,
+                        output,
+                        mappings,
+                        expr_info.expr,
+                        node.start + expr_info.offset,
+                        if_branches,
+                        &has_expressions,
+                    );
                 }
             },
 
@@ -1762,18 +1757,16 @@ fn emitTemplateExpressions(
                     current_await_expr = await_info.expr;
 
                     // Emit the await expression for property access checking
-                    if (!has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
-                    }
-                    try output.appendSlice(allocator, "void (");
-                    try mappings.append(allocator, .{
-                        .svelte_offset = node.start + await_info.offset,
-                        .ts_offset = @intCast(output.items.len),
-                        .len = @intCast(await_info.expr.len),
-                    });
-                    try output.appendSlice(allocator, await_info.expr);
-                    try output.appendSlice(allocator, ");\n");
+                    // Use narrowed expression emission for proper type narrowing.
+                    try emitNarrowedExpression(
+                        allocator,
+                        output,
+                        mappings,
+                        await_info.expr,
+                        node.start + await_info.offset,
+                        if_branches,
+                        &has_expressions,
+                    );
 
                     // Handle inline {#await promise then value} syntax
                     // This is different from {:then value} which gets its own .then_block node
@@ -1896,6 +1889,9 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
 
                 // Parse and emit each block bindings (item, index variables)
+                // Note: We don't emit a separate narrowed expression for the iterable because
+                // emitEachBindingDeclarations already handles the source mapping for error reporting.
+                // Emitting twice would cause duplicate errors.
                 if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
                     if (!has_expressions) {
                         try output.appendSlice(allocator, ";// Template expressions\n");
