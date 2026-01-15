@@ -6,6 +6,7 @@
 //! - unused-export-let: Exported props not used in the template
 //! - slot_element_deprecated: <slot> elements (use {@render} in Svelte 5)
 //! - unsupported_ts_feature: TypeScript features like enums that aren't natively supported
+//! - state_referenced_locally: reactive value captured outside a closure loses reactivity
 
 const std = @import("std");
 const Ast = @import("../svelte_parser.zig").Ast;
@@ -54,6 +55,7 @@ pub fn runDiagnostics(
     try checkSlotDeprecation(allocator, ast, diagnostics);
     try checkNonHoistableDeclarations(allocator, ast, diagnostics);
     try checkUnsupportedTsFeatures(allocator, ast, diagnostics);
+    try checkStateReferencedLocally(allocator, ast, diagnostics);
 }
 
 /// Detects await usage where experimental_async is required.
@@ -1126,6 +1128,469 @@ fn computeLineCol(source: []const u8, pos: u32) struct { line: u32, col: u32 } {
     return .{ .line = line, .col = col };
 }
 
+/// Detects when a reactive variable (from $props, $state, $derived) is referenced
+/// outside a closure at the top level of the script. This "breaks the link" to
+/// reactivity because only the initial value is captured.
+///
+/// Example that triggers this warning:
+///   let { data } = $props()
+///   const threads = data.threads  // captures initial value, loses reactivity
+///
+/// Fix by referencing inside a closure or using $derived:
+///   const threads = $derived(data.threads)
+fn checkStateReferencedLocally(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    // Find instance script (not context="module")
+    var instance_script: ?ScriptData = null;
+    for (ast.scripts.items) |script| {
+        if (script.context == null) {
+            instance_script = script;
+            break;
+        } else if (!std.mem.eql(u8, script.context.?, "module")) {
+            instance_script = script;
+            break;
+        }
+    }
+
+    const script = instance_script orelse return;
+    const script_content = ast.source[script.content_start..script.content_end];
+
+    // Step 1: Find reactive variables from $props() and $state()/$derived() declarations
+    var reactive_vars: std.StringHashMapUnmanaged(void) = .empty;
+    defer reactive_vars.deinit(allocator);
+    try extractReactiveVariables(allocator, script_content, &reactive_vars);
+
+    if (reactive_vars.count() == 0) return;
+
+    // Step 2: Find top-level const/let declarations that reference these reactive vars
+    try findStateReferencedLocally(allocator, script_content, script.content_start, ast.source, ast.file_path, &reactive_vars, diagnostics);
+}
+
+/// Extracts variable names that are declared as reactive (from $props, $state, $derived).
+/// Handles both destructuring and direct assignment patterns.
+fn extractReactiveVariables(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    reactive_vars: *std.StringHashMapUnmanaged(void),
+) !void {
+    var i: usize = 0;
+    var brace_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Track nesting
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+        if (c == '(') paren_depth += 1;
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        // Skip comments
+        if (c == '/' and i + 1 < content.len) {
+            if (content[i + 1] == '/') {
+                while (i < content.len and content[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (content[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < content.len) {
+                    if (content[i] == '*' and content[i + 1] == '/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // Only look at top level (not inside functions)
+        if (brace_depth == 0 and paren_depth == 0) {
+            // Look for "let" keyword - could be `let { x } = $props()` or `let x = $state(...)`
+            if (startsWithKeyword(content[i..], "let")) {
+                const let_start = i;
+                i += 3;
+                i = skipWhitespace(content, i);
+
+                if (i >= content.len) break;
+
+                // Check for destructuring: let { ... } = $props()
+                if (content[i] == '{') {
+                    const destruct_start = i;
+                    i += 1;
+                    var destruct_depth: u32 = 1;
+                    // Find matching }
+                    while (i < content.len and destruct_depth > 0) : (i += 1) {
+                        if (content[i] == '{') destruct_depth += 1;
+                        if (content[i] == '}') destruct_depth -= 1;
+                    }
+                    const destruct_end = i;
+
+                    // Skip to = and check RHS
+                    i = skipWhitespace(content, i);
+                    // Skip optional type annotation: }: Type =
+                    if (i < content.len and content[i] == ':') {
+                        i += 1;
+                        i = skipTypeAnnotation(content, i);
+                    }
+                    i = skipWhitespace(content, i);
+
+                    if (i < content.len and content[i] == '=') {
+                        i += 1;
+                        i = skipWhitespace(content, i);
+
+                        // Check if RHS is $props()
+                        if (startsWithKeyword(content[i..], "$props")) {
+                            // Extract all identifiers from the destructuring pattern
+                            try extractDestructuredNames(allocator, content[destruct_start..destruct_end], reactive_vars);
+                        }
+                    }
+                    continue;
+                }
+
+                // Simple assignment: let x = $state(...) or let x = $derived(...)
+                if (isIdentStart(content[i])) {
+                    const name_start = i;
+                    while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+                    const name = content[name_start..i];
+
+                    i = skipWhitespace(content, i);
+                    // Skip optional type annotation
+                    if (i < content.len and content[i] == ':') {
+                        i += 1;
+                        i = skipTypeAnnotation(content, i);
+                    }
+                    i = skipWhitespace(content, i);
+
+                    if (i < content.len and content[i] == '=') {
+                        i += 1;
+                        i = skipWhitespace(content, i);
+
+                        // Check if RHS starts with $state or $derived
+                        if (startsWithKeyword(content[i..], "$state") or
+                            startsWithKeyword(content[i..], "$derived"))
+                        {
+                            try reactive_vars.put(allocator, name, {});
+                        }
+                    }
+                    continue;
+                }
+
+                // Restore position if we didn't find a valid pattern
+                _ = let_start;
+            }
+        }
+
+        i += 1;
+    }
+}
+
+/// Extract simple identifiers from a destructuring pattern like { a, b, c: d }
+fn extractDestructuredNames(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    names: *std.StringHashMapUnmanaged(void),
+) !void {
+    var i: usize = 0;
+
+    while (i < pattern.len) {
+        const c = pattern[i];
+
+        // Skip braces and whitespace
+        if (c == '{' or c == '}' or std.ascii.isWhitespace(c) or c == ',') {
+            i += 1;
+            continue;
+        }
+
+        // Parse identifier
+        if (isIdentStart(c)) {
+            const start = i;
+            while (i < pattern.len and isIdentChar(pattern[i])) : (i += 1) {}
+            const ident = pattern[start..i];
+
+            // Skip whitespace
+            while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+
+            // Check for `:` (renaming) or `=` (default value)
+            if (i < pattern.len and pattern[i] == ':') {
+                // `prop: localName` - skip and get the local name
+                i += 1;
+                while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+                if (i < pattern.len and isIdentStart(pattern[i])) {
+                    const local_start = i;
+                    while (i < pattern.len and isIdentChar(pattern[i])) : (i += 1) {}
+                    const local_name = pattern[local_start..i];
+                    try names.put(allocator, local_name, {});
+                }
+            } else {
+                // Simple identifier or with default value
+                try names.put(allocator, ident, {});
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Find top-level const/let assignments that reference reactive variables.
+fn findStateReferencedLocally(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    base_offset: u32,
+    source: []const u8,
+    file_path: []const u8,
+    reactive_vars: *std.StringHashMapUnmanaged(void),
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    var i: usize = 0;
+    var brace_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Track nesting
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+        if (c == '(') paren_depth += 1;
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        // Skip comments
+        if (c == '/' and i + 1 < content.len) {
+            if (content[i + 1] == '/') {
+                while (i < content.len and content[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (content[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < content.len) {
+                    if (content[i] == '*' and content[i + 1] == '/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // Only look at top level
+        if (brace_depth == 0 and paren_depth == 0) {
+            // Look for "const" or "let" keyword
+            const is_const = startsWithKeyword(content[i..], "const");
+            const is_let = !is_const and startsWithKeyword(content[i..], "let");
+
+            if (is_const or is_let) {
+                const kw_len: usize = if (is_const) 5 else 3;
+                const decl_start = i;
+                i += kw_len;
+                i = skipWhitespace(content, i);
+
+                if (i >= content.len) break;
+
+                // Skip the LHS (identifier or destructuring)
+                const lhs_start = i;
+                if (content[i] == '{') {
+                    // Destructuring - skip to matching }
+                    var destruct_depth: u32 = 1;
+                    i += 1;
+                    while (i < content.len and destruct_depth > 0) : (i += 1) {
+                        if (content[i] == '{') destruct_depth += 1;
+                        if (content[i] == '}') destruct_depth -= 1;
+                    }
+                } else if (isIdentStart(content[i])) {
+                    while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+                } else {
+                    continue;
+                }
+
+                const lhs_end = i;
+                i = skipWhitespace(content, i);
+
+                // Skip optional type annotation
+                if (i < content.len and content[i] == ':') {
+                    i += 1;
+                    i = skipTypeAnnotation(content, i);
+                }
+                i = skipWhitespace(content, i);
+
+                if (i >= content.len or content[i] != '=') {
+                    i = decl_start + 1;
+                    continue;
+                }
+                i += 1;
+                i = skipWhitespace(content, i);
+
+                // Skip if RHS is a reactive rune ($state, $derived, $props)
+                // These are declarations, not captures
+                if (startsWithKeyword(content[i..], "$state") or
+                    startsWithKeyword(content[i..], "$derived") or
+                    startsWithKeyword(content[i..], "$props"))
+                {
+                    // Skip to end of statement
+                    while (i < content.len and content[i] != ';' and content[i] != '\n') : (i += 1) {}
+                    continue;
+                }
+
+                // Find end of RHS (until ; or end of line)
+                const rhs_start = i;
+                var rhs_brace_depth: u32 = 0;
+                var rhs_paren_depth: u32 = 0;
+                while (i < content.len) {
+                    const rc = content[i];
+                    if (rc == '{') rhs_brace_depth += 1;
+                    if (rc == '}') {
+                        if (rhs_brace_depth > 0) {
+                            rhs_brace_depth -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (rc == '(') rhs_paren_depth += 1;
+                    if (rc == ')') {
+                        if (rhs_paren_depth > 0) {
+                            rhs_paren_depth -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (rhs_brace_depth == 0 and rhs_paren_depth == 0 and (rc == ';' or rc == '\n')) break;
+                    // Skip strings in RHS
+                    if (rc == '"' or rc == '\'' or rc == '`') {
+                        i = skipString(content, i);
+                        continue;
+                    }
+                    i += 1;
+                }
+                const rhs_end = i;
+                const rhs = content[rhs_start..rhs_end];
+
+                // Check if RHS contains a reactive variable reference
+                if (findReactiveReference(rhs, reactive_vars)) |ref_info| {
+                    const ref_pos = rhs_start + ref_info.offset;
+                    const loc = computeLineCol(source, base_offset + @as(u32, @intCast(ref_pos)));
+                    try diagnostics.append(allocator, .{
+                        .source = .svelte,
+                        .severity = .warning,
+                        .code = "state_referenced_locally",
+                        .message = try std.fmt.allocPrint(
+                            allocator,
+                            "This reference only captures the initial value of `{s}`. Did you mean to reference it inside a closure instead?\nhttps://svelte.dev/e/state_referenced_locally",
+                            .{ref_info.name},
+                        ),
+                        .file_path = file_path,
+                        .start_line = loc.line,
+                        .start_col = loc.col,
+                        .end_line = loc.line,
+                        .end_col = loc.col + @as(u32, @intCast(ref_info.name.len)),
+                    });
+                }
+
+                // Collect LHS names to avoid re-warning on same statement
+                _ = lhs_start;
+                _ = lhs_end;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+}
+
+const RefInfo = struct {
+    name: []const u8,
+    offset: usize,
+};
+
+/// Find first reference to a reactive variable in the given text.
+/// Returns the name and offset if found.
+fn findReactiveReference(text: []const u8, reactive_vars: *std.StringHashMapUnmanaged(void)) ?RefInfo {
+    var i: usize = 0;
+
+    while (i < text.len) {
+        const c = text[i];
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(text, i);
+            continue;
+        }
+
+        // Skip arrow functions and function expressions - these are closures
+        // Look for patterns like: `() =>`, `(x) =>`, `function(`
+        if (c == '=' and i + 1 < text.len and text[i + 1] == '>') {
+            // Arrow function found - everything after this is in a closure
+            return null;
+        }
+        if (startsWithKeyword(text[i..], "function")) {
+            // Function expression - everything inside is in a closure
+            return null;
+        }
+
+        // Look for identifier
+        if (isIdentStart(c)) {
+            const start = i;
+            while (i < text.len and isIdentChar(text[i])) : (i += 1) {}
+            const ident = text[start..i];
+
+            // Check if this is a reactive variable
+            if (reactive_vars.contains(ident)) {
+                return .{ .name = ident, .offset = start };
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    return null;
+}
+
+/// Skip a type annotation (handles generics, unions, intersections, etc.)
+fn skipTypeAnnotation(content: []const u8, start: usize) usize {
+    var i = start;
+    var angle_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Stop at = or ; when not inside nested constructs
+        if (angle_depth == 0 and paren_depth == 0 and bracket_depth == 0) {
+            if (c == '=' or c == ';' or c == ',' or c == ')' or c == '}') break;
+        }
+
+        if (c == '<') angle_depth += 1;
+        if (c == '>' and angle_depth > 0) angle_depth -= 1;
+        if (c == '(') paren_depth += 1;
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+        if (c == '[') bracket_depth += 1;
+        if (c == ']' and bracket_depth > 0) bracket_depth -= 1;
+
+        i += 1;
+    }
+
+    return i;
+}
+
 test "unused-export-let: simple unused prop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1886,4 +2351,191 @@ test "unsupported-ts-feature: enum in comment is valid" {
 
     // "enum" inside comments is not a declaration
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+// ============================================================================
+// state_referenced_locally tests
+// ============================================================================
+
+test "state_referenced_locally: props captured in const" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\interface Props { data: { threads: string[] } }
+        \\let { data }: Props = $props()
+        \\const threads = data.threads
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("state_referenced_locally", diagnostics.items[0].code.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "data") != null);
+}
+
+test "state_referenced_locally: $state captured in const" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let count = $state(0)
+        \\const doubled = count * 2
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("state_referenced_locally", diagnostics.items[0].code.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "count") != null);
+}
+
+test "state_referenced_locally: $derived is not captured" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let count = $state(0)
+        \\const doubled = $derived(count * 2)
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Using $derived() is the correct pattern, no warning
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "state_referenced_locally: reference in closure is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let { data } = $props()
+        \\const getThreads = () => data.threads
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Reference inside arrow function is lazily evaluated, no warning
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "state_referenced_locally: reference in function expression is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let { data } = $props()
+        \\const getThreads = function() { return data.threads }
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Reference inside function expression is lazily evaluated, no warning
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "state_referenced_locally: non-reactive const is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let { data } = $props()
+        \\const API_URL = "https://api.example.com"
+        \\const timeout = 5000
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Consts that don't reference reactive vars are fine
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "state_referenced_locally: reference inside function body is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let { data } = $props()
+        \\function handleClick() {
+        \\    const threads = data.threads
+        \\}
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Reference inside function body is evaluated when function is called, not at script init
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "state_referenced_locally: props with renamed destructuring" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let { data: pageData } = $props()
+        \\const threads = pageData.threads
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("state_referenced_locally", diagnostics.items[0].code.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "pageData") != null);
 }
