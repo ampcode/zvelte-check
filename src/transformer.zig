@@ -2431,11 +2431,40 @@ fn isSingleExpression(val: []const u8) bool {
 
     var depth: usize = 1;
     var i: usize = 1;
-    while (i < val.len and depth > 0) : (i += 1) {
+    while (i < val.len and depth > 0) {
         const c = val[i];
+
+        // Skip line comments (// ... until newline)
+        // This prevents apostrophes in comments like "Don't" from being parsed as strings
+        if (c == '/' and i + 1 < val.len and val[i + 1] == '/') {
+            i += 2;
+            while (i < val.len and val[i] != '\n') : (i += 1) {}
+            if (i < val.len) i += 1; // skip the newline
+            continue;
+        }
+
+        // Skip block comments (/* ... */)
+        if (c == '/' and i + 1 < val.len and val[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < val.len) {
+                if (val[i] == '*' and val[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
         switch (c) {
-            '{' => depth += 1,
-            '}' => depth -= 1,
+            '{' => {
+                depth += 1;
+                i += 1;
+            },
+            '}' => {
+                depth -= 1;
+                i += 1;
+            },
             '"', '\'' => {
                 // Skip string literal
                 const quote = c;
@@ -2443,15 +2472,17 @@ fn isSingleExpression(val: []const u8) bool {
                 while (i < val.len and val[i] != quote) : (i += 1) {
                     if (val[i] == '\\' and i + 1 < val.len) i += 1;
                 }
+                if (i < val.len) i += 1; // skip closing quote
             },
             '`' => {
-                // Skip template literal (simplified)
+                // Skip template literal (simplified - doesn't handle ${} expressions)
                 i += 1;
                 while (i < val.len and val[i] != '`') : (i += 1) {
                     if (val[i] == '\\' and i + 1 < val.len) i += 1;
                 }
+                if (i < val.len) i += 1; // skip closing backtick
             },
-            else => {},
+            else => i += 1,
         }
     }
 
