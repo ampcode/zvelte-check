@@ -4806,8 +4806,10 @@ fn findSnippetBodyRanges(
             var snippet_depth: u32 = 1;
             var k = j + 1;
             while (k < source.len and snippet_depth > 0) {
-                // Skip strings
-                if (source[k] == '"' or source[k] == '\'' or source[k] == '`') {
+                // Only skip template literals (backticks) to avoid false matches inside ${...}
+                // Don't skip single/double quotes because they're often just text content in HTML
+                // (e.g., "Owner's Manual" contains an apostrophe, not a string delimiter)
+                if (source[k] == '`') {
                     k = skipStringLiteral(source, k);
                     continue;
                 }
@@ -9698,4 +9700,41 @@ test "transform {:then} destructuring with type inference from await expression"
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var { items, total } = await (dataPromise);") != null);
     // Should NOT emit `var { items, total } = {} as any;`
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "= {} as any") == null);
+}
+
+test "snippet body expressions with apostrophes in text content" {
+    // Regression test: apostrophes in text content (like "Owner's Manual") were being
+    // treated as string delimiters, causing findSnippetBodyRanges to skip over {/snippet}.
+    // This resulted in snippet body expressions being emitted at module scope instead of
+    // inside the wrapper function, causing "Cannot find name" errors for snippet parameters.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\let Popover = {} as any;
+        \\</script>
+        \\<Popover.Content>
+        \\    {#snippet child({ open: isOpen })}
+        \\        {#if isOpen}
+        \\            <span>Owner's Manual</span>
+        \\        {/if}
+        \\    {/snippet}
+        \\</Popover.Content>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // Should NOT have void (isOpen); at module scope
+    // It should be inside the wrapper function
+    const bad_pattern = ";// Template expressions\nvoid (isOpen);";
+    const has_bad = std.mem.indexOf(u8, virtual.content, bad_pattern) != null;
+    try std.testing.expect(!has_bad);
+
+    // Should have the wrapper function with isOpen in scope
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "(({ open: isOpen })") != null);
 }
