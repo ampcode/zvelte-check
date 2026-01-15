@@ -59,6 +59,8 @@ const SnippetBodyRange = struct {
     name: []const u8,
     params: ?[]const u8,
     generics: ?[]const u8,
+    /// Position of the {#snippet tag (for finding enclosing if branches)
+    snippet_start: u32,
     /// Start of snippet body (after the closing } of {#snippet ...})
     body_start: u32,
     /// End of snippet body (start of {/snippet})
@@ -4535,6 +4537,7 @@ fn findSnippetBodyRanges(
                                 .name = info.name,
                                 .params = info.params,
                                 .generics = info.generics,
+                                .snippet_start = @intCast(snippet_start),
                                 .body_start = body_start,
                                 .body_end = body_end,
                             });
@@ -4556,8 +4559,9 @@ fn findSnippetBodyRanges(
             continue;
         }
 
-        // Skip strings to avoid false matches
-        if (source[i] == '"' or source[i] == '\'' or source[i] == '`') {
+        // Only skip template literals (backticks) to avoid false matches inside ${...}
+        // Don't skip single/double quotes because they're often just text content in HTML
+        if (source[i] == '`') {
             i = skipStringLiteral(source, i);
             continue;
         }
@@ -4590,8 +4594,10 @@ fn findIfBranches(
 
     var i: usize = 0;
     while (i < source.len) {
-        // Skip strings to avoid false matches inside template literals
-        if (source[i] == '"' or source[i] == '\'' or source[i] == '`') {
+        // Only skip template literals (backticks) because they can contain ${...} expressions
+        // which might have braces that look like {#if}. We DON'T skip single/double quotes
+        // because in Svelte templates, quotes in text content (like "it's") are not JS strings.
+        if (source[i] == '`') {
             i = skipStringLiteral(source, i);
             continue;
         }
@@ -5022,6 +5028,12 @@ fn emitSnippetBodyExpressions(
 
     try output.appendSlice(allocator, ") => {\n");
 
+    // Find if branches that ENCLOSE the snippet definition itself.
+    // These outer conditions must be applied to all expressions inside the snippet
+    // for proper discriminated union narrowing.
+    var outer_enclosing = try findAllEnclosingIfBranches(allocator, range.snippet_start, if_branches);
+    defer outer_enclosing.deinit(allocator);
+
     // Filter if_branches to only those entirely within this snippet's body range.
     // We only want branches where both body_start and body_end are within the snippet.
     var snippet_branches: std.ArrayList(IfBranch) = .empty;
@@ -5035,14 +5047,24 @@ fn emitSnippetBodyExpressions(
     // Emit each body expression with narrowing applied
     for (body_exprs.items) |expr_info| {
         // Find enclosing if branches for this expression (within snippet scope)
-        var enclosing = try findAllEnclosingIfBranches(allocator, expr_info.offset, snippet_branches.items);
-        defer enclosing.deinit(allocator);
+        var inner_enclosing = try findAllEnclosingIfBranches(allocator, expr_info.offset, snippet_branches.items);
+        defer inner_enclosing.deinit(allocator);
 
         // Count how many if conditions we need to open
         var conditions_opened: u32 = 0;
 
-        // Emit if wrappers for each enclosing branch that has a condition
-        for (enclosing.items) |branch| {
+        // First emit outer enclosing conditions (from if branches containing the snippet)
+        for (outer_enclosing.items) |branch| {
+            if (branch.condition) |cond| {
+                try output.appendSlice(allocator, "  if (");
+                try output.appendSlice(allocator, cond);
+                try output.appendSlice(allocator, ") { ");
+                conditions_opened += 1;
+            }
+        }
+
+        // Then emit inner enclosing conditions (from if branches within the snippet body)
+        for (inner_enclosing.items) |branch| {
             if (branch.condition) |cond| {
                 try output.appendSlice(allocator, "  if (");
                 try output.appendSlice(allocator, cond);
