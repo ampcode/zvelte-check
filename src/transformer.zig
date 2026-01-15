@@ -1613,6 +1613,7 @@ fn emitTemplateExpressions(
                                 mappings,
                                 range,
                                 is_typescript,
+                                if_branches,
                                 &has_expressions,
                             );
                             break;
@@ -4921,6 +4922,7 @@ fn isInsideSnippetBody(pos: u32, ranges: []const SnippetBodyRange) bool {
 /// Emits expressions from inside a snippet body, wrapped in a block with snippet parameters in scope.
 /// This ensures that expressions like `{@render threadItem(thread)}` inside `{#snippet children(thread: T)}`
 /// have access to the `thread` parameter.
+/// Also applies if-branch narrowing for expressions inside {#if} blocks within the snippet.
 fn emitSnippetBodyExpressions(
     allocator: std.mem.Allocator,
     ast: *const Ast,
@@ -4928,6 +4930,7 @@ fn emitSnippetBodyExpressions(
     mappings: *std.ArrayList(SourceMap.Mapping),
     range: SnippetBodyRange,
     is_typescript: bool,
+    if_branches: []const IfBranch,
     has_expressions: *bool,
 ) !void {
     // Collect render expressions and other expressions from the snippet body
@@ -5019,16 +5022,51 @@ fn emitSnippetBodyExpressions(
 
     try output.appendSlice(allocator, ") => {\n");
 
-    // Emit each body expression
+    // Filter if_branches to only those entirely within this snippet's body range.
+    // We only want branches where both body_start and body_end are within the snippet.
+    var snippet_branches: std.ArrayList(IfBranch) = .empty;
+    defer snippet_branches.deinit(allocator);
+    for (if_branches) |branch| {
+        if (branch.body_start >= range.body_start and branch.body_end <= range.body_end) {
+            try snippet_branches.append(allocator, branch);
+        }
+    }
+
+    // Emit each body expression with narrowing applied
     for (body_exprs.items) |expr_info| {
-        try output.appendSlice(allocator, "  void (");
+        // Find enclosing if branches for this expression (within snippet scope)
+        var enclosing = try findAllEnclosingIfBranches(allocator, expr_info.offset, snippet_branches.items);
+        defer enclosing.deinit(allocator);
+
+        // Count how many if conditions we need to open
+        var conditions_opened: u32 = 0;
+
+        // Emit if wrappers for each enclosing branch that has a condition
+        for (enclosing.items) |branch| {
+            if (branch.condition) |cond| {
+                try output.appendSlice(allocator, "  if (");
+                try output.appendSlice(allocator, cond);
+                try output.appendSlice(allocator, ") { ");
+                conditions_opened += 1;
+            }
+        }
+
+        // Emit the actual expression
+        try output.appendSlice(allocator, "void (");
         try mappings.append(allocator, .{
             .svelte_offset = expr_info.offset,
             .ts_offset = @intCast(output.items.len),
             .len = @intCast(expr_info.expr.len),
         });
         try output.appendSlice(allocator, expr_info.expr);
-        try output.appendSlice(allocator, ");\n");
+        try output.appendSlice(allocator, ");");
+
+        // Close all opened if blocks
+        var j: u32 = 0;
+        while (j < conditions_opened) : (j += 1) {
+            try output.appendSlice(allocator, " }");
+        }
+        try output.appendSlice(allocator, "\n");
     }
 
     try output.appendSlice(allocator, "})(");
