@@ -977,12 +977,6 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Argument of type 'X | undefined' is not assignable to parameter of type 'Y'"
-        // Same narrowing issue as above, but with undefined instead of null.
-        if (std.mem.indexOf(u8, message, "| undefined' is not assignable to parameter of type") != null) {
-            return true;
-        }
-
         // Skip complex generic type assignability errors in Svelte files
         // These often arise from our generic stubs (like $props returning $$Props)
         // not matching the specific inferred types from SvelteKit's generated types.
