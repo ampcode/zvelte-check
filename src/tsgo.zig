@@ -915,14 +915,6 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Object is possibly 'null'" errors for Svelte files
-        // These are often false positives from reactive patterns
-        if (std.mem.indexOf(u8, message, "is possibly 'null'") != null or
-            std.mem.indexOf(u8, message, "is possibly 'undefined'") != null)
-        {
-            return true;
-        }
-
         // Skip "Cannot use namespace 'X' as a type" errors
         // False positives from libraries like bits-ui
         if (std.mem.indexOf(u8, message, "Cannot use namespace") != null and
