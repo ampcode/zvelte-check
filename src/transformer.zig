@@ -1610,7 +1610,7 @@ fn emitTemplateExpressions(
 
                 if (extractRenderExpression(ast.source, node.start, node.end)) |render_info| {
                     if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
+                        try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
                     try output.appendSlice(allocator, "void (");
@@ -1635,7 +1635,7 @@ fn emitTemplateExpressions(
 
                 if (extractPlainExpression(ast.source, node.start, node.end)) |expr_info| {
                     if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
+                        try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
                     try output.appendSlice(allocator, "void (");
@@ -1656,7 +1656,7 @@ fn emitTemplateExpressions(
 
                 if (extractIfExpression(ast.source, node.start, node.end)) |expr_info| {
                     if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
+                        try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
                     try output.appendSlice(allocator, "void (");
@@ -1677,7 +1677,7 @@ fn emitTemplateExpressions(
 
                 if (extractKeyExpression(ast.source, node.start, node.end)) |expr_info| {
                     if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
+                        try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
                     try output.appendSlice(allocator, "void (");
@@ -1698,7 +1698,7 @@ fn emitTemplateExpressions(
 
                 if (extractHtmlExpression(ast.source, node.start, node.end)) |expr_info| {
                     if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
+                        try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
                     try output.appendSlice(allocator, "void (");
@@ -1725,7 +1725,7 @@ fn emitTemplateExpressions(
 
                 if (extractDebugExpression(ast.source, node.start, node.end)) |expr_info| {
                     if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
+                        try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
                     try output.appendSlice(allocator, "void (");
@@ -1750,7 +1750,7 @@ fn emitTemplateExpressions(
 
                     // Emit the await expression for property access checking
                     if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
+                        try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
                     try output.appendSlice(allocator, "void (");
@@ -1766,7 +1766,7 @@ fn emitTemplateExpressions(
                     // This is different from {:then value} which gets its own .then_block node
                     if (extractInlineThenBinding(ast.source, node.start, node.end)) |binding_pattern| {
                         if (!has_expressions) {
-                            try output.appendSlice(allocator, "// Template expressions\n");
+                            try output.appendSlice(allocator, ";// Template expressions\n");
                             has_expressions = true;
                         }
                         const is_destructuring = binding_pattern.len > 0 and (binding_pattern[0] == '{' or binding_pattern[0] == '[');
@@ -1796,7 +1796,7 @@ fn emitTemplateExpressions(
                 // Don't extract identifiers from the full expression (would extract "then" keyword)
                 if (extractThenCatchBinding(ast.source, node.start, node.end, "then")) |binding_pattern| {
                     if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
+                        try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
                     // For destructuring patterns, we need an initializer
@@ -1838,7 +1838,7 @@ fn emitTemplateExpressions(
                 // {:catch error} - emit binding for the error
                 if (extractThenCatchBinding(ast.source, node.start, node.end, "catch")) |binding_pattern| {
                     if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
+                        try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
                     // For destructuring patterns, we need an initializer
@@ -1885,7 +1885,7 @@ fn emitTemplateExpressions(
                 // Parse and emit each block bindings (item, index variables)
                 if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
                     if (!has_expressions) {
-                        try output.appendSlice(allocator, "// Template expressions\n");
+                        try output.appendSlice(allocator, ";// Template expressions\n");
                         has_expressions = true;
                     }
                     try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
@@ -2036,7 +2036,7 @@ fn emitTemplateExpressions(
             if (!has_validatable_attrs) continue;
 
             if (!has_expressions) {
-                try output.appendSlice(allocator, "// Template expressions\n");
+                try output.appendSlice(allocator, ";// Template expressions\n");
                 has_expressions = true;
             }
 
@@ -2143,7 +2143,7 @@ fn emitTemplateExpressions(
         if (isJsKeywordOrBuiltin(name) and !declared_names.contains(name)) continue;
 
         if (!has_expressions) {
-            try output.appendSlice(allocator, "// Template expressions\n");
+            try output.appendSlice(allocator, ";// Template expressions\n");
             has_expressions = true;
         }
         try output.appendSlice(allocator, "void ");
@@ -3445,7 +3445,7 @@ fn scanTemplateForEachBlocks(
             const abs_end: u32 = @intCast(template_start + j);
             if (extractEachBindings(ast.source, abs_start, abs_end)) |binding| {
                 if (!has_expressions.*) {
-                    try output.appendSlice(allocator, "// Template expressions\n");
+                    try output.appendSlice(allocator, ";// Template expressions\n");
                     has_expressions.* = true;
                 }
                 // If inside snippet body, emit a simplified declaration without referencing
@@ -3463,7 +3463,7 @@ fn scanTemplateForEachBlocks(
         if (std.mem.startsWith(u8, full_expr, "{@const ")) {
             if (extractConstBinding(template, @intCast(expr_start), @intCast(j))) |binding| {
                 if (!has_expressions.*) {
-                    try output.appendSlice(allocator, "// Template expressions\n");
+                    try output.appendSlice(allocator, ";// Template expressions\n");
                     has_expressions.* = true;
                 }
                 try output.appendSlice(allocator, "var ");
@@ -4634,7 +4634,7 @@ fn emitSnippetBodyExpressions(
     if (body_exprs.items.len == 0) return;
 
     if (!has_expressions.*) {
-        try output.appendSlice(allocator, "// Template expressions\n");
+        try output.appendSlice(allocator, ";// Template expressions\n");
         has_expressions.* = true;
     }
 
