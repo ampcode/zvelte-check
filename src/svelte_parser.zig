@@ -519,11 +519,48 @@ pub const Parser = struct {
             self.current.kind != .slash_gt and
             self.current.kind != .eof)
         {
-            // Handle spread attributes and expressions: {...expr}
-            // These are NOT regular attributes - skip over them entirely
+            // Handle expressions in attribute position: {...expr} spreads and {ident} shorthand
             if (self.current.kind == .lbrace) {
                 const expr_start = self.current.start;
                 const expr_end = findMatchingBrace(self.source, expr_start);
+                const expr_content = self.source[expr_start + 1 .. expr_end - 1];
+
+                // Check if this is a spread {...foo} or shorthand {foo}
+                // Spread has ... prefix, shorthand is just an identifier
+                const is_spread = std.mem.startsWith(u8, std.mem.trim(u8, expr_content, " \t\n\r"), "...");
+
+                if (is_spread) {
+                    // Spread attributes are NOT regular attributes - skip them
+                    self.lexer.pos = expr_end;
+                    self.advance();
+                    continue;
+                }
+
+                // Shorthand syntax: {foo} is equivalent to foo={foo}
+                // Check if the content is a simple identifier
+                const trimmed = std.mem.trim(u8, expr_content, " \t\n\r");
+                const is_simple_ident = blk: {
+                    if (trimmed.len == 0) break :blk false;
+                    // First char must be letter or underscore
+                    if (!std.ascii.isAlphabetic(trimmed[0]) and trimmed[0] != '_') break :blk false;
+                    // Rest must be alphanumeric or underscore
+                    for (trimmed[1..]) |c| {
+                        if (!std.ascii.isAlphanumeric(c) and c != '_') break :blk false;
+                    }
+                    break :blk true;
+                };
+
+                if (is_simple_ident) {
+                    // Shorthand: {foo} → attribute name=foo, value=null
+                    // The helper emitComponentPropsValidation will detect this via source inspection
+                    try ast.attributes.append(self.allocator, .{
+                        .name = trimmed,
+                        .value = null,
+                        .start = expr_start,
+                        .end = expr_end,
+                    });
+                }
+
                 // Reset lexer position to after the expression
                 self.lexer.pos = expr_end;
                 self.advance();

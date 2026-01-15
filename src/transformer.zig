@@ -21,6 +21,7 @@ const std = @import("std");
 const Ast = @import("svelte_parser.zig").Ast;
 const ScriptData = @import("svelte_parser.zig").ScriptData;
 const ElementData = @import("svelte_parser.zig").ElementData;
+const AttributeData = @import("svelte_parser.zig").AttributeData;
 const SourceMap = @import("source_map.zig").SourceMap;
 const sveltekit = @import("sveltekit.zig");
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
@@ -194,7 +195,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         // Svelte type imports
         // Import Component for Svelte 5 type compatibility (makes ComponentProps work)
         // Use a private alias to avoid conflicts with user imports of Component
-        try output.appendSlice(allocator, "import type { Component as __SvelteComponentType__ } from \"svelte\";\n");
+        // Also import ComponentProps for type-checking component props in templates
+        try output.appendSlice(allocator, "import type { Component as __SvelteComponentType__, ComponentProps as __ComponentProps__ } from \"svelte\";\n");
         // Import SvelteHTMLElements for validating HTML element props
         try output.appendSlice(allocator, "import type { SvelteHTMLElements as __SvelteElements__ } from \"svelte/elements\";\n");
         // Note: We don't auto-import Snippet - if users need it, they import it themselves.
@@ -2138,14 +2140,172 @@ fn emitTemplateExpressions(
                         }
                     }
                 } else {
-                    // Valueless attribute (e.g., disabled, hidden)
-                    try output.appendSlice(allocator, "true");
+                    // Check if this is a shorthand prop like {foo}
+                    const src = ast.source[attr.start..attr.end];
+                    if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
+                        // Shorthand: {foo} → foo: foo
+                        const expr = std.mem.trim(u8, src[1 .. src.len - 1], " \t\n\r");
+                        try output.appendSlice(allocator, expr);
+                    } else {
+                        // Valueless attribute (e.g., disabled, hidden)
+                        try output.appendSlice(allocator, "true");
+                    }
                 }
             }
 
             try output.appendSlice(allocator, " } satisfies Partial<__SvelteElements__['");
             try output.appendSlice(allocator, elem_data.tag_name);
             try output.appendSlice(allocator, "']>);");
+
+            // Close all opened if blocks
+            var k: u32 = 0;
+            while (k < conditions_opened) : (k += 1) {
+                try output.appendSlice(allocator, " }");
+            }
+            try output.appendSlice(allocator, "\n");
+        }
+    }
+
+    // Component props validation is temporarily disabled.
+    // The approach of using __ComponentProps__<typeof Component> produces false positives
+    // because it requires ALL props, including those with defaults. Svelte's actual
+    // component prop checking is more nuanced and handles optional props correctly.
+    // TODO: Implement proper component props validation that:
+    // - Distinguishes required vs optional props
+    // - Reports "unknown property" errors like svelte-check does
+    // - Handles generic components correctly
+    const enable_component_props_validation = false;
+    if (enable_component_props_validation and is_typescript) {
+        for (ast.nodes.items) |node| {
+            if (node.kind != .component) continue;
+
+            // Skip components inside snippet bodies - they're handled by emitSnippetBodyExpressions
+            if (isInsideSnippetBody(node.start, snippet_body_ranges)) continue;
+
+            const elem_data = ast.elements.items[node.data];
+            const tag_name = elem_data.tag_name;
+
+            // Skip svelte: special elements
+            if (std.mem.startsWith(u8, tag_name, "svelte:")) continue;
+
+            const attrs = ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end];
+
+            // Collect validatable component props (exclude Svelte directives)
+            var has_validatable_props = false;
+            for (attrs) |attr| {
+                if (isValidatableComponentProp(attr.name)) {
+                    has_validatable_props = true;
+                    break;
+                }
+            }
+
+            if (!has_validatable_props) continue;
+
+            if (!has_expressions) {
+                try output.appendSlice(allocator, ";// Template expressions\n");
+                has_expressions = true;
+            }
+
+            // Find enclosing if branches for this component and emit if wrappers
+            // Skip if-branches that are inside snippet bodies since their conditions
+            // reference variables that are only in scope within the snippet
+            var enclosing = try findAllEnclosingIfBranches(allocator, node.start, if_branches);
+            defer enclosing.deinit(allocator);
+
+            var conditions_opened: u32 = 0;
+            for (enclosing.items) |branch| {
+                if (branch.condition) |cond| {
+                    // Skip this if-branch if it's inside a snippet body
+                    const branch_inside_snippet = isInsideSnippetBody(branch.body_start, snippet_body_ranges);
+                    if (branch_inside_snippet) continue;
+
+                    try output.appendSlice(allocator, "if (");
+                    try output.appendSlice(allocator, cond);
+                    try output.appendSlice(allocator, ") { ");
+                    conditions_opened += 1;
+                }
+            }
+
+            // Emit: ((_: __ComponentProps__<typeof ComponentName>) => {})({ prop1: value1, ... });
+            // This validates props without actually calling the component
+            try output.appendSlice(allocator, "((_: __ComponentProps__<typeof ");
+            try output.appendSlice(allocator, tag_name);
+            try output.appendSlice(allocator, ">) => {})({ ");
+
+            var first_prop = true;
+            for (attrs) |attr| {
+                if (!isValidatableComponentProp(attr.name)) continue;
+
+                if (!first_prop) {
+                    try output.appendSlice(allocator, ", ");
+                }
+                first_prop = false;
+
+                // Check if prop name needs to be quoted
+                const needs_quote = blk: {
+                    for (attr.name) |ch| {
+                        if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '$') {
+                            break :blk true;
+                        }
+                    }
+                    break :blk false;
+                };
+
+                // Add source mapping for the prop name
+                try mappings.append(allocator, .{
+                    .svelte_offset = attr.start,
+                    .ts_offset = @intCast(output.items.len),
+                    .len = @intCast(attr.name.len + (if (needs_quote) @as(u32, 2) else 0)),
+                });
+                if (needs_quote) {
+                    try output.appendSlice(allocator, "'");
+                }
+                try output.appendSlice(allocator, attr.name);
+                if (needs_quote) {
+                    try output.appendSlice(allocator, "'");
+                }
+                try output.appendSlice(allocator, ": ");
+
+                // Emit value
+                if (attr.value) |val| {
+                    if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}' and isSingleExpression(val)) {
+                        // Pure expression value: strip { } and emit the expression
+                        const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
+                        try output.appendSlice(allocator, expr);
+                    } else if (std.mem.indexOf(u8, val, "{") != null) {
+                        // Mixed value with embedded expressions
+                        try emitMixedAttributeValue(allocator, output, mappings, val, attr.start);
+                    } else if (std.mem.indexOf(u8, val, "\n") != null) {
+                        // Multi-line static value - emit as template literal
+                        try output.appendSlice(allocator, "`");
+                        for (val) |c| {
+                            if (c == '`' or c == '$') {
+                                try output.append(allocator, '\\');
+                            }
+                            try output.append(allocator, c);
+                        }
+                        try output.appendSlice(allocator, "`");
+                    } else {
+                        // Static string value
+                        try output.appendSlice(allocator, "\"");
+                        try output.appendSlice(allocator, val);
+                        try output.appendSlice(allocator, "\"");
+                    }
+                } else {
+                    // Check if this is a shorthand prop like {foo}
+                    const src = ast.source[attr.start..attr.end];
+                    if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
+                        // Shorthand: {foo} → foo: foo
+                        const expr = std.mem.trim(u8, src[1 .. src.len - 1], " \t\n\r");
+                        try output.appendSlice(allocator, expr);
+                    } else {
+                        // Valueless prop (e.g., <Component disabled />)
+                        try output.appendSlice(allocator, "true");
+                    }
+                }
+            }
+
+            try output.appendSlice(allocator, " });");
 
             // Close all opened if blocks
             var k: u32 = 0;
@@ -2299,6 +2459,113 @@ fn isSingleExpression(val: []const u8) bool {
     if (depth != 0) return false;
     const remaining = std.mem.trim(u8, val[i..], " \t\n\r");
     return remaining.len == 0;
+}
+
+/// Emits component props validation code for a single component.
+/// Generates: ((_: __ComponentProps__<typeof TagName>) => {})({ prop1: val1, prop2: val2 });
+/// This is used both for top-level components and components inside snippets/each blocks.
+fn emitComponentPropsValidation(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    output: *std.ArrayList(u8),
+    mappings: *std.ArrayList(SourceMap.Mapping),
+    tag_name: []const u8,
+    attrs_start: u32,
+    attrs_end: u32,
+    attributes: []const AttributeData,
+) !void {
+    const attrs = attributes[attrs_start..attrs_end];
+
+    // Collect validatable component props (exclude Svelte directives)
+    var has_validatable_props = false;
+    for (attrs) |attr| {
+        if (isValidatableComponentProp(attr.name)) {
+            has_validatable_props = true;
+            break;
+        }
+    }
+
+    if (!has_validatable_props) return;
+
+    // Emit: ((_: __ComponentProps__<typeof ComponentName>) => {})({ prop1: value1, ... });
+    try output.appendSlice(allocator, "((_: __ComponentProps__<typeof ");
+    try output.appendSlice(allocator, tag_name);
+    try output.appendSlice(allocator, ">) => {})({ ");
+
+    var first_prop = true;
+    for (attrs) |attr| {
+        if (!isValidatableComponentProp(attr.name)) continue;
+
+        if (!first_prop) {
+            try output.appendSlice(allocator, ", ");
+        }
+        first_prop = false;
+
+        // Check if prop name needs to be quoted
+        const needs_quote = blk: {
+            for (attr.name) |ch| {
+                if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '$') {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+
+        // Add source mapping for the prop name
+        try mappings.append(allocator, .{
+            .svelte_offset = attr.start,
+            .ts_offset = @intCast(output.items.len),
+            .len = @intCast(attr.name.len + (if (needs_quote) @as(u32, 2) else 0)),
+        });
+        if (needs_quote) {
+            try output.appendSlice(allocator, "'");
+        }
+        try output.appendSlice(allocator, attr.name);
+        if (needs_quote) {
+            try output.appendSlice(allocator, "'");
+        }
+        try output.appendSlice(allocator, ": ");
+
+        // Emit value
+        if (attr.value) |val| {
+            if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}' and isSingleExpression(val)) {
+                // Pure expression value: strip { } and emit the expression
+                const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
+                try output.appendSlice(allocator, expr);
+            } else if (std.mem.indexOf(u8, val, "{") != null) {
+                // Mixed value with embedded expressions
+                try emitMixedAttributeValue(allocator, output, mappings, val, attr.start);
+            } else if (std.mem.indexOf(u8, val, "\n") != null) {
+                // Multi-line static value - emit as template literal
+                try output.appendSlice(allocator, "`");
+                for (val) |c| {
+                    if (c == '`' or c == '$') {
+                        try output.append(allocator, '\\');
+                    }
+                    try output.append(allocator, c);
+                }
+                try output.appendSlice(allocator, "`");
+            } else {
+                // Static string value
+                try output.appendSlice(allocator, "\"");
+                try output.appendSlice(allocator, val);
+                try output.appendSlice(allocator, "\"");
+            }
+        } else {
+            // Check if this is a shorthand prop like {foo}
+            const src = source[attr.start..attr.end];
+            if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
+                // Shorthand: {foo} → foo: foo
+                const expr = std.mem.trim(u8, src[1 .. src.len - 1], " \t\n\r");
+                try output.appendSlice(allocator, expr);
+            } else {
+                // Valueless prop (e.g., <Component disabled />)
+                try output.appendSlice(allocator, "true");
+            }
+        }
+    }
+
+    try output.appendSlice(allocator, " });\n");
 }
 
 /// Extracts identifier references from an attribute value that may contain mixed text and expressions.
@@ -3702,6 +3969,31 @@ fn detectDirectiveIdentifier(template: []const u8, pos: usize) ?DirectiveInfo {
     return null;
 }
 
+/// Returns true if a component prop should be validated against the component's props type.
+/// Excludes Svelte-specific directives that have special handling.
+fn isValidatableComponentProp(name: []const u8) bool {
+    // Skip Svelte directives (colon syntax)
+    if (std.mem.startsWith(u8, name, "bind:")) return false;
+    if (std.mem.startsWith(u8, name, "on:")) return false;
+    if (std.mem.startsWith(u8, name, "use:")) return false;
+    if (std.mem.startsWith(u8, name, "let:")) return false;
+    if (std.mem.startsWith(u8, name, "class:")) return false;
+    if (std.mem.startsWith(u8, name, "style:")) return false;
+    if (std.mem.startsWith(u8, name, "transition:")) return false;
+    if (std.mem.startsWith(u8, name, "in:")) return false;
+    if (std.mem.startsWith(u8, name, "out:")) return false;
+    if (std.mem.startsWith(u8, name, "animate:")) return false;
+    // Skip Svelte 5 attach directive
+    if (std.mem.eql(u8, name, "@attach")) return false;
+    // Skip spread attributes
+    if (std.mem.eql(u8, name, "...")) return false;
+    // Skip slot attribute (for named slots)
+    if (std.mem.eql(u8, name, "slot")) return false;
+    // Skip this attribute (for svelte:component)
+    if (std.mem.eql(u8, name, "this")) return false;
+    return true;
+}
+
 /// Returns true if an HTML attribute name should be validated against Svelte's type definitions.
 /// Excludes Svelte-specific directives that have special handling.
 fn isValidatableHtmlAttr(name: []const u8) bool {
@@ -4943,6 +5235,11 @@ fn emitSnippetBodyExpressions(
     var body_exprs: std.ArrayList(struct { expr: []const u8, offset: u32 }) = .empty;
     defer body_exprs.deinit(allocator);
 
+    // Collect components inside the snippet body for props validation
+    const ComponentInfo = struct { data_index: u32, node_start: u32 };
+    var body_components: std.ArrayList(ComponentInfo) = .empty;
+    defer body_components.deinit(allocator);
+
     for (ast.nodes.items) |node| {
         // Only process nodes within this snippet's body range
         if (node.start < range.body_start or node.start >= range.body_end) continue;
@@ -5004,12 +5301,19 @@ fn emitSnippetBodyExpressions(
                     });
                 }
             },
+            .component => {
+                // Collect component for props validation inside snippet scope
+                try body_components.append(allocator, .{
+                    .data_index = node.data,
+                    .node_start = node.start,
+                });
+            },
             else => {},
         }
     }
 
-    // If there are no body expressions, nothing to emit
-    if (body_exprs.items.len == 0) return;
+    // If there are no body expressions and no components, nothing to emit
+    if (body_exprs.items.len == 0 and body_components.items.len == 0) return;
 
     if (!has_expressions.*) {
         try output.appendSlice(allocator, ";// Template expressions\n");
@@ -5089,6 +5393,65 @@ fn emitSnippetBodyExpressions(
             try output.appendSlice(allocator, " }");
         }
         try output.appendSlice(allocator, "\n");
+    }
+
+    // Emit component props validation for components inside this snippet
+    // Only in TypeScript mode (component props validation requires type checking)
+    if (is_typescript) {
+        for (body_components.items) |comp_info| {
+            const elem_data = ast.elements.items[comp_info.data_index];
+            const tag_name = elem_data.tag_name;
+
+            // Skip svelte: special elements
+            if (std.mem.startsWith(u8, tag_name, "svelte:")) continue;
+
+            // Find enclosing if branches for this component (within snippet scope)
+            var inner_enclosing = try findAllEnclosingIfBranches(allocator, comp_info.node_start, snippet_branches.items);
+            defer inner_enclosing.deinit(allocator);
+
+            var conditions_opened: u32 = 0;
+
+            // First emit outer enclosing conditions (from if branches containing the snippet)
+            for (outer_enclosing.items) |branch| {
+                if (branch.condition) |cond| {
+                    try output.appendSlice(allocator, "  if (");
+                    try output.appendSlice(allocator, cond);
+                    try output.appendSlice(allocator, ") { ");
+                    conditions_opened += 1;
+                }
+            }
+
+            // Then emit inner enclosing conditions (from if branches within the snippet body)
+            for (inner_enclosing.items) |branch| {
+                if (branch.condition) |cond| {
+                    try output.appendSlice(allocator, "  if (");
+                    try output.appendSlice(allocator, cond);
+                    try output.appendSlice(allocator, ") { ");
+                    conditions_opened += 1;
+                }
+            }
+
+            // Emit component props validation
+            try emitComponentPropsValidation(
+                allocator,
+                ast.source,
+                output,
+                mappings,
+                tag_name,
+                elem_data.attrs_start,
+                elem_data.attrs_end,
+                ast.attributes.items,
+            );
+
+            // Close all opened if blocks
+            var k: u32 = 0;
+            while (k < conditions_opened) : (k += 1) {
+                try output.appendSlice(allocator, " }");
+            }
+            if (conditions_opened > 0) {
+                try output.appendSlice(allocator, "\n");
+            }
+        }
     }
 
     try output.appendSlice(allocator, "})(");
@@ -6803,7 +7166,7 @@ test "transform typescript component" {
     const virtual = try transform(allocator, ast);
 
     // Verify key parts of the generated TypeScript
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Component as __SvelteComponentType__ }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Component as __SvelteComponentType__, ComponentProps as __ComponentProps__ }") != null);
     // Snippet import is conditional - only added when file uses snippets
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") == null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state") != null);
