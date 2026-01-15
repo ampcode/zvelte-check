@@ -65,6 +65,20 @@ const SnippetBodyRange = struct {
     body_end: u32,
 };
 
+/// Represents a branch within an {#if}/{:else if}/{:else}/{/if} chain.
+/// Each branch has a condition (or null for {:else}) and a body range.
+/// Expressions in the body should be narrowed by the condition.
+const IfBranch = struct {
+    /// The condition expression (null for {:else} branches)
+    condition: ?[]const u8,
+    /// True if this is a negated branch (inside {:else})
+    is_else: bool,
+    /// Start of this branch's body (after the tag's closing })
+    body_start: u32,
+    /// End of this branch's body (start of {:else} or {/if})
+    body_end: u32,
+};
+
 const ExportInfo = struct {
     name: []const u8,
     type_repr: ?[]const u8,
@@ -161,6 +175,11 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // not at module scope, so that snippet parameters are in scope.
     var snippet_body_ranges = try findSnippetBodyRanges(allocator, ast.source);
     defer snippet_body_ranges.deinit(allocator);
+
+    // Find if/else branches for type narrowing.
+    // Expressions inside {#if condition} blocks should be narrowed by the condition.
+    var if_branches = try findIfBranches(allocator, ast.source);
+    defer if_branches.deinit(allocator);
 
     // Header comment
     try output.appendSlice(allocator, "// Generated from ");
@@ -332,7 +351,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         if (instance_generics != null) {
             // For generic components, emit template expressions INSIDE __render
             // so they can access script variables (which are scoped to __render).
-            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items);
+            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items);
             try output.appendSlice(allocator, "\n}\n\n");
         } else {
             try output.appendSlice(allocator, "\n\n");
@@ -341,7 +360,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
 
     // For non-generic components, emit template expressions at module level
     if (instance_generics == null) {
-        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items);
+        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items);
     }
 
     // Extract props from instance script
@@ -1528,6 +1547,7 @@ fn emitTemplateExpressions(
     declared_names: std.StringHashMapUnmanaged(void),
     is_typescript: bool,
     snippet_body_ranges: []const SnippetBodyRange,
+    if_branches: []const IfBranch,
 ) !void {
     var has_expressions = false;
 
@@ -1609,19 +1629,16 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
 
                 if (extractRenderExpression(ast.source, node.start, node.end)) |render_info| {
-                    if (!has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
-                    }
-                    try output.appendSlice(allocator, "void (");
-                    // Add source mapping for the render expression
-                    try mappings.append(allocator, .{
-                        .svelte_offset = node.start + render_info.offset,
-                        .ts_offset = @intCast(output.items.len),
-                        .len = @intCast(render_info.expr.len),
-                    });
-                    try output.appendSlice(allocator, render_info.expr);
-                    try output.appendSlice(allocator, ");\n");
+                    // Use narrowed expression emission for type narrowing in {#if} blocks
+                    try emitNarrowedExpression(
+                        allocator,
+                        output,
+                        mappings,
+                        render_info.expr,
+                        node.start + render_info.offset,
+                        if_branches,
+                        &has_expressions,
+                    );
                 }
             },
 
@@ -1634,18 +1651,16 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractPlainExpression(ast.source, node.start, node.end)) |expr_info| {
-                    if (!has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
-                    }
-                    try output.appendSlice(allocator, "void (");
-                    try mappings.append(allocator, .{
-                        .svelte_offset = node.start + expr_info.offset,
-                        .ts_offset = @intCast(output.items.len),
-                        .len = @intCast(expr_info.expr.len),
-                    });
-                    try output.appendSlice(allocator, expr_info.expr);
-                    try output.appendSlice(allocator, ");\n");
+                    // Use narrowed expression emission for type narrowing in {#if} blocks
+                    try emitNarrowedExpression(
+                        allocator,
+                        output,
+                        mappings,
+                        expr_info.expr,
+                        node.start + expr_info.offset,
+                        if_branches,
+                        &has_expressions,
+                    );
                 }
             },
 
@@ -1697,18 +1712,16 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractHtmlExpression(ast.source, node.start, node.end)) |expr_info| {
-                    if (!has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
-                    }
-                    try output.appendSlice(allocator, "void (");
-                    try mappings.append(allocator, .{
-                        .svelte_offset = node.start + expr_info.offset,
-                        .ts_offset = @intCast(output.items.len),
-                        .len = @intCast(expr_info.expr.len),
-                    });
-                    try output.appendSlice(allocator, expr_info.expr);
-                    try output.appendSlice(allocator, ");\n");
+                    // Use narrowed expression emission for type narrowing in {#if} blocks
+                    try emitNarrowedExpression(
+                        allocator,
+                        output,
+                        mappings,
+                        expr_info.expr,
+                        node.start + expr_info.offset,
+                        if_branches,
+                        &has_expressions,
+                    );
                 }
             },
 
@@ -2040,6 +2053,20 @@ fn emitTemplateExpressions(
                 has_expressions = true;
             }
 
+            // Find enclosing if branches for this element and emit if wrappers
+            var enclosing = try findAllEnclosingIfBranches(allocator, node.start, if_branches);
+            defer enclosing.deinit(allocator);
+
+            var conditions_opened: u32 = 0;
+            for (enclosing.items) |branch| {
+                if (branch.condition) |cond| {
+                    try output.appendSlice(allocator, "if (");
+                    try output.appendSlice(allocator, cond);
+                    try output.appendSlice(allocator, ") { ");
+                    conditions_opened += 1;
+                }
+            }
+
             // Emit: void ({ attr1: value1 } satisfies Partial<__SvelteElements__['tag']>);
             // Use 'satisfies' to check attribute types without declaring variables
             elem_counter += 1;
@@ -2121,7 +2148,14 @@ fn emitTemplateExpressions(
 
             try output.appendSlice(allocator, " } satisfies Partial<__SvelteElements__['");
             try output.appendSlice(allocator, elem_data.tag_name);
-            try output.appendSlice(allocator, "']>);\n");
+            try output.appendSlice(allocator, "']>);");
+
+            // Close all opened if blocks
+            var k: u32 = 0;
+            while (k < conditions_opened) : (k += 1) {
+                try output.appendSlice(allocator, " }");
+            }
+            try output.appendSlice(allocator, "\n");
         }
     }
 
@@ -4537,6 +4571,270 @@ fn findSnippetBodyRanges(
     }
 
     return ranges;
+}
+
+/// Scans source for {#if}/{:else if}/{:else}/{/if} blocks and builds IfBranch entries.
+/// Each branch represents a contiguous region where a condition (or its negation) applies.
+/// Nested {#if} blocks are flattened into the list; callers should check all branches.
+fn findIfBranches(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !std.ArrayList(IfBranch) {
+    var branches: std.ArrayList(IfBranch) = .empty;
+
+    // Stack of open if blocks: each entry is (condition, body_start_after_tag, is_first_branch)
+    // When we see {:else} or {:else if}, we close the current branch and open a new one.
+    // When we see {/if}, we close the current branch.
+    const StackEntry = struct {
+        condition: ?[]const u8,
+        body_start: u32,
+        is_else: bool,
+    };
+    var stack: std.ArrayList(StackEntry) = .empty;
+    defer stack.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < source.len) {
+        // Skip strings to avoid false matches inside template literals
+        if (source[i] == '"' or source[i] == '\'' or source[i] == '`') {
+            i = skipStringLiteral(source, i);
+            continue;
+        }
+
+        // Skip HTML comments
+        if (i + 4 <= source.len and std.mem.eql(u8, source[i .. i + 4], "<!--")) {
+            const comment_end = std.mem.indexOf(u8, source[i + 4 ..], "-->") orelse {
+                i = source.len;
+                continue;
+            };
+            i += 4 + comment_end + 3;
+            continue;
+        }
+
+        // Check for {#if
+        if (i + 4 < source.len and std.mem.eql(u8, source[i .. i + 4], "{#if")) {
+            const tag_start = i;
+            // Find condition and closing brace
+            var j = i + 4;
+            var brace_depth: u32 = 1;
+            while (j < source.len and brace_depth > 0) {
+                const c = source[j];
+                if (c == '"' or c == '\'' or c == '`') {
+                    j = skipStringLiteral(source, j);
+                    continue;
+                }
+                if (c == '{') brace_depth += 1;
+                if (c == '}') brace_depth -= 1;
+                if (brace_depth > 0) j += 1;
+            }
+            const tag_end = j + 1;
+
+            // Extract condition: everything between "{#if " and "}"
+            const condition_start = tag_start + 4;
+            var cond_end = j;
+            // Trim whitespace
+            while (cond_end > condition_start and (source[cond_end - 1] == ' ' or source[cond_end - 1] == '\t' or source[cond_end - 1] == '\n' or source[cond_end - 1] == '\r')) {
+                cond_end -= 1;
+            }
+            var cond_start = condition_start;
+            while (cond_start < cond_end and (source[cond_start] == ' ' or source[cond_start] == '\t' or source[cond_start] == '\n' or source[cond_start] == '\r')) {
+                cond_start += 1;
+            }
+            const condition = if (cond_start < cond_end) source[cond_start..cond_end] else null;
+
+            try stack.append(allocator, .{
+                .condition = condition,
+                .body_start = @intCast(tag_end),
+                .is_else = false,
+            });
+
+            i = tag_end;
+            continue;
+        }
+
+        // Check for {:else if or {:else
+        if (i + 6 < source.len and std.mem.eql(u8, source[i .. i + 6], "{:else")) {
+            if (stack.items.len == 0) {
+                i += 6;
+                continue;
+            }
+
+            const tag_start = i;
+            // Find closing brace
+            var j = i + 6;
+            var brace_depth: u32 = 1;
+            while (j < source.len and brace_depth > 0) {
+                const c = source[j];
+                if (c == '"' or c == '\'' or c == '`') {
+                    j = skipStringLiteral(source, j);
+                    continue;
+                }
+                if (c == '{') brace_depth += 1;
+                if (c == '}') brace_depth -= 1;
+                if (brace_depth > 0) j += 1;
+            }
+            const tag_end = j + 1;
+
+            // Close the current branch
+            const prev = stack.pop() orelse {
+                i = tag_end;
+                continue;
+            };
+            try branches.append(allocator, .{
+                .condition = prev.condition,
+                .is_else = prev.is_else,
+                .body_start = prev.body_start,
+                .body_end = @intCast(tag_start),
+            });
+
+            // Check if it's {:else if ...} or just {:else}
+            const after_else = source[i + 6 .. j];
+            const trimmed = std.mem.trim(u8, after_else, " \t\n\r");
+            if (std.mem.startsWith(u8, trimmed, "if ") or std.mem.startsWith(u8, trimmed, "if\t") or std.mem.startsWith(u8, trimmed, "if\n")) {
+                // {:else if condition}
+                const if_start = std.mem.indexOf(u8, trimmed, "if") orelse 0;
+                const cond_text = std.mem.trim(u8, trimmed[if_start + 2 ..], " \t\n\r");
+                try stack.append(allocator, .{
+                    .condition = if (cond_text.len > 0) cond_text else null,
+                    .body_start = @intCast(tag_end),
+                    .is_else = true, // In an else branch, even with a condition
+                });
+            } else {
+                // {:else}
+                try stack.append(allocator, .{
+                    .condition = null,
+                    .body_start = @intCast(tag_end),
+                    .is_else = true,
+                });
+            }
+
+            i = tag_end;
+            continue;
+        }
+
+        // Check for {/if}
+        if (i + 5 <= source.len and std.mem.eql(u8, source[i .. i + 5], "{/if}")) {
+            if (stack.pop()) |prev| {
+                try branches.append(allocator, .{
+                    .condition = prev.condition,
+                    .is_else = prev.is_else,
+                    .body_start = prev.body_start,
+                    .body_end = @intCast(i),
+                });
+            }
+            i += 5;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    return branches;
+}
+
+/// Finds the IfBranch that contains a given source position.
+/// Returns the branch if found, null otherwise.
+/// For expressions, we want the innermost branch that contains them.
+fn findEnclosingIfBranch(pos: u32, branches: []const IfBranch) ?IfBranch {
+    // Find all branches that contain this position
+    // Return the one with the smallest range (innermost)
+    var best: ?IfBranch = null;
+    var best_size: u32 = std.math.maxInt(u32);
+
+    for (branches) |branch| {
+        if (pos >= branch.body_start and pos < branch.body_end) {
+            const size = branch.body_end - branch.body_start;
+            if (size < best_size) {
+                best = branch;
+                best_size = size;
+            }
+        }
+    }
+
+    return best;
+}
+
+/// Finds all IfBranches that contain a given position, from outermost to innermost.
+/// This is needed to emit nested if conditions correctly.
+fn findAllEnclosingIfBranches(
+    allocator: std.mem.Allocator,
+    pos: u32,
+    branches: []const IfBranch,
+) !std.ArrayList(IfBranch) {
+    var result: std.ArrayList(IfBranch) = .empty;
+
+    // Collect all branches that contain this position
+    for (branches) |branch| {
+        if (pos >= branch.body_start and pos < branch.body_end) {
+            try result.append(allocator, branch);
+        }
+    }
+
+    // Sort by body_start (ascending) to get outermost first
+    std.mem.sort(IfBranch, result.items, {}, struct {
+        fn lessThan(_: void, a: IfBranch, b: IfBranch) bool {
+            return a.body_start < b.body_start;
+        }
+    }.lessThan);
+
+    return result;
+}
+
+/// Emits an expression wrapped in the appropriate if conditions for type narrowing.
+/// For expressions inside {#if condition} blocks, wraps in `if (condition) { void (expr); }`
+/// For expressions inside {:else} blocks without conditions, doesn't add narrowing.
+/// For expressions inside {:else if condition} blocks, wraps in `if (condition) { void (expr); }`
+fn emitNarrowedExpression(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    mappings: *std.ArrayList(SourceMap.Mapping),
+    expr: []const u8,
+    svelte_offset: u32,
+    if_branches: []const IfBranch,
+    has_expressions: *bool,
+) !void {
+    // Find all enclosing if branches for this expression
+    var enclosing = try findAllEnclosingIfBranches(allocator, svelte_offset, if_branches);
+    defer enclosing.deinit(allocator);
+
+    if (!has_expressions.*) {
+        try output.appendSlice(allocator, ";// Template expressions\n");
+        has_expressions.* = true;
+    }
+
+    // Count how many if conditions we need to open
+    var conditions_opened: u32 = 0;
+
+    // Emit if wrappers for each enclosing branch that has a condition
+    for (enclosing.items) |branch| {
+        if (branch.condition) |cond| {
+            // This branch has a condition - emit an if wrapper
+            try output.appendSlice(allocator, "if (");
+            try output.appendSlice(allocator, cond);
+            try output.appendSlice(allocator, ") { ");
+            conditions_opened += 1;
+        }
+        // For {:else} branches without conditions, we don't add narrowing
+        // since TypeScript's control flow analysis doesn't help without
+        // the full if/else structure
+    }
+
+    // Emit the actual expression
+    try output.appendSlice(allocator, "void (");
+    try mappings.append(allocator, .{
+        .svelte_offset = svelte_offset,
+        .ts_offset = @intCast(output.items.len),
+        .len = @intCast(expr.len),
+    });
+    try output.appendSlice(allocator, expr);
+    try output.appendSlice(allocator, ");");
+
+    // Close all opened if blocks
+    var j: u32 = 0;
+    while (j < conditions_opened) : (j += 1) {
+        try output.appendSlice(allocator, " }");
+    }
+    try output.appendSlice(allocator, "\n");
 }
 
 /// Checks if a source position is inside any snippet body.
