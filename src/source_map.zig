@@ -27,6 +27,30 @@ pub const SourceMap = struct {
         return null;
     }
 
+    /// Maps a TS offset to a Svelte offset, returning both the position and
+    /// whether an exact mapping was found. Exact mappings are from script content;
+    /// fallback mappings are from generated template code.
+    pub fn tsToSvelteWithExactness(self: *const SourceMap, ts_offset: u32) struct { offset: u32, is_exact: bool } {
+        var last_mapped_end: u32 = 0;
+
+        for (self.mappings) |m| {
+            // Exact match within a mapping range (script content)
+            if (ts_offset >= m.ts_offset and ts_offset < m.ts_offset + m.len) {
+                const delta = ts_offset - m.ts_offset;
+                return .{ .offset = m.svelte_offset + delta, .is_exact = true };
+            }
+
+            // Track the end of the last mapping we passed (for fallback)
+            if (ts_offset >= m.ts_offset + m.len) {
+                last_mapped_end = m.svelte_offset + m.len;
+            }
+        }
+
+        // Fallback: return end of last mapping (generated template code)
+        const fallback = if (last_mapped_end > 0) last_mapped_end - 1 else 0;
+        return .{ .offset = fallback, .is_exact = false };
+    }
+
     /// Maps a TS offset to a Svelte offset, with fallback for unmapped regions.
     /// For errors in generated code (template bindings, type stubs), returns
     /// the nearest preceding mapped position. This prevents line numbers from

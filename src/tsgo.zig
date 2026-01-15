@@ -708,6 +708,10 @@ fn parseTsgoOutput(
         var svelte_line = ts_line;
         var svelte_col = ts_col;
         var original_path: []const u8 = file_path;
+        // Track whether this error is from script content (exact mapping) or
+        // generated template code (fallback mapping). Template code loses type
+        // narrowing context from {#if} blocks.
+        var is_from_script = false;
 
         if (cached) |cf| {
             // This is a .svelte.ts file - map back to original .svelte
@@ -715,12 +719,13 @@ fn parseTsgoOutput(
 
             // Use pre-computed line table to convert line/col → offset
             if (cf.ts_line_table.lineColToOffset(ts_line, ts_col)) |ts_offset| {
-                // Map TS offset to Svelte offset with fallback for unmapped regions.
-                // Generated code (template bindings, type stubs) won't have exact mappings,
-                // so we fall back to the nearest preceding mapped position.
-                const svelte_offset = cf.vf.source_map.tsToSvelteFallback(ts_offset);
+                // Map TS offset to Svelte offset with exactness tracking.
+                // Exact mappings are from script content (verbatim copy).
+                // Fallback mappings are from generated template code.
+                const mapping = cf.vf.source_map.tsToSvelteWithExactness(ts_offset);
+                is_from_script = mapping.is_exact;
                 // Use pre-computed Svelte line table to convert offset → line/col
-                const pos = cf.svelte_line_table.offsetToLineCol(svelte_offset);
+                const pos = cf.svelte_line_table.offsetToLineCol(mapping.offset);
                 // Convert from 0-based to 1-based
                 svelte_line = pos.line + 1;
                 svelte_col = pos.col + 1;
@@ -756,7 +761,7 @@ fn parseTsgoOutput(
         const is_typescript_svelte = if (cached) |cf| cf.vf.is_typescript else false;
 
         // Skip errors that are false positives for Svelte files
-        if (shouldSkipError(message, is_svelte_file, is_test_file, is_typescript_svelte)) continue;
+        if (shouldSkipError(message, is_svelte_file, is_test_file, is_typescript_svelte, is_from_script)) continue;
 
         // Skip "Type assertion expressions can only be used in TypeScript files" for `as any`
         // The `as any` pattern is a common escape hatch that svelte-check doesn't report,
@@ -787,7 +792,10 @@ fn parseTsgoOutput(
 ///
 /// @param is_typescript_svelte: true if the .svelte file has lang="ts" in its script tag.
 ///        JavaScript Svelte files get less strict checking to match svelte-check behavior.
-fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool, is_typescript_svelte: bool) bool {
+/// @param is_from_script: true if the error is from script content (exact source mapping),
+///        false if from generated template code (fallback mapping). Template code loses
+///        type narrowing context, so some errors are false positives there but not in scripts.
+fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool, is_typescript_svelte: bool, is_from_script: bool) bool {
     if (is_svelte_file) {
         // Svelte-specific type errors (only for .svelte files)
         // These are false positives from our code generation
@@ -914,17 +922,19 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Object is possibly 'null'" and "is possibly 'undefined'" errors for Svelte files.
-        // These are still false positives from:
+        // Skip "Object is possibly 'null'" and "is possibly 'undefined'" errors for template code.
+        // These are false positives from generated template bindings where we lose type narrowing:
         // 1. Nested {#if} blocks where inner blocks can't access outer narrowing
         // 2. Template attribute expressions (e.g., onclick={handler} where handler is narrowed)
         // 3. Complex discriminated unions (task 1532)
         //
-        // TODO: Implement full nested narrowing for template expressions.
-        if (std.mem.indexOf(u8, message, "is possibly 'null'") != null or
-            std.mem.indexOf(u8, message, "is possibly 'undefined'") != null)
-        {
-            return true;
+        // Script code should still report these errors - they're legitimate type errors there.
+        if (!is_from_script) {
+            if (std.mem.indexOf(u8, message, "is possibly 'null'") != null or
+                std.mem.indexOf(u8, message, "is possibly 'undefined'") != null)
+            {
+                return true;
+            }
         }
 
         // Skip "Cannot use namespace 'X' as a type" errors
