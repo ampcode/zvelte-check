@@ -579,11 +579,17 @@ pub const Parser = struct {
                 // - class:!classname for Tailwind's important modifier
                 if (self.current.kind == .colon) {
                     const first_ident = self.source[attr_start..attr_name_end];
-                    if (self.peek().kind == .identifier) {
+                    if (std.mem.eql(u8, first_ident, "class")) {
+                        // class: directive - scan for full Tailwind/CSS class name FIRST
+                        // before checking for identifier token, because the lexer can't
+                        // parse class names with special characters like dots or brackets.
+                        // This must come before the generic identifier check below.
+                    } else if (self.peek().kind == .identifier) {
                         self.advance(); // consume :
                         attr_name_end = self.current.end;
                         self.advance(); // consume modifier name
-                    } else if (std.mem.eql(u8, first_ident, "style")) {
+                    }
+                    if (std.mem.eql(u8, first_ident, "style")) {
                         // style: directive - check for CSS custom property (--name)
                         // The lexer can't parse -- as part of an identifier, so we scan manually.
                         // After the colon, check if the source has -- indicating a CSS custom property.
@@ -610,20 +616,40 @@ pub const Parser = struct {
                             self.advance(); // just consume the colon
                         }
                     } else if (std.mem.eql(u8, first_ident, "class")) {
-                        // class: directive - check for Tailwind's ! important modifier (!classname)
-                        // The lexer can't parse ! as part of an identifier, so we scan manually.
+                        // class: directive - scan for full Tailwind/CSS class name
+                        // The lexer can't parse class names with special characters like:
+                        // - Tailwind's ! important modifier: class:!hidden
+                        // - Tailwind arbitrary values with dots: class:pb-1.5, class:text-[1.5rem]
+                        // - Tailwind arbitrary values with brackets: class:bg-[#fff]
+                        // We scan manually from the colon to capture the full class name.
                         const colon_pos = self.current.start;
-                        if (colon_pos + 1 < self.source.len and self.source[colon_pos + 1] == '!') {
-                            var class_end: usize = colon_pos + 2;
-                            // Tailwind class names: alphanumeric, -, _
-                            while (class_end < self.source.len) {
-                                const c = self.source[class_end];
-                                if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') {
-                                    class_end += 1;
-                                } else {
-                                    break;
-                                }
+                        var class_end: usize = colon_pos + 1;
+                        // Skip optional ! prefix (Tailwind important modifier)
+                        if (class_end < self.source.len and self.source[class_end] == '!') {
+                            class_end += 1;
+                        }
+                        // Tailwind class names: alphanumeric, -, _, ., [, ], /, :, #, %, (, )
+                        // Stop at = (value start), > (tag end), space, or { (expression)
+                        var bracket_depth: u32 = 0;
+                        while (class_end < self.source.len) {
+                            const c = self.source[class_end];
+                            if (c == '[') {
+                                bracket_depth += 1;
+                                class_end += 1;
+                            } else if (c == ']') {
+                                if (bracket_depth > 0) bracket_depth -= 1;
+                                class_end += 1;
+                            } else if (bracket_depth > 0) {
+                                // Inside brackets, allow almost anything except unbalanced brackets
+                                class_end += 1;
+                            } else if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '/' or c == ':' or c == '#' or c == '%') {
+                                class_end += 1;
+                            } else {
+                                break;
                             }
+                        }
+                        // Only update if we actually scanned something past the colon
+                        if (class_end > colon_pos + 1) {
                             attr_name_end = @intCast(class_end);
                             self.lexer.pos = @intCast(class_end);
                             self.advance();

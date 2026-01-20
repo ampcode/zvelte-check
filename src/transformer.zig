@@ -10304,3 +10304,89 @@ test "regular function local variables should not be extracted to module scope" 
     // inner should NOT be extracted (it's inside the function body)
     try std.testing.expect(!refs.contains("inner"));
 }
+
+test "class directive with hyphen in name should not extract class name as identifier" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\let isCollapsed = true;
+        \\</script>
+        \\<div class:pb-1.5={isCollapsed}>test</div>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    // Verify parser correctly captured the full class name with value
+    try std.testing.expectEqual(@as(usize, 1), ast.attributes.items.len);
+    try std.testing.expectEqualStrings("class:pb-1.5", ast.attributes.items[0].name);
+    try std.testing.expectEqualStrings("{isCollapsed}", ast.attributes.items[0].value.?);
+
+    const virtual = try transform(allocator, ast);
+
+    // The class directive condition (isCollapsed) should be extracted
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void isCollapsed") != null);
+    // The class name (pb-1.5 or pb-1 or pb) should NOT be extracted as an identifier
+    // This would cause "void pb-1;" which TypeScript parses as "void pb - 1;" (syntax error)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void pb") == null);
+}
+
+test "shorthand class directive extracts variable name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\let hidden = true;
+        \\</script>
+        \\<div class:hidden>test</div>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    // Verify parser captured shorthand class directive
+    try std.testing.expectEqual(@as(usize, 1), ast.attributes.items.len);
+    try std.testing.expectEqualStrings("class:hidden", ast.attributes.items[0].name);
+    try std.testing.expect(ast.attributes.items[0].value == null);
+
+    const virtual = try transform(allocator, ast);
+
+    // Shorthand class:hidden should extract "hidden" as a variable reference
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void hidden") != null);
+}
+
+test "class directive with Tailwind arbitrary value brackets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\let active = true;
+        \\</script>
+        \\<div class:bg-[#fff]={active}>test</div>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    // Verify parser captured Tailwind arbitrary value class name
+    try std.testing.expectEqual(@as(usize, 1), ast.attributes.items.len);
+    try std.testing.expectEqualStrings("class:bg-[#fff]", ast.attributes.items[0].name);
+    try std.testing.expectEqualStrings("{active}", ast.attributes.items[0].value.?);
+
+    const virtual = try transform(allocator, ast);
+
+    // The condition variable should be extracted
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void active") != null);
+    // The class name should NOT be extracted as identifiers
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void bg") == null);
+}
