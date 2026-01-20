@@ -1859,6 +1859,7 @@ fn emitTemplateExpressions(
                                 range,
                                 is_typescript,
                                 if_branches,
+                                each_body_ranges,
                                 &narrowing_ctx.has_expressions,
                             );
                             break;
@@ -6079,6 +6080,7 @@ fn emitSnippetBodyExpressions(
     range: SnippetBodyRange,
     is_typescript: bool,
     if_branches: []const IfBranch,
+    each_body_ranges: []const EachBodyRange,
     has_expressions: *bool,
 ) !void {
     // Collect render expressions and other expressions from the snippet body
@@ -6206,6 +6208,27 @@ fn emitSnippetBodyExpressions(
         if (branch.body_start >= range.body_start and branch.body_end <= range.body_end) {
             try snippet_branches.append(allocator, branch);
         }
+    }
+
+    // Find {#each} blocks that ENCLOSE the snippet definition.
+    // Expressions inside the snippet need access to these loop variables (e.g., `file` from `{#each files as file}`).
+    var enclosing_eaches = try findAllEnclosingEachRanges(allocator, range.snippet_start, each_body_ranges);
+    defer enclosing_eaches.deinit(allocator);
+
+    // Emit bindings for enclosing {#each} blocks at the start of the snippet IIFE.
+    // This makes loop variables like `file` and `index` available inside the snippet body.
+    for (enclosing_eaches.items) |each_range| {
+        try output.appendSlice(allocator, "  let ");
+        try output.appendSlice(allocator, each_range.item_binding);
+        try output.appendSlice(allocator, " = __svelte_ensureArray(");
+        try output.appendSlice(allocator, each_range.iterable);
+        try output.appendSlice(allocator, ")[0];");
+        if (each_range.index_binding) |idx| {
+            try output.appendSlice(allocator, " let ");
+            try output.appendSlice(allocator, idx);
+            try output.appendSlice(allocator, " = 0;");
+        }
+        try output.appendSlice(allocator, "\n");
     }
 
     // Emit each bindings with narrowing applied
