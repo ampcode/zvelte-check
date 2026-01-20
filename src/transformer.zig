@@ -351,23 +351,9 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         });
 
         try output.appendSlice(allocator, content);
-
-        if (instance_generics != null) {
-            // For generic components, emit template expressions INSIDE __render
-            // so they can access script variables (which are scoped to __render).
-            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items);
-            try output.appendSlice(allocator, "\n}\n\n");
-        } else {
-            try output.appendSlice(allocator, "\n\n");
-        }
     }
 
-    // For non-generic components, emit template expressions at module level
-    if (instance_generics == null) {
-        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items);
-    }
-
-    // Extract props from instance script
+    // Extract props from instance script FIRST (needed for bindable props void statements)
     var props: std.ArrayList(PropInfo) = .empty;
     defer props.deinit(allocator);
 
@@ -386,6 +372,31 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         }
     }
 
+    // For generic components, emit template expressions and bindable void statements INSIDE __render
+    // For non-generic, emit at module level
+    if (instance_generics != null) {
+        if (instance_script != null) {
+            // For generic components, emit template expressions INSIDE __render
+            // so they can access script variables (which are scoped to __render).
+            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items);
+
+            // Emit void statements for $bindable() props INSIDE __render to suppress "never read" errors.
+            // For generic components, props are scoped to __render, so void statements must be inside too.
+            try emitBindablePropsVoid(allocator, &output, props.items);
+
+            try output.appendSlice(allocator, "\n}\n\n");
+        }
+    } else {
+        if (instance_script != null) {
+            try output.appendSlice(allocator, "\n\n");
+        }
+        // For non-generic components, emit template expressions at module level
+        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items);
+
+        // Emit void statements for $bindable() props at module level
+        try emitBindablePropsVoid(allocator, &output, props.items);
+    }
+
     // Extract slots from AST
     var slots: std.ArrayList(SlotInfo) = .empty;
     defer {
@@ -402,26 +413,6 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     if (instance_script) |script| {
         const content = ast.source[script.content_start..script.content_end];
         try extractInstanceExports(allocator, content, &instance_exports);
-    }
-
-    // Emit void statements for $bindable() props to suppress "never read" errors.
-    // Bindable props are often only written to (reassigned) in script, not read,
-    // but the binding is read by the parent component. TypeScript sees writes but
-    // no reads, causing false "declared but its value is never read" errors.
-    var has_bindable_props = false;
-    for (props.items) |prop| {
-        if (prop.is_bindable) {
-            if (!has_bindable_props) {
-                try output.appendSlice(allocator, "// Mark bindable props as used (read by parent via binding)\n");
-                has_bindable_props = true;
-            }
-            try output.appendSlice(allocator, "void ");
-            try output.appendSlice(allocator, prop.name);
-            try output.appendSlice(allocator, ";\n");
-        }
-    }
-    if (has_bindable_props) {
-        try output.appendSlice(allocator, "\n");
     }
 
     // Generate component type interfaces
@@ -1523,6 +1514,28 @@ fn emitGenericTypeDeclarations(
         if (i < generics.len and generics[i] == ',') {
             i += 1;
         }
+    }
+}
+
+/// Emit void statements for $bindable() props to suppress "never read" errors.
+/// Bindable props are often only written to (reassigned) in script, not read,
+/// but the binding is read by the parent component. TypeScript sees writes but
+/// no reads, causing false "declared but its value is never read" errors.
+fn emitBindablePropsVoid(allocator: std.mem.Allocator, output: *std.ArrayList(u8), props: []const PropInfo) !void {
+    var has_bindable_props = false;
+    for (props) |prop| {
+        if (prop.is_bindable) {
+            if (!has_bindable_props) {
+                try output.appendSlice(allocator, "// Mark bindable props as used (read by parent via binding)\n");
+                has_bindable_props = true;
+            }
+            try output.appendSlice(allocator, "void ");
+            try output.appendSlice(allocator, prop.name);
+            try output.appendSlice(allocator, ";\n");
+        }
+    }
+    if (has_bindable_props) {
+        try output.appendSlice(allocator, "\n");
     }
 }
 
@@ -8377,6 +8390,60 @@ test "transform with generics attribute" {
 
     // Should wrap instance script in generic render function
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function __render<T extends SomeInterface>()") != null);
+}
+
+test "generic component bindable props scoped inside __render" {
+    // Regression test: $bindable() props must be visible in template expressions.
+    // Previously, `void selected;` was emitted at module scope, but `selected`
+    // is only declared inside __render for generic components.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts" generics="T">
+        \\    interface Props {
+        \\        items: T[];
+        \\        selected?: T;
+        \\    }
+        \\    let { items, selected = $bindable() }: Props = $props();
+        \\</script>
+        \\
+        \\{#each items as item}
+        \\    <button onclick={() => selected = item}>
+        \\        {item}
+        \\    </button>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Generics.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // The `void selected;` for bindable props must be INSIDE __render, not at module scope.
+    // Find __render function start
+    const render_start = std.mem.indexOf(u8, virtual.content, "function __render<T>()") orelse
+        return error.TestUnexpectedResult;
+
+    // Find the "// Component typing" comment which comes after __render closes
+    const component_typing = std.mem.indexOf(u8, virtual.content, "// Component typing") orelse
+        return error.TestUnexpectedResult;
+
+    // Find `void selected;` for bindable props (look for the comment marker)
+    const bindable_comment = std.mem.indexOf(u8, virtual.content, "// Mark bindable props") orelse
+        return error.TestUnexpectedResult;
+
+    // bindable void statement must be after __render starts and before "// Component typing"
+    try std.testing.expect(bindable_comment > render_start);
+    try std.testing.expect(bindable_comment < component_typing);
+
+    // Also verify that onclick expression referencing selected is inside __render
+    const onclick_expr = std.mem.indexOf(u8, virtual.content, "onclick: () => selected = item") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(onclick_expr > render_start);
+    try std.testing.expect(onclick_expr < component_typing);
 }
 
 test "transform with module and instance generics" {
