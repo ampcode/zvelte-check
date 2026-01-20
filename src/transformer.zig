@@ -86,6 +86,21 @@ const IfBranch = struct {
     prior_conditions: []const []const u8,
 };
 
+/// Tracks an {#each} block's body range and bindings.
+/// Elements inside an {#each} block need access to the loop variable.
+const EachBodyRange = struct {
+    /// The iterable expression (e.g., "items" in {#each items as item})
+    iterable: []const u8,
+    /// The item binding pattern (e.g., "item" or "{a, b}")
+    item_binding: []const u8,
+    /// Optional index binding (e.g., "i" in {#each items as item, i})
+    index_binding: ?[]const u8,
+    /// Start of the each block's body (after the closing } of {#each ...})
+    body_start: u32,
+    /// End of the each block's body (start of {:else} or {/each})
+    body_end: u32,
+};
+
 /// Tracks the currently open if-block for narrowing context.
 /// When emitting multiple expressions from the same if-branch, we keep the if-block
 /// open so TypeScript can connect the narrowing context across expressions.
@@ -358,6 +373,11 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     var if_branches = try findIfBranches(allocator, ast.source);
     defer if_branches.deinit(allocator);
 
+    // Find {#each} body ranges for scoping loop variables.
+    // Elements inside {#each} blocks need access to the loop variable.
+    var each_body_ranges = try findEachBodyRanges(allocator, ast.source);
+    defer each_body_ranges.deinit(allocator);
+
     // Header comment
     try output.appendSlice(allocator, "// Generated from ");
     try output.appendSlice(allocator, ast.file_path);
@@ -572,7 +592,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         if (instance_script != null) {
             // For generic components, emit template expressions INSIDE __render
             // so they can access script variables (which are scoped to __render).
-            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items);
+            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items, each_body_ranges.items);
 
             // Emit void statements for $bindable() props INSIDE __render to suppress "never read" errors.
             // For generic components, props are scoped to __render, so void statements must be inside too.
@@ -585,7 +605,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             try output.appendSlice(allocator, "\n\n");
         }
         // For non-generic components, emit template expressions at module level
-        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items);
+        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items, each_body_ranges.items);
 
         // Emit void statements for $bindable() props at module level
         try emitBindablePropsVoid(allocator, &output, props.items);
@@ -1759,6 +1779,7 @@ fn emitTemplateExpressions(
     is_typescript: bool,
     snippet_body_ranges: []const SnippetBodyRange,
     if_branches: []const IfBranch,
+    each_body_ranges: []const EachBodyRange,
 ) !void {
     // Track narrowing context to keep if-blocks open across multiple expressions.
     // This enables TypeScript to connect narrowing across declarations and usages.
@@ -2276,11 +2297,16 @@ fn emitTemplateExpressions(
                 narrowing_ctx.has_expressions = true;
             }
 
-            // Find enclosing if branches for this element and emit if wrappers
+            // Find enclosing if branches and {#each} blocks for this element
+            // They must be emitted in the correct nested order (by body_start)
             var enclosing = try findAllEnclosingIfBranches(allocator, node.start, if_branches);
             defer enclosing.deinit(allocator);
 
-            const conditions_opened = try emitIfConditionOpeners(allocator, output, enclosing.items);
+            var enclosing_each = try findAllEnclosingEachRanges(allocator, node.start, each_body_ranges);
+            defer enclosing_each.deinit(allocator);
+
+            // Emit if conditions and each bindings interleaved by their body_start
+            const conditions_opened = try emitInterleavedConditionsAndBindings(allocator, output, enclosing.items, enclosing_each.items, is_typescript);
 
             // Emit: void ({ attr1: value1 } satisfies Partial<__SvelteElements__['tag']>);
             // Use 'satisfies' to check attribute types without declaring variables
@@ -5508,6 +5534,286 @@ fn findIfBranches(
     }
 
     return branches;
+}
+
+/// Scans source for {#each} blocks and returns their body ranges with bindings.
+/// Used to determine when expressions need access to loop variables.
+fn findEachBodyRanges(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !std.ArrayList(EachBodyRange) {
+    var ranges: std.ArrayList(EachBodyRange) = .empty;
+
+    // Stack of open each blocks
+    const StackEntry = struct {
+        iterable: []const u8,
+        item_binding: []const u8,
+        index_binding: ?[]const u8,
+        body_start: u32,
+    };
+    var stack: std.ArrayList(StackEntry) = .empty;
+    defer stack.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < source.len) {
+        // Skip template literals
+        if (source[i] == '`') {
+            i = skipStringLiteral(source, i);
+            continue;
+        }
+
+        // Skip HTML comments
+        if (i + 4 <= source.len and std.mem.eql(u8, source[i .. i + 4], "<!--")) {
+            const comment_end = std.mem.indexOf(u8, source[i + 4 ..], "-->") orelse {
+                i = source.len;
+                continue;
+            };
+            i += 4 + comment_end + 3;
+            continue;
+        }
+
+        // Check for {#each
+        if (i + 6 < source.len and std.mem.eql(u8, source[i .. i + 6], "{#each")) {
+            // Find closing brace
+            var j = i + 6;
+            var brace_depth: u32 = 1;
+            while (j < source.len and brace_depth > 0) {
+                const c = source[j];
+                if (c == '"' or c == '\'' or c == '`') {
+                    j = skipStringLiteral(source, j);
+                    continue;
+                }
+                if (c == '{') brace_depth += 1;
+                if (c == '}') brace_depth -= 1;
+                if (brace_depth > 0) j += 1;
+            }
+            const tag_end = j + 1;
+
+            // Parse the each block to get bindings
+            if (extractEachBindings(source, @intCast(i), @intCast(tag_end))) |binding| {
+                try stack.append(allocator, .{
+                    .iterable = binding.iterable,
+                    .item_binding = binding.item_binding,
+                    .index_binding = binding.index_binding,
+                    .body_start = @intCast(tag_end),
+                });
+            }
+
+            i = tag_end;
+            continue;
+        }
+
+        // Check for {:else} within each - this ends the main body
+        // but we still track the whole block until {/each}
+        if (i + 6 < source.len and std.mem.eql(u8, source[i .. i + 6], "{:else")) {
+            // Find closing brace
+            var j = i + 6;
+            var brace_depth: u32 = 1;
+            while (j < source.len and brace_depth > 0) {
+                const c = source[j];
+                if (c == '"' or c == '\'' or c == '`') {
+                    j = skipStringLiteral(source, j);
+                    continue;
+                }
+                if (c == '{') brace_depth += 1;
+                if (c == '}') brace_depth -= 1;
+                if (brace_depth > 0) j += 1;
+            }
+            const tag_end = j + 1;
+
+            // Check if this is an {:else} for an {#each} (vs {#if})
+            // by looking at what follows - {:else} for each is just {:else}
+            // while {:else if ...} is for {#if}
+            const after_else = source[i + 6 .. j];
+            const trimmed = std.mem.trim(u8, after_else, " \t\n\r");
+            if (trimmed.len == 0 and stack.items.len > 0) {
+                // Plain {:else} - close the current each body but keep on stack
+                // until we see {/each}
+                const entry = stack.pop().?;
+                try ranges.append(allocator, .{
+                    .iterable = entry.iterable,
+                    .item_binding = entry.item_binding,
+                    .index_binding = entry.index_binding,
+                    .body_start = entry.body_start,
+                    .body_end = @intCast(i),
+                });
+                // Don't push back - the {:else} body doesn't have the bindings
+            }
+
+            i = tag_end;
+            continue;
+        }
+
+        // Check for {/each}
+        if (i + 7 <= source.len and std.mem.eql(u8, source[i .. i + 7], "{/each}")) {
+            if (stack.pop()) |entry| {
+                try ranges.append(allocator, .{
+                    .iterable = entry.iterable,
+                    .item_binding = entry.item_binding,
+                    .index_binding = entry.index_binding,
+                    .body_start = entry.body_start,
+                    .body_end = @intCast(i),
+                });
+            }
+            i += 7;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    return ranges;
+}
+
+/// Finds all EachBodyRanges that contain a given position, from outermost to innermost.
+fn findAllEnclosingEachRanges(
+    allocator: std.mem.Allocator,
+    pos: u32,
+    each_ranges: []const EachBodyRange,
+) !std.ArrayList(EachBodyRange) {
+    var result: std.ArrayList(EachBodyRange) = .empty;
+
+    for (each_ranges) |range| {
+        if (pos >= range.body_start and pos < range.body_end) {
+            try result.append(allocator, range);
+        }
+    }
+
+    // Sort by body_start (ascending) to get outermost first
+    std.mem.sort(EachBodyRange, result.items, {}, struct {
+        fn lessThan(_: void, a: EachBodyRange, b: EachBodyRange) bool {
+            return a.body_start < b.body_start;
+        }
+    }.lessThan);
+
+    return result;
+}
+
+/// Emits the {#each} binding declarations for enclosing each blocks.
+/// Returns the number of bindings emitted (for closing braces later).
+fn emitEachBindingOpeners(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    each_ranges: []const EachBodyRange,
+    is_typescript: bool,
+) !u32 {
+    var count: u32 = 0;
+    for (each_ranges) |range| {
+        // Emit: let item = __svelte_ensureArray(iterable)[0];
+        try output.appendSlice(allocator, " let ");
+        try output.appendSlice(allocator, range.item_binding);
+        if (is_typescript) {
+            // Type annotation to help with destructuring patterns
+            try output.appendSlice(allocator, " = __svelte_ensureArray(");
+        } else {
+            try output.appendSlice(allocator, " = __svelte_ensureArray(");
+        }
+        try output.appendSlice(allocator, range.iterable);
+        try output.appendSlice(allocator, ")[0];");
+
+        // Emit index binding if present
+        if (range.index_binding) |idx| {
+            try output.appendSlice(allocator, " let ");
+            try output.appendSlice(allocator, idx);
+            try output.appendSlice(allocator, " = 0;");
+        }
+
+        count += 1;
+    }
+    return count;
+}
+
+/// Emits if conditions and each bindings interleaved by their body_start.
+/// This ensures proper scoping when {#each} and {#if} are nested.
+/// For example: {#each items as item}{#if item.foo}...
+/// Must emit: let item = ...; if ((item.foo)) { ... }
+/// Returns the number of if-blocks opened (for closing braces later).
+fn emitInterleavedConditionsAndBindings(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    if_branches: []const IfBranch,
+    each_ranges: []const EachBodyRange,
+    is_typescript: bool,
+) !u32 {
+    // Union type to track both kinds of scopes
+    const ScopeItem = union(enum) {
+        if_branch: IfBranch,
+        each_range: EachBodyRange,
+
+        fn bodyStart(self: @This()) u32 {
+            return switch (self) {
+                .if_branch => |b| b.body_start,
+                .each_range => |r| r.body_start,
+            };
+        }
+    };
+
+    // Collect all items and sort by body_start
+    var items: std.ArrayList(ScopeItem) = .empty;
+    defer items.deinit(allocator);
+
+    for (if_branches) |branch| {
+        try items.append(allocator, .{ .if_branch = branch });
+    }
+    for (each_ranges) |range| {
+        try items.append(allocator, .{ .each_range = range });
+    }
+
+    // Sort by body_start (outermost first)
+    std.mem.sort(ScopeItem, items.items, {}, struct {
+        fn lessThan(_: void, a: ScopeItem, b: ScopeItem) bool {
+            return a.bodyStart() < b.bodyStart();
+        }
+    }.lessThan);
+
+    // Emit items in order
+    var if_count: u32 = 0;
+    for (items.items) |item| {
+        switch (item) {
+            .if_branch => |branch| {
+                // Emit if condition opener
+                try output.appendSlice(allocator, "if (");
+
+                // For {:else} and {:else if} branches, negate prior conditions
+                for (branch.prior_conditions) |prior| {
+                    try output.appendSlice(allocator, "!(");
+                    try output.appendSlice(allocator, prior);
+                    try output.appendSlice(allocator, ") && ");
+                }
+
+                // Emit the condition (or true for plain {:else})
+                if (branch.condition) |cond| {
+                    try output.appendSlice(allocator, "(");
+                    try output.appendSlice(allocator, cond);
+                    try output.appendSlice(allocator, ")");
+                } else {
+                    try output.appendSlice(allocator, "true");
+                }
+                try output.appendSlice(allocator, ") {");
+                if_count += 1;
+            },
+            .each_range => |range| {
+                // Emit binding declaration (no braces needed)
+                try output.appendSlice(allocator, " let ");
+                try output.appendSlice(allocator, range.item_binding);
+                if (is_typescript) {
+                    try output.appendSlice(allocator, " = __svelte_ensureArray(");
+                } else {
+                    try output.appendSlice(allocator, " = __svelte_ensureArray(");
+                }
+                try output.appendSlice(allocator, range.iterable);
+                try output.appendSlice(allocator, ")[0];");
+
+                if (range.index_binding) |idx| {
+                    try output.appendSlice(allocator, " let ");
+                    try output.appendSlice(allocator, idx);
+                    try output.appendSlice(allocator, " = 0;");
+                }
+            },
+        }
+    }
+
+    return if_count;
 }
 
 /// Finds the IfBranch that contains a given source position.
