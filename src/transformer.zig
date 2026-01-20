@@ -5882,25 +5882,6 @@ fn findAllEnclosingIfBranches(
     return result;
 }
 
-/// Checks if a condition is a simple discriminant check that TypeScript can use for narrowing.
-/// Returns true for patterns like:
-/// - `x.type === 'value'`
-/// - `x === 'value'`
-/// - `typeof x === 'string'`
-/// Returns false for compound conditions with &&, ||, or complex expressions.
-fn isSimpleDiscriminantCheck(condition: []const u8) bool {
-    // Compound conditions don't help with narrowing when negated
-    if (std.mem.indexOf(u8, condition, "&&") != null) return false;
-    if (std.mem.indexOf(u8, condition, "||") != null) return false;
-
-    // Must contain an equality or type check
-    if (std.mem.indexOf(u8, condition, "===") != null) return true;
-    if (std.mem.indexOf(u8, condition, "!==") != null) return true;
-    if (std.mem.indexOf(u8, condition, "typeof") != null) return true;
-
-    return false;
-}
-
 /// Emits opening if conditions for a list of enclosing branches, including prior condition negations.
 /// Returns the number of if blocks opened (caller must close them with `}`).
 /// @param indent: Optional indentation prefix to add before each "if ("
@@ -5913,26 +5894,22 @@ fn emitIfConditionOpenersIndented(
     var conditions_opened: u32 = 0;
 
     for (enclosing) |branch| {
-        // For {:else} and {:else if} branches, emit negations of prior conditions
-        // Only use simple discriminant checks that TypeScript can actually narrow from
-        // Compound conditions (with && or ||) don't help with narrowing when negated
-        var has_simple_priors = false;
-        for (branch.prior_conditions) |prior_cond| {
-            if (isSimpleDiscriminantCheck(prior_cond)) {
-                has_simple_priors = true;
-                break;
-            }
-        }
+        // For {:else} and {:else if} branches, emit negations of prior conditions.
+        // All prior conditions must be emitted (not just simple ones) because even
+        // compound conditions with || help narrow types. For example, negating
+        // `!x || x === 'pending'` gives `x && x !== 'pending'`, which narrows x
+        // to exclude falsy values and the 'pending' literal - enabling `in` operator
+        // checks like `'user' in x` that require an object type.
+        const has_priors = branch.prior_conditions.len > 0;
 
-        if (has_simple_priors or branch.condition != null) {
+        if (has_priors or branch.condition != null) {
             try output.appendSlice(allocator, indent);
             try output.appendSlice(allocator, "if (");
 
             var needs_and = false;
 
-            // Emit negations of prior conditions (only simple ones that help with narrowing)
+            // Emit negations of all prior conditions
             for (branch.prior_conditions) |prior_cond| {
-                if (!isSimpleDiscriminantCheck(prior_cond)) continue;
                 if (needs_and) {
                     try output.appendSlice(allocator, " && ");
                 }
