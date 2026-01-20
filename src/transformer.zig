@@ -321,36 +321,53 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     // Emit instance script content (if any)
     // For generic components, wrap in a render function to preserve type parameter semantics
     if (instance_script) |script| {
-        if (instance_generics) |generics| {
-            // Wrap in async generic render function like svelte2tsx does.
-            // async allows await expressions to be valid TypeScript syntax.
-            // This ensures type parameters like T in $state<T>(0) trigger proper type checking.
-            try output.appendSlice(allocator, "// <script>\nasync function __render<");
-            try output.appendSlice(allocator, generics);
-            try output.appendSlice(allocator, ">() {\n");
-        } else {
-            try output.appendSlice(allocator, "// <script>\n");
-        }
-
         const raw_content = ast.source[script.content_start..script.content_end];
         const filtered = try filterSvelteImports(allocator, raw_content);
         const reactive_transformed = try transformReactiveStatements(allocator, filtered);
         const state_transformed = try transformStateWithTypeAnnotation(allocator, reactive_transformed);
         const store_transformed = try transformStoreSubscriptions(allocator, state_transformed);
-        // For generic components, strip 'export' keyword since it's invalid inside a function.
-        // The exports are already tracked in $$Exports interface.
-        const content = if (instance_generics != null)
-            try stripExportKeyword(allocator, store_transformed)
-        else
-            store_transformed;
 
-        try mappings.append(allocator, .{
-            .svelte_offset = script.content_start,
-            .ts_offset = @intCast(output.items.len),
-            .len = @intCast(raw_content.len),
-        });
+        if (instance_generics) |generics| {
+            // For generic components, imports must be at module level (not inside __render).
+            // Separate imports from other code, emit imports first, then wrap the rest.
+            const separated = try separateImports(allocator, store_transformed);
 
-        try output.appendSlice(allocator, content);
+            // Emit imports at module level
+            if (separated.imports.len > 0) {
+                try output.appendSlice(allocator, "// <script> imports (hoisted)\n");
+                try output.appendSlice(allocator, separated.imports);
+                try output.appendSlice(allocator, "\n");
+            }
+
+            // Wrap non-import code in async generic render function like svelte2tsx does.
+            // async allows await expressions to be valid TypeScript syntax.
+            // This ensures type parameters like T in $state<T>(0) trigger proper type checking.
+            try output.appendSlice(allocator, "// <script>\nasync function __render<");
+            try output.appendSlice(allocator, generics);
+            try output.appendSlice(allocator, ">() {\n");
+
+            // Strip 'export' keyword since it's invalid inside a function.
+            // The exports are already tracked in $$Exports interface.
+            const content = try stripExportKeyword(allocator, separated.other);
+
+            try mappings.append(allocator, .{
+                .svelte_offset = script.content_start,
+                .ts_offset = @intCast(output.items.len),
+                .len = @intCast(raw_content.len),
+            });
+
+            try output.appendSlice(allocator, content);
+        } else {
+            try output.appendSlice(allocator, "// <script>\n");
+
+            try mappings.append(allocator, .{
+                .svelte_offset = script.content_start,
+                .ts_offset = @intCast(output.items.len),
+                .len = @intCast(raw_content.len),
+            });
+
+            try output.appendSlice(allocator, store_transformed);
+        }
     }
 
     // Extract props from instance script FIRST (needed for bindable props void statements)
@@ -6504,6 +6521,125 @@ fn stripExportKeyword(allocator: std.mem.Allocator, content: []const u8) ![]cons
     return try result.toOwnedSlice(allocator);
 }
 
+/// Result of separating imports from other code.
+const SeparatedCode = struct {
+    imports: []const u8,
+    other: []const u8,
+};
+
+/// Separates import statements from other code.
+/// Used for generic components where imports must be at module level but other code
+/// goes inside the __render function.
+/// Handles:
+/// - `import ... from '...'` statements
+/// - `import '...'` (side-effect imports)
+/// - `import type ... from '...'` (TypeScript type imports)
+/// Multi-line imports (with { ... } spanning lines) are supported.
+fn separateImports(allocator: std.mem.Allocator, content: []const u8) !SeparatedCode {
+    var imports: std.ArrayList(u8) = .empty;
+    defer imports.deinit(allocator);
+    var other: std.ArrayList(u8) = .empty;
+    defer other.deinit(allocator);
+
+    try imports.ensureTotalCapacity(allocator, content.len / 4);
+    try other.ensureTotalCapacity(allocator, content.len);
+
+    var i: usize = 0;
+    while (i < content.len) {
+        // Skip leading whitespace on the line (but preserve it for output)
+        const line_start = i;
+        while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
+
+        // Check if this line starts with 'import'
+        if (i + 6 <= content.len and std.mem.eql(u8, content[i .. i + 6], "import")) {
+            // Verify it's actually an import keyword (not identifier like 'importFoo')
+            const after_import = if (i + 6 < content.len) content[i + 6] else 0;
+            if (after_import == ' ' or after_import == '\t' or after_import == '{' or after_import == '"' or after_import == '\'') {
+                // This is an import statement - find where it ends
+                const import_end = findImportEnd(content, i);
+
+                // Include the full import (from line_start to include leading whitespace)
+                try imports.appendSlice(allocator, content[line_start..import_end]);
+                if (import_end < content.len and content[import_end] == '\n') {
+                    try imports.append(allocator, '\n');
+                    i = import_end + 1;
+                } else {
+                    i = import_end;
+                }
+                continue;
+            }
+        }
+
+        // Not an import - copy to 'other' until end of line
+        const line_end = std.mem.indexOfScalarPos(u8, content, i, '\n') orelse content.len;
+        try other.appendSlice(allocator, content[line_start..line_end]);
+        if (line_end < content.len) {
+            try other.append(allocator, '\n');
+            i = line_end + 1;
+        } else {
+            i = line_end;
+        }
+    }
+
+    return .{
+        .imports = try imports.toOwnedSlice(allocator),
+        .other = try other.toOwnedSlice(allocator),
+    };
+}
+
+/// Finds the end of an import statement, handling multi-line imports.
+/// Returns the position after the semicolon or newline that ends the import.
+fn findImportEnd(content: []const u8, start: usize) usize {
+    var i = start;
+    var brace_depth: u32 = 0;
+    var in_string: u8 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Handle string literals
+        if (in_string != 0) {
+            if (c == '\\' and i + 1 < content.len) {
+                i += 2;
+                continue;
+            }
+            if (c == in_string) {
+                in_string = 0;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Start of string
+        if (c == '"' or c == '\'' or c == '`') {
+            in_string = c;
+            i += 1;
+            continue;
+        }
+
+        // Track braces for multi-line imports like: import { a, b, c } from '...'
+        if (c == '{') {
+            brace_depth += 1;
+        } else if (c == '}') {
+            if (brace_depth > 0) brace_depth -= 1;
+        }
+
+        // Semicolon ends the import (if not inside braces)
+        if (c == ';' and brace_depth == 0) {
+            return i + 1;
+        }
+
+        // Newline ends import only if we're not inside braces
+        if (c == '\n' and brace_depth == 0) {
+            return i;
+        }
+
+        i += 1;
+    }
+
+    return i;
+}
+
 /// Transforms Svelte store auto-subscriptions ($storeName) to __svelte_store(storeName).v.
 /// This allows tsgo to type-check store access patterns without seeing undefined variables.
 /// The .v property allows both reads and assignments (for $store = value syntax).
@@ -8517,6 +8653,54 @@ test "transform with module and instance generics" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function __render<T>()") != null);
     // Should also have the module script content
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export type ComboboxItem<T>") != null);
+}
+
+test "generic component imports hoisted to module level" {
+    // Regression test: imports in generic components must be at module level,
+    // not inside the __render function. Otherwise, tsgo reports false positive
+    // "Cannot use import statement inside a function" errors.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts" generics="T">
+        \\    import { tick } from 'svelte'
+        \\    import type { Snippet } from 'svelte'
+        \\    import * as Utils from '../utils'
+        \\
+        \\    let { items }: { items: T[] } = $props();
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Generic.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // Find positions of key markers
+    const imports_hoisted = std.mem.indexOf(u8, virtual.content, "// <script> imports (hoisted)") orelse
+        return error.TestUnexpectedResult;
+    const render_func = std.mem.indexOf(u8, virtual.content, "function __render<T>()") orelse
+        return error.TestUnexpectedResult;
+    const tick_import = std.mem.indexOf(u8, virtual.content, "import { tick }") orelse
+        return error.TestUnexpectedResult;
+    const snippet_import = std.mem.indexOf(u8, virtual.content, "import type { Snippet }") orelse
+        return error.TestUnexpectedResult;
+    const utils_import = std.mem.indexOf(u8, virtual.content, "import * as Utils") orelse
+        return error.TestUnexpectedResult;
+
+    // All imports must be BEFORE the __render function (at module level)
+    try std.testing.expect(imports_hoisted < render_func);
+    try std.testing.expect(tick_import < render_func);
+    try std.testing.expect(snippet_import < render_func);
+    try std.testing.expect(utils_import < render_func);
+
+    // The let { items } props declaration should be INSIDE __render
+    const props_decl = std.mem.indexOf(u8, virtual.content, "let { items }") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(props_decl > render_func);
 }
 
 test "transform with renamed $props has only one default export" {
