@@ -47,6 +47,29 @@ pub fn build(b: *std.Build) void {
 
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });
     test_step.dependOn(&fmt_check.step);
+
+    // dump-transform: outputs generated TypeScript for debugging
+    const dump_mod = b.createModule(.{
+        .root_source_file = b.path("src/dump_transform.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const dump_exe = b.addExecutable(.{
+        .name = "dump-transform",
+        .root_module = dump_mod,
+    });
+
+    b.installArtifact(dump_exe);
+
+    const dump_cmd = b.addRunArtifact(dump_exe);
+    dump_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        dump_cmd.addArgs(args);
+    }
+
+    const dump_step = b.step("dump", "Dump transformer output for a .svelte file");
+    dump_step.dependOn(&dump_cmd.step);
 }
 
 fn getVersion(b: *std.Build) []const u8 {
