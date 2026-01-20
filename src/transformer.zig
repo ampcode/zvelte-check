@@ -199,8 +199,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         try output.appendSlice(allocator, "import type { Component as __SvelteComponentType__, ComponentProps as __ComponentProps__ } from \"svelte\";\n");
         // Import SvelteHTMLElements for validating HTML element props
         try output.appendSlice(allocator, "import type { SvelteHTMLElements as __SvelteElements__ } from \"svelte/elements\";\n");
-        // Note: We don't auto-import Snippet - if users need it, they import it themselves.
-        // Auto-importing caused "declared but never used" errors for files that don't use Snippet types.
+        // Note: Snippet is imported later after rune stubs to make it globally available.
 
         // SvelteKit route type imports are NOT auto-generated
         // User code imports from './$types' which resolves via SvelteKit's generated types
@@ -236,6 +235,10 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             \\declare function $bindable<T>(initial?: T): T;
             \\declare function $inspect<T>(...values: T[]): { with: (fn: (type: 'init' | 'update', ...values: T[]) => void) => void };
             \\declare function $host<T extends HTMLElement>(): T;
+            \\
+            \\// Snippet type - globally available in Svelte 5 templates
+            \\// Re-exported from 'svelte' to avoid "declared but never used" with imports
+            \\import type { Snippet } from "svelte";
             \\
             \\// Svelte store auto-subscription stub
             \\// $storeName syntax in Svelte auto-subscribes to the store
@@ -7544,8 +7547,8 @@ test "transform typescript component" {
 
     // Verify key parts of the generated TypeScript
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Component as __SvelteComponentType__, ComponentProps as __ComponentProps__ }") != null);
-    // Snippet import is conditional - only added when file uses snippets
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") == null);
+    // Snippet is globally available in Svelte 5 templates
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Props") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "name: string") != null);
@@ -8470,8 +8473,8 @@ test "transform snippet with import type param" {
 
     const virtual = try transform(allocator, ast);
 
-    // We don't auto-import Snippet (users import it themselves if needed)
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") == null);
+    // Snippet is globally available in Svelte 5 templates
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") != null);
     // Snippets are hoisted as function declarations with generic parameter names
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function shortcut(_0: any, _1: any): void {}") != null);
 }
