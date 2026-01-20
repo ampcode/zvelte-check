@@ -1758,9 +1758,19 @@ fn emitTemplateExpressions(
             },
 
             .const_tag => {
-                // {@const} is a declaration, just extract identifiers for now
+                // {@const} declares a variable - emit it BEFORE expressions that use it.
+                // Extract identifiers from the RHS for noUnusedLocals checking.
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
+
+                // Emit the const declaration with narrowing (for {#if} contexts)
+                if (extractConstBinding(ast.source, node.start, node.end)) |binding| {
+                    if (!has_expressions) {
+                        try output.appendSlice(allocator, ";// Template expressions\n");
+                        has_expressions = true;
+                    }
+                    try emitNarrowedConstBinding(allocator, output, binding, node.start, if_branches);
+                }
             },
 
             .debug_tag => {
@@ -3865,31 +3875,28 @@ fn scanTemplateForEachBlocks(
             }
         }
 
-        // Special handling for {@const} - emit variable declaration with narrowing
-        // For snippet bodies, emit with `any` type to avoid referencing snippet params
-        if (std.mem.startsWith(u8, full_expr, "{@const ")) {
+        // Special handling for {@const} inside snippet bodies only.
+        // Non-snippet {@const} is handled by emitTemplateExpressions via AST nodes.
+        // For snippet bodies, we need to emit here with `any` type since we skip
+        // snippet body nodes in emitTemplateExpressions.
+        if (std.mem.startsWith(u8, full_expr, "{@const ") and isInsideSnippetBody(svelte_offset, snippet_body_ranges)) {
             if (extractConstBinding(template, @intCast(expr_start), @intCast(j))) |binding| {
                 if (!has_expressions.*) {
                     try output.appendSlice(allocator, ";// Template expressions\n");
                     has_expressions.* = true;
                 }
-                if (isInsideSnippetBody(svelte_offset, snippet_body_ranges)) {
-                    // Use any type to avoid referencing snippet params.
-                    // Strip any existing type annotation from the name (e.g., "x: number" -> "x")
-                    const name_without_type = if (std.mem.indexOf(u8, binding.name, ":")) |colon_pos|
-                        std.mem.trim(u8, binding.name[0..colon_pos], " \t\n\r")
-                    else
-                        binding.name;
-                    try output.appendSlice(allocator, "var ");
-                    try output.appendSlice(allocator, name_without_type);
-                    if (is_typescript) {
-                        try output.appendSlice(allocator, ": any;\n");
-                    } else {
-                        try output.appendSlice(allocator, ";\n");
-                    }
+                // Use any type to avoid referencing snippet params.
+                // Strip any existing type annotation from the name (e.g., "x: number" -> "x")
+                const name_without_type = if (std.mem.indexOf(u8, binding.name, ":")) |colon_pos|
+                    std.mem.trim(u8, binding.name[0..colon_pos], " \t\n\r")
+                else
+                    binding.name;
+                try output.appendSlice(allocator, "var ");
+                try output.appendSlice(allocator, name_without_type);
+                if (is_typescript) {
+                    try output.appendSlice(allocator, ": any;\n");
                 } else {
-                    // Emit with narrowing so {@const} inside {#if} respects type narrowing
-                    try emitNarrowedConstBinding(allocator, output, binding, svelte_offset, if_branches);
+                    try output.appendSlice(allocator, ";\n");
                 }
             }
         }
@@ -10065,4 +10072,41 @@ test "snippet body expressions with apostrophes in text content" {
 
     // Should have the wrapper function with isOpen in scope
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "(({ open: isOpen })") != null);
+}
+
+test "@const declarations emitted before usages in each blocks" {
+    // Regression test: {@const} declarations inside {#each} blocks should be
+    // emitted BEFORE template expressions that use them. Otherwise TypeScript
+    // reports "Cannot find name" errors because the variable is used before declaration.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\let items = [{ name: 'a' }];
+        \\</script>
+        \\
+        \\{#each items as item}
+        \\  {@const name = item.name}
+        \\  <div>{name}</div>
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // The const declaration MUST appear before its usage
+    const const_decl = "var name = item.name;";
+    const void_usage = "void (name);";
+
+    const decl_pos = std.mem.indexOf(u8, virtual.content, const_decl);
+    const usage_pos = std.mem.indexOf(u8, virtual.content, void_usage);
+
+    try std.testing.expect(decl_pos != null);
+    try std.testing.expect(usage_pos != null);
+    // Declaration must come before usage
+    try std.testing.expect(decl_pos.? < usage_pos.?);
 }
