@@ -5803,6 +5803,11 @@ fn emitInterleavedConditionsAndBindings(
                 }
                 try output.appendSlice(allocator, range.iterable);
                 try output.appendSlice(allocator, ")[0];");
+                // Mark binding as used to suppress "unused variable" warnings.
+                // For destructuring patterns like [a, b], this silences the warning.
+                try output.appendSlice(allocator, " void ");
+                try output.appendSlice(allocator, range.item_binding);
+                try output.appendSlice(allocator, ";");
 
                 if (range.index_binding) |idx| {
                     try output.appendSlice(allocator, " let ");
