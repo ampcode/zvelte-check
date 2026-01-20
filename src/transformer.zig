@@ -472,22 +472,34 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
                         try output.appendSlice(allocator, "// Hoisted snippet declarations\n");
                         emitted_snippet_header = true;
                     }
-                    // Emit as function declaration to validate parameter counts at call sites.
-                    // Format: function name(p0: any, p1: any, ...): void {}
-                    // We use generic parameter names with `any` type to avoid referencing
-                    // types that may not be imported yet (hoisting happens before imports).
-                    try output.appendSlice(allocator, "function ");
-                    try output.appendSlice(allocator, info.name);
-                    try output.appendSlice(allocator, "(");
-                    // Emit parameters with any type (count-only, no original type info)
-                    if (info.params) |params| {
-                        try emitAnyTypedParams(allocator, &output, params, is_typescript);
-                    }
-                    try output.appendSlice(allocator, ")");
+                    // Emit as Snippet-typed variable declaration.
+                    // Format: var name: Snippet<[any, ...]> = (..._: any[]) => ({} as any);
+                    // This ensures snippets are assignable to Snippet<[T]> props when passed around.
+                    // We use `any` parameter types to avoid referencing types not yet imported.
                     if (is_typescript) {
-                        try output.appendSlice(allocator, ": void");
+                        try output.appendSlice(allocator, "var ");
+                        try output.appendSlice(allocator, info.name);
+                        try output.appendSlice(allocator, ": Snippet<[");
+                        // Count parameters and emit [any, any, ...] tuple
+                        if (info.params) |params| {
+                            const param_count = countSnippetParams(params);
+                            var param_idx: usize = 0;
+                            while (param_idx < param_count) : (param_idx += 1) {
+                                if (param_idx > 0) try output.appendSlice(allocator, ", ");
+                                try output.appendSlice(allocator, "any");
+                            }
+                        }
+                        try output.appendSlice(allocator, "]> = (..._: any[]) => ({} as any);\n");
+                    } else {
+                        // JavaScript: emit plain function for arity checking
+                        try output.appendSlice(allocator, "function ");
+                        try output.appendSlice(allocator, info.name);
+                        try output.appendSlice(allocator, "(");
+                        if (info.params) |params| {
+                            try emitAnyTypedParams(allocator, &output, params, false);
+                        }
+                        try output.appendSlice(allocator, ") {}\n");
                     }
-                    try output.appendSlice(allocator, " {}\n");
                 }
             }
         }
@@ -6471,13 +6483,15 @@ fn parseParams(params: []const u8, list: *std.ArrayList(ParamInfo), allocator: s
 
 /// Counts the number of parameters in a params string.
 /// Handles destructuring patterns and type annotations.
+/// Also used by snippet hoisting to count params for Snippet<[...]> type.
+const countSnippetParams = countParams;
 fn countParams(params: []const u8) usize {
     if (params.len == 0) return 0;
 
     var count: usize = 0;
     var i: usize = 0;
     var depth: u32 = 0;
-    var in_type: bool = false;
+    var in_param: bool = false;
 
     while (i < params.len) {
         const c = params[i];
@@ -6494,24 +6508,19 @@ fn countParams(params: []const u8) usize {
             continue;
         }
 
-        // ':' at depth 0 starts a type annotation
-        if (c == ':' and depth == 0) {
-            in_type = true;
-            i += 1;
-            continue;
-        }
+        if (depth == 0) {
+            // ',' at depth 0 separates parameters
+            if (c == ',') {
+                in_param = false;
+                i += 1;
+                continue;
+            }
 
-        // ',' at depth 0 separates parameters
-        if (c == ',' and depth == 0) {
-            count += 1;
-            in_type = false;
-            i += 1;
-            continue;
-        }
-
-        // First non-whitespace at depth 0 (not in type) starts a parameter
-        if (depth == 0 and !in_type and !std.ascii.isWhitespace(c) and count == 0) {
-            count = 1;
+            // Non-whitespace starts a new parameter
+            if (!std.ascii.isWhitespace(c) and !in_param) {
+                count += 1;
+                in_param = true;
+            }
         }
 
         i += 1;
@@ -8994,9 +9003,8 @@ test "transform snippet with params" {
 
     const virtual = try transform(allocator, ast);
 
-    // Snippets are hoisted as function declarations with generic parameter names
-    // This allows call sites to validate argument counts without importing types
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function greeting(_0: any, _1: any): void {}") != null);
+    // Snippets are hoisted as Snippet-typed variables for assignability to Snippet props
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var greeting: Snippet<[any, any]>") != null);
 }
 
 test "transform snippet with import type param" {
@@ -9020,8 +9028,8 @@ test "transform snippet with import type param" {
 
     // Snippet is globally available in Svelte 5 templates
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") != null);
-    // Snippets are hoisted as function declarations with generic parameter names
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function shortcut(_0: any, _1: any): void {}") != null);
+    // Snippets are hoisted as Snippet-typed variables
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var shortcut: Snippet<[any, any]>") != null);
 }
 
 test "transform const binding" {
@@ -9071,8 +9079,8 @@ test "debug Svelte5EdgeCases optional param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Snippets are hoisted with optional params preserved (note `?:` for optional)
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function optionalParam(_0?: any): void {}") != null);
+    // Snippets are hoisted as Snippet-typed variables (1 param)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var optionalParam: Snippet<[any]>") != null);
 }
 
 test "snippet with object destructuring param" {
@@ -9098,8 +9106,8 @@ test "snippet with object destructuring param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Snippets with destructuring params count the parameter (not individual fields)
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function child(_0: any): void {}") != null);
+    // Snippets are typed as Snippet<[...]> for compatibility when passed to other snippets
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var child: Snippet<[any]>") != null);
 }
 
 test "snippet param optionality - default values and trailing commas" {
@@ -9144,17 +9152,18 @@ test "snippet param optionality - default values and trailing commas" {
 
     const virtual = try transform(allocator, ast);
 
-    // Trailing comma: 3 required params, not 4
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function trailingComma(_0: any, _1: any, _2: any): void {}") != null);
+    // Snippets are now typed as Snippet<[any, ...]> for assignability to Snippet props.
+    // Trailing comma: 3 params, not 4
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var trailingComma: Snippet<[any, any, any]>") != null);
 
-    // Default value: 1 optional param
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function withDefault(_0?: any): void {}") != null);
+    // Default value: 1 param
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var withDefault: Snippet<[any]>") != null);
 
-    // Mixed: 2 required, 2 optional
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function mixedParams(_0: any, _1: any, _2?: any, _3?: any): void {}") != null);
+    // Mixed: 4 params
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var mixedParams: Snippet<[any, any, any, any]>") != null);
 
-    // Simple default: 1 required, 1 optional
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function simpleDefault(_0: any, _1?: any): void {}") != null);
+    // Simple default: 2 params
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var simpleDefault: Snippet<[any, any]>") != null);
 }
 
 test "const tag with template literal" {
@@ -10008,13 +10017,13 @@ test "snippet name shadowing import should not emit var declaration" {
 
     const virtual = try transform(allocator, ast);
 
-    // Should NOT emit hoisted function declarations for names that shadow imports
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function filter(") == null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function map(") == null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function Default(") == null);
+    // Should NOT emit hoisted declarations for names that shadow imports
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var filter: Snippet") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var map: Snippet") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var Default: Snippet") == null);
 
-    // SHOULD emit hoisted function declaration for snippet that doesn't shadow an import
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function other(): void {}") != null);
+    // SHOULD emit hoisted Snippet declaration for snippet that doesn't shadow an import
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var other: Snippet<[]>") != null);
 
     // The imports should still be present
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import { filter, map } from 'rxjs'") != null);
@@ -10078,8 +10087,8 @@ test "component usages nested inside snippets emit void statements" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Button;") != null);
     // Popover should also be marked as used
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void Popover;") != null);
-    // Snippet is hoisted as a function declaration
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function child(_0: any): void {}") != null);
+    // Snippet is hoisted as a Snippet-typed variable
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var child: Snippet<[any]>") != null);
 }
 
 test "spread props in lowercase tags are detected" {
