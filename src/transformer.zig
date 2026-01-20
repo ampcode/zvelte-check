@@ -80,6 +80,10 @@ const IfBranch = struct {
     body_start: u32,
     /// End of this branch's body (start of {:else} or {/if})
     body_end: u32,
+    /// Prior conditions from earlier branches in the same if/else chain.
+    /// For {:else if} and {:else} branches, these conditions must have been false
+    /// for execution to reach this branch. Used for discriminated union narrowing.
+    prior_conditions: []const []const u8,
 };
 
 const ExportInfo = struct {
@@ -2099,15 +2103,7 @@ fn emitTemplateExpressions(
             var enclosing = try findAllEnclosingIfBranches(allocator, node.start, if_branches);
             defer enclosing.deinit(allocator);
 
-            var conditions_opened: u32 = 0;
-            for (enclosing.items) |branch| {
-                if (branch.condition) |cond| {
-                    try output.appendSlice(allocator, "if (");
-                    try output.appendSlice(allocator, cond);
-                    try output.appendSlice(allocator, ") { ");
-                    conditions_opened += 1;
-                }
-            }
+            const conditions_opened = try emitIfConditionOpeners(allocator, output, enclosing.items);
 
             // Emit: void ({ attr1: value1 } satisfies Partial<__SvelteElements__['tag']>);
             // Use 'satisfies' to check attribute types without declaring variables
@@ -2255,19 +2251,17 @@ fn emitTemplateExpressions(
             var enclosing = try findAllEnclosingIfBranches(allocator, node.start, if_branches);
             defer enclosing.deinit(allocator);
 
-            var conditions_opened: u32 = 0;
+            // Filter out branches inside snippet bodies
+            var filtered: std.ArrayList(IfBranch) = .empty;
+            defer filtered.deinit(allocator);
             for (enclosing.items) |branch| {
-                if (branch.condition) |cond| {
-                    // Skip this if-branch if it's inside a snippet body
-                    const branch_inside_snippet = isInsideSnippetBody(branch.body_start, snippet_body_ranges);
-                    if (branch_inside_snippet) continue;
-
-                    try output.appendSlice(allocator, "if (");
-                    try output.appendSlice(allocator, cond);
-                    try output.appendSlice(allocator, ") { ");
-                    conditions_opened += 1;
+                const branch_inside_snippet = isInsideSnippetBody(branch.body_start, snippet_body_ranges);
+                if (!branch_inside_snippet) {
+                    try filtered.append(allocator, branch);
                 }
             }
+
+            const conditions_opened = try emitIfConditionOpeners(allocator, output, filtered.items);
 
             // Emit: ((_: __ComponentProps__<typeof ComponentName>) => {})({ prop1: value1, ... });
             // This validates props without actually calling the component
@@ -5134,16 +5128,27 @@ fn findIfBranches(
 ) !std.ArrayList(IfBranch) {
     var branches: std.ArrayList(IfBranch) = .empty;
 
-    // Stack of open if blocks: each entry is (condition, body_start_after_tag, is_first_branch)
-    // When we see {:else} or {:else if}, we close the current branch and open a new one.
-    // When we see {/if}, we close the current branch.
+    // Stack of open if-chains. Each chain tracks:
+    // - The current branch's condition and body_start
+    // - All prior conditions from this chain (for discriminated union narrowing)
     const StackEntry = struct {
         condition: ?[]const u8,
         body_start: u32,
         is_else: bool,
+        // All conditions that must be false for this branch to execute
+        prior_conditions: std.ArrayList([]const u8),
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            self.prior_conditions.deinit(alloc);
+        }
     };
     var stack: std.ArrayList(StackEntry) = .empty;
-    defer stack.deinit(allocator);
+    defer {
+        for (stack.items) |*entry| {
+            entry.deinit(allocator);
+        }
+        stack.deinit(allocator);
+    }
 
     var i: usize = 0;
     while (i < source.len) {
@@ -5196,10 +5201,12 @@ fn findIfBranches(
             }
             const condition = if (cond_start < cond_end) source[cond_start..cond_end] else null;
 
+            // New {#if} starts a fresh chain with no prior conditions
             try stack.append(allocator, .{
                 .condition = condition,
                 .body_start = @intCast(tag_end),
                 .is_else = false,
+                .prior_conditions = .empty,
             });
 
             i = tag_end;
@@ -5229,17 +5236,29 @@ fn findIfBranches(
             }
             const tag_end = j + 1;
 
-            // Close the current branch
-            const prev = stack.pop() orelse {
+            // Pop the current branch from the stack
+            var prev = stack.pop() orelse {
                 i = tag_end;
                 continue;
             };
+
+            // Record the completed branch with its prior conditions
             try branches.append(allocator, .{
                 .condition = prev.condition,
                 .is_else = prev.is_else,
                 .body_start = prev.body_start,
                 .body_end = @intCast(tag_start),
+                .prior_conditions = try allocator.dupe([]const u8, prev.prior_conditions.items),
             });
+
+            // Build prior conditions for the next branch:
+            // Include all prior conditions from the completed branch, plus its own condition
+            var new_prior_conditions: std.ArrayList([]const u8) = .empty;
+            try new_prior_conditions.appendSlice(allocator, prev.prior_conditions.items);
+            if (prev.condition) |cond| {
+                try new_prior_conditions.append(allocator, cond);
+            }
+            prev.deinit(allocator);
 
             // Check if it's {:else if ...} or just {:else}
             const after_else = source[i + 6 .. j];
@@ -5251,7 +5270,8 @@ fn findIfBranches(
                 try stack.append(allocator, .{
                     .condition = if (cond_text.len > 0) cond_text else null,
                     .body_start = @intCast(tag_end),
-                    .is_else = true, // In an else branch, even with a condition
+                    .is_else = true,
+                    .prior_conditions = new_prior_conditions,
                 });
             } else {
                 // {:else}
@@ -5259,6 +5279,7 @@ fn findIfBranches(
                     .condition = null,
                     .body_start = @intCast(tag_end),
                     .is_else = true,
+                    .prior_conditions = new_prior_conditions,
                 });
             }
 
@@ -5268,13 +5289,16 @@ fn findIfBranches(
 
         // Check for {/if}
         if (i + 5 <= source.len and std.mem.eql(u8, source[i .. i + 5], "{/if}")) {
-            if (stack.pop()) |prev| {
+            if (stack.pop()) |prev_const| {
+                var prev = prev_const;
                 try branches.append(allocator, .{
                     .condition = prev.condition,
                     .is_else = prev.is_else,
                     .body_start = prev.body_start,
                     .body_end = @intCast(i),
+                    .prior_conditions = try allocator.dupe([]const u8, prev.prior_conditions.items),
                 });
+                prev.deinit(allocator);
             }
             i += 5;
             continue;
@@ -5334,10 +5358,98 @@ fn findAllEnclosingIfBranches(
     return result;
 }
 
+/// Checks if a condition is a simple discriminant check that TypeScript can use for narrowing.
+/// Returns true for patterns like:
+/// - `x.type === 'value'`
+/// - `x === 'value'`
+/// - `typeof x === 'string'`
+/// Returns false for compound conditions with &&, ||, or complex expressions.
+fn isSimpleDiscriminantCheck(condition: []const u8) bool {
+    // Compound conditions don't help with narrowing when negated
+    if (std.mem.indexOf(u8, condition, "&&") != null) return false;
+    if (std.mem.indexOf(u8, condition, "||") != null) return false;
+
+    // Must contain an equality or type check
+    if (std.mem.indexOf(u8, condition, "===") != null) return true;
+    if (std.mem.indexOf(u8, condition, "!==") != null) return true;
+    if (std.mem.indexOf(u8, condition, "typeof") != null) return true;
+
+    return false;
+}
+
+/// Emits opening if conditions for a list of enclosing branches, including prior condition negations.
+/// Returns the number of if blocks opened (caller must close them with `}`).
+/// @param indent: Optional indentation prefix to add before each "if ("
+fn emitIfConditionOpenersIndented(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    enclosing: []const IfBranch,
+    indent: []const u8,
+) !u32 {
+    var conditions_opened: u32 = 0;
+
+    for (enclosing) |branch| {
+        // For {:else} and {:else if} branches, emit negations of prior conditions
+        // Only use simple discriminant checks that TypeScript can actually narrow from
+        // Compound conditions (with && or ||) don't help with narrowing when negated
+        var has_simple_priors = false;
+        for (branch.prior_conditions) |prior_cond| {
+            if (isSimpleDiscriminantCheck(prior_cond)) {
+                has_simple_priors = true;
+                break;
+            }
+        }
+
+        if (has_simple_priors or branch.condition != null) {
+            try output.appendSlice(allocator, indent);
+            try output.appendSlice(allocator, "if (");
+
+            var needs_and = false;
+
+            // Emit negations of prior conditions (only simple ones that help with narrowing)
+            for (branch.prior_conditions) |prior_cond| {
+                if (!isSimpleDiscriminantCheck(prior_cond)) continue;
+                if (needs_and) {
+                    try output.appendSlice(allocator, " && ");
+                }
+                try output.appendSlice(allocator, "!(");
+                try output.appendSlice(allocator, prior_cond);
+                try output.appendSlice(allocator, ")");
+                needs_and = true;
+            }
+
+            // Emit current condition if present
+            if (branch.condition) |cond| {
+                if (needs_and) {
+                    try output.appendSlice(allocator, " && ");
+                }
+                try output.appendSlice(allocator, "(");
+                try output.appendSlice(allocator, cond);
+                try output.appendSlice(allocator, ")");
+            }
+
+            try output.appendSlice(allocator, ") { ");
+            conditions_opened += 1;
+        }
+    }
+
+    return conditions_opened;
+}
+
+/// Emits opening if conditions for a list of enclosing branches, including prior condition negations.
+/// Returns the number of if blocks opened (caller must close them with `}`).
+fn emitIfConditionOpeners(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    enclosing: []const IfBranch,
+) !u32 {
+    return emitIfConditionOpenersIndented(allocator, output, enclosing, "");
+}
+
 /// Emits an expression wrapped in the appropriate if conditions for type narrowing.
 /// For expressions inside {#if condition} blocks, wraps in `if (condition) { void (expr); }`
-/// For expressions inside {:else} blocks without conditions, doesn't add narrowing.
-/// For expressions inside {:else if condition} blocks, wraps in `if (condition) { void (expr); }`
+/// For expressions inside {:else} branches, also emits negations of prior conditions.
+/// For expressions inside {:else if condition} blocks, emits `if (!prior1 && !prior2 && cond) { ... }`
 fn emitNarrowedExpression(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
@@ -5356,22 +5468,8 @@ fn emitNarrowedExpression(
         has_expressions.* = true;
     }
 
-    // Count how many if conditions we need to open
-    var conditions_opened: u32 = 0;
-
-    // Emit if wrappers for each enclosing branch that has a condition
-    for (enclosing.items) |branch| {
-        if (branch.condition) |cond| {
-            // This branch has a condition - emit an if wrapper
-            try output.appendSlice(allocator, "if (");
-            try output.appendSlice(allocator, cond);
-            try output.appendSlice(allocator, ") { ");
-            conditions_opened += 1;
-        }
-        // For {:else} branches without conditions, we don't add narrowing
-        // since TypeScript's control flow analysis doesn't help without
-        // the full if/else structure
-    }
+    // Emit if wrappers for each enclosing branch
+    const conditions_opened = try emitIfConditionOpeners(allocator, output, enclosing.items);
 
     // Emit the actual expression
     try output.appendSlice(allocator, "void (");
@@ -5405,18 +5503,8 @@ fn emitNarrowedEachBindingDeclarations(
     var enclosing = try findAllEnclosingIfBranches(allocator, binding.offset, if_branches);
     defer enclosing.deinit(allocator);
 
-    // Count how many if conditions we need to open
-    var conditions_opened: u32 = 0;
-
-    // Emit if wrappers for each enclosing branch that has a condition
-    for (enclosing.items) |branch| {
-        if (branch.condition) |cond| {
-            try output.appendSlice(allocator, "if (");
-            try output.appendSlice(allocator, cond);
-            try output.appendSlice(allocator, ") {\n");
-            conditions_opened += 1;
-        }
-    }
+    // Emit if wrappers for each enclosing branch
+    const conditions_opened = try emitIfConditionOpeners(allocator, output, enclosing.items);
 
     // Emit the binding declarations (using the existing function)
     try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
@@ -5441,18 +5529,8 @@ fn emitNarrowedConstBinding(
     var enclosing = try findAllEnclosingIfBranches(allocator, svelte_offset, if_branches);
     defer enclosing.deinit(allocator);
 
-    // Count how many if conditions we need to open
-    var conditions_opened: u32 = 0;
-
-    // Emit if wrappers for each enclosing branch that has a condition
-    for (enclosing.items) |branch| {
-        if (branch.condition) |cond| {
-            try output.appendSlice(allocator, "if (");
-            try output.appendSlice(allocator, cond);
-            try output.appendSlice(allocator, ") {\n");
-            conditions_opened += 1;
-        }
-    }
+    // Emit if wrappers for each enclosing branch
+    const conditions_opened = try emitIfConditionOpeners(allocator, output, enclosing.items);
 
     // Emit the const binding
     try output.appendSlice(allocator, "var ");
@@ -5500,6 +5578,10 @@ fn emitSnippetBodyExpressions(
     const ComponentInfo = struct { data_index: u32, node_start: u32 };
     var body_components: std.ArrayList(ComponentInfo) = .empty;
     defer body_components.deinit(allocator);
+
+    // Collect each bindings inside the snippet body
+    var each_bindings: std.ArrayList(EachBindingInfo) = .empty;
+    defer each_bindings.deinit(allocator);
 
     for (ast.nodes.items) |node| {
         // Only process nodes within this snippet's body range
@@ -5569,12 +5651,18 @@ fn emitSnippetBodyExpressions(
                     .node_start = node.start,
                 });
             },
+            .each_block => {
+                // Collect each bindings for proper typing inside snippet scope
+                if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
+                    try each_bindings.append(allocator, binding);
+                }
+            },
             else => {},
         }
     }
 
-    // If there are no body expressions and no components, nothing to emit
-    if (body_exprs.items.len == 0 and body_components.items.len == 0) return;
+    // If there are no body expressions, components, or each bindings, nothing to emit
+    if (body_exprs.items.len == 0 and body_components.items.len == 0 and each_bindings.items.len == 0) return;
 
     if (!has_expressions.*) {
         try output.appendSlice(allocator, ";// Template expressions\n");
@@ -5609,34 +5697,40 @@ fn emitSnippetBodyExpressions(
         }
     }
 
+    // Emit each bindings with narrowing applied
+    // This provides proper typing for loop variables like `{#each m.content as block}`
+    for (each_bindings.items) |binding| {
+        // Find enclosing if branches for this each block (within snippet scope)
+        var inner_enclosing = try findAllEnclosingIfBranches(allocator, binding.offset, snippet_branches.items);
+        defer inner_enclosing.deinit(allocator);
+
+        // Emit outer enclosing conditions (from if branches containing the snippet)
+        const outer_opened = try emitIfConditionOpenersIndented(allocator, output, outer_enclosing.items, "");
+        // Emit inner enclosing conditions (from if branches within the snippet body)
+        const inner_opened = try emitIfConditionOpenersIndented(allocator, output, inner_enclosing.items, "");
+        const conditions_opened = outer_opened + inner_opened;
+
+        // Emit the each binding declarations
+        try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
+
+        // Close all opened if blocks
+        var j: u32 = 0;
+        while (j < conditions_opened) : (j += 1) {
+            try output.appendSlice(allocator, "}\n");
+        }
+    }
+
     // Emit each body expression with narrowing applied
     for (body_exprs.items) |expr_info| {
         // Find enclosing if branches for this expression (within snippet scope)
         var inner_enclosing = try findAllEnclosingIfBranches(allocator, expr_info.offset, snippet_branches.items);
         defer inner_enclosing.deinit(allocator);
 
-        // Count how many if conditions we need to open
-        var conditions_opened: u32 = 0;
-
-        // First emit outer enclosing conditions (from if branches containing the snippet)
-        for (outer_enclosing.items) |branch| {
-            if (branch.condition) |cond| {
-                try output.appendSlice(allocator, "  if (");
-                try output.appendSlice(allocator, cond);
-                try output.appendSlice(allocator, ") { ");
-                conditions_opened += 1;
-            }
-        }
-
-        // Then emit inner enclosing conditions (from if branches within the snippet body)
-        for (inner_enclosing.items) |branch| {
-            if (branch.condition) |cond| {
-                try output.appendSlice(allocator, "  if (");
-                try output.appendSlice(allocator, cond);
-                try output.appendSlice(allocator, ") { ");
-                conditions_opened += 1;
-            }
-        }
+        // Emit outer enclosing conditions (from if branches containing the snippet)
+        const outer_opened = try emitIfConditionOpenersIndented(allocator, output, outer_enclosing.items, "  ");
+        // Emit inner enclosing conditions (from if branches within the snippet body)
+        const inner_opened = try emitIfConditionOpenersIndented(allocator, output, inner_enclosing.items, "  ");
+        const conditions_opened = outer_opened + inner_opened;
 
         // Emit the actual expression
         try output.appendSlice(allocator, "void (");
@@ -5670,27 +5764,11 @@ fn emitSnippetBodyExpressions(
             var inner_enclosing = try findAllEnclosingIfBranches(allocator, comp_info.node_start, snippet_branches.items);
             defer inner_enclosing.deinit(allocator);
 
-            var conditions_opened: u32 = 0;
-
-            // First emit outer enclosing conditions (from if branches containing the snippet)
-            for (outer_enclosing.items) |branch| {
-                if (branch.condition) |cond| {
-                    try output.appendSlice(allocator, "  if (");
-                    try output.appendSlice(allocator, cond);
-                    try output.appendSlice(allocator, ") { ");
-                    conditions_opened += 1;
-                }
-            }
-
-            // Then emit inner enclosing conditions (from if branches within the snippet body)
-            for (inner_enclosing.items) |branch| {
-                if (branch.condition) |cond| {
-                    try output.appendSlice(allocator, "  if (");
-                    try output.appendSlice(allocator, cond);
-                    try output.appendSlice(allocator, ") { ");
-                    conditions_opened += 1;
-                }
-            }
+            // Emit outer enclosing conditions (from if branches containing the snippet)
+            const outer_opened = try emitIfConditionOpenersIndented(allocator, output, outer_enclosing.items, "  ");
+            // Emit inner enclosing conditions (from if branches within the snippet body)
+            const inner_opened = try emitIfConditionOpenersIndented(allocator, output, inner_enclosing.items, "  ");
+            const conditions_opened = outer_opened + inner_opened;
 
             // Emit component props validation
             try emitComponentPropsValidation(
@@ -5734,88 +5812,21 @@ fn emitSnippetBodyExpressions(
     try output.appendSlice(allocator, ");\n");
 }
 
-/// Emits snippet parameter declarations with their original names.
-/// Used for snippet body wrapper functions where we need names, not just counts.
+/// Emits snippet parameter declarations with their original names and types.
+/// Used for snippet body wrapper functions where we need proper types for narrowing.
+/// Preserves type annotations to enable discriminated union narrowing inside snippet bodies.
 fn emitSnippetParamsWithNames(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
     params: []const u8,
     is_typescript: bool,
 ) !void {
-    var i: usize = 0;
-    var param_idx: usize = 0;
-
-    while (i < params.len) {
-        // Skip whitespace
-        while (i < params.len and std.ascii.isWhitespace(params[i])) : (i += 1) {}
-        if (i >= params.len) break;
-
-        // Handle destructuring patterns: { a, b } or [a, b]
-        if (params[i] == '{' or params[i] == '[') {
-            const open_char = params[i];
-            const close_char: u8 = if (open_char == '{') '}' else ']';
-            const pattern_start = i;
-            i += 1;
-            var depth: u32 = 1;
-            while (i < params.len and depth > 0) {
-                if (params[i] == open_char) depth += 1;
-                if (params[i] == close_char) depth -= 1;
-                i += 1;
-            }
-            const pattern_end = i;
-
-            if (param_idx > 0) try output.appendSlice(allocator, ", ");
-            try output.appendSlice(allocator, params[pattern_start..pattern_end]);
-
-            // Skip type annotation
-            while (i < params.len and params[i] != ',') {
-                if (params[i] == '<') {
-                    var angle_depth: u32 = 1;
-                    i += 1;
-                    while (i < params.len and angle_depth > 0) {
-                        if (params[i] == '<') angle_depth += 1;
-                        if (params[i] == '>') angle_depth -= 1;
-                        i += 1;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            if (i < params.len and params[i] == ',') i += 1;
-            param_idx += 1;
-            continue;
-        }
-
-        // Simple parameter: name or name: type
-        if (isIdentStartChar(params[i])) {
-            const name_start = i;
-            while (i < params.len and isIdentChar(params[i])) : (i += 1) {}
-            const name = params[name_start..i];
-
-            if (param_idx > 0) try output.appendSlice(allocator, ", ");
-            try output.appendSlice(allocator, name);
-            if (is_typescript) {
-                try output.appendSlice(allocator, ": any");
-            }
-            param_idx += 1;
-        }
-
-        // Skip to next parameter (past : type annotation and , separator)
-        while (i < params.len and params[i] != ',') {
-            if (params[i] == '<') {
-                var depth: u32 = 1;
-                i += 1;
-                while (i < params.len and depth > 0) {
-                    if (params[i] == '<') depth += 1;
-                    if (params[i] == '>') depth -= 1;
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-        }
-        if (i < params.len and params[i] == ',') i += 1;
-    }
+    _ = is_typescript;
+    // Emit the entire params string as-is to preserve type annotations.
+    // This enables TypeScript to properly narrow types inside snippet bodies.
+    // Example: "(m: ThreadAssistantMessage, messageIndex: number)" preserves
+    // the ThreadAssistantMessage type which allows m.content narrowing.
+    try output.appendSlice(allocator, params);
 }
 
 /// Emits parameter declarations with `any` type for hoisted snippet functions.
