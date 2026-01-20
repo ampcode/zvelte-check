@@ -110,6 +110,10 @@ const NarrowingContext = struct {
     enclosing_branches: std.ArrayList(IfBranch),
     /// Number of if-blocks currently open (matches enclosing_branches.items.len when open).
     conditions_opened: u32,
+    /// Minimum depth that must remain open due to variable declarations.
+    /// When {#each} or {@const} bindings are emitted inside an if-block, we can't close
+    /// below this depth or the variables go out of scope.
+    min_binding_depth: u32,
     /// True if template expressions header has been emitted.
     has_expressions: bool,
     /// The allocator for managing enclosing_branches.
@@ -119,6 +123,7 @@ const NarrowingContext = struct {
         return .{
             .enclosing_branches = .empty,
             .conditions_opened = 0,
+            .min_binding_depth = 0,
             .has_expressions = false,
             .allocator = allocator,
         };
@@ -144,24 +149,47 @@ const NarrowingContext = struct {
     }
 
     /// Close the currently open if-block (if any).
+    /// Respects min_binding_depth to avoid closing scopes with variable declarations.
     fn close(self: *NarrowingContext, output: *std.ArrayList(u8)) !void {
+        // Only close down to min_binding_depth, not all the way
+        const closeable = if (self.conditions_opened > self.min_binding_depth)
+            self.conditions_opened - self.min_binding_depth
+        else
+            0;
+        var j: u32 = 0;
+        while (j < closeable) : (j += 1) {
+            try output.appendSlice(self.allocator, "}\n");
+        }
+        self.conditions_opened = self.min_binding_depth;
+        self.enclosing_branches.shrinkRetainingCapacity(self.min_binding_depth);
+    }
+
+    /// Force close all open if-blocks, ignoring min_binding_depth.
+    /// Use at the end of a scope (function/IIFE) when all braces must be balanced.
+    fn forceCloseAll(self: *NarrowingContext, output: *std.ArrayList(u8)) !void {
         var j: u32 = 0;
         while (j < self.conditions_opened) : (j += 1) {
             try output.appendSlice(self.allocator, "}\n");
         }
         self.conditions_opened = 0;
+        self.min_binding_depth = 0;
         self.enclosing_branches.clearRetainingCapacity();
     }
 
     /// Close some inner if-blocks, keeping the outer ones open.
+    /// Respects min_binding_depth to avoid closing scopes with variable declarations.
     fn closeInner(self: *NarrowingContext, output: *std.ArrayList(u8), keep_count: usize) !void {
-        const to_close = self.conditions_opened - @as(u32, @intCast(keep_count));
+        // Never close below min_binding_depth
+        const actual_keep = @max(keep_count, self.min_binding_depth);
+        if (actual_keep >= self.conditions_opened) return;
+
+        const to_close = self.conditions_opened - @as(u32, @intCast(actual_keep));
         var j: u32 = 0;
         while (j < to_close) : (j += 1) {
             try output.appendSlice(self.allocator, "}\n");
         }
-        self.conditions_opened = @intCast(keep_count);
-        self.enclosing_branches.shrinkRetainingCapacity(keep_count);
+        self.conditions_opened = @intCast(actual_keep);
+        self.enclosing_branches.shrinkRetainingCapacity(actual_keep);
     }
 
     /// Ensure the if-block for the given branches is open.
@@ -185,7 +213,7 @@ const NarrowingContext = struct {
             return;
         }
 
-        // Close branches that diverge from the new context
+        // Close branches that diverge from the new context (respecting min_binding_depth)
         if (common_prefix_len < self.enclosing_branches.items.len) {
             try self.closeInner(output, common_prefix_len);
         }
@@ -196,6 +224,14 @@ const NarrowingContext = struct {
             const additional = try emitIfConditionOpeners(self.allocator, output, new_branches);
             self.conditions_opened += additional;
             try self.enclosing_branches.appendSlice(self.allocator, new_branches);
+        }
+    }
+
+    /// Record that a binding was emitted at the current depth.
+    /// This prevents closing if-blocks that contain variable declarations.
+    fn markBindingEmitted(self: *NarrowingContext) void {
+        if (self.conditions_opened > self.min_binding_depth) {
+            self.min_binding_depth = self.conditions_opened;
         }
     }
 
@@ -245,6 +281,9 @@ const NarrowingContext = struct {
 
         // Emit the binding declarations
         try emitEachBindingDeclarations(self.allocator, output, mappings, binding, binding.iterable, is_typescript);
+
+        // Mark that a binding was emitted - prevents closing this scope
+        self.markBindingEmitted();
     }
 
     /// Emit {@const} binding within the current narrowing context.
@@ -268,6 +307,9 @@ const NarrowingContext = struct {
         try output.appendSlice(self.allocator, " = ");
         try output.appendSlice(self.allocator, binding.expr);
         try output.appendSlice(self.allocator, ";\n");
+
+        // Mark that a binding was emitted - prevents closing this scope
+        self.markBindingEmitted();
     }
 };
 
@@ -2160,6 +2202,11 @@ fn emitTemplateExpressions(
             },
 
             .element, .component => {
+                // Skip elements inside snippet bodies - they're handled by emitSnippetBodyExpressions.
+                // Extracting identifiers here would add {#each} bindings like `block` to template_refs,
+                // causing invalid `void block;` at module scope where they're not defined.
+                if (isInsideSnippetBody(node.start, snippet_body_ranges)) continue;
+
                 // Extract identifiers from attribute expressions
                 const elem_data = ast.elements.items[node.data];
 
@@ -2571,8 +2618,9 @@ fn emitTemplateExpressions(
         }
     }
 
-    // Close any open narrowing context before the final sections
-    try narrowing_ctx.close(output);
+    // Force close all open narrowing contexts before the final sections.
+    // At the end of template expressions, all braces must be balanced.
+    try narrowing_ctx.forceCloseAll(output);
 
     // Fallback: scan template source directly for {#each} patterns not captured by AST
     // The parser sometimes misses {#each} blocks inside component elements
@@ -4204,10 +4252,20 @@ fn scanTemplateForEachBlocks(
             continue;
         }
 
+        // Calculate absolute offset for position checks
+        const svelte_offset: u32 = @intCast(template_start + expr_start);
+
+        // Skip expressions inside snippet bodies - they're handled by emitSnippetBodyExpressions.
+        // Extracting identifiers here would add {#each} bindings like `index` to template_refs,
+        // causing invalid `void index;` at module scope where they're not defined.
+        if (isInsideSnippetBody(svelte_offset, snippet_body_ranges)) {
+            i = j;
+            continue;
+        }
+
         // Svelte 5 attach directives: {@attach functionName(args)}
         // Extract identifiers from the expression to mark the function as "used"
         if (std.mem.startsWith(u8, full_expr, "{@attach ")) {
-            const svelte_offset: u32 = @intCast(template_start + expr_start);
             try extractIdentifiersFromExpr(allocator, full_expr, svelte_offset, template_refs);
             i = j;
             continue;
@@ -4215,7 +4273,6 @@ fn scanTemplateForEachBlocks(
 
         // Extract identifiers from the expression
         // template_start + expr_start gives the absolute Svelte source offset
-        const svelte_offset: u32 = @intCast(template_start + expr_start);
         try extractIdentifiersFromExpr(allocator, full_expr, svelte_offset, template_refs);
 
         // Special handling for {#each} - emit binding declarations with narrowing
@@ -4281,7 +4338,7 @@ fn scanTemplateForEachBlocks(
     }
 
     // Scan for component tags (capitalized tag names)
-    try scanTemplateForComponents(allocator, template, @intCast(template_start), template_refs);
+    try scanTemplateForComponents(allocator, template, @intCast(template_start), template_refs, snippet_body_ranges);
 }
 
 /// Scans template source for component usages (capitalized tag names) and
@@ -4292,6 +4349,7 @@ fn scanTemplateForComponents(
     template: []const u8,
     template_start_offset: u32,
     refs: *std.StringHashMapUnmanaged(u32),
+    snippet_body_ranges: []const SnippetBodyRange,
 ) !void {
     var i: usize = 0;
     while (i < template.len) {
@@ -4343,6 +4401,8 @@ fn scanTemplateForComponents(
                         }
                     }
                     const name = template[i + 1 .. name_end];
+                    // Component names are always added (for noUnusedLocals checking on imports).
+                    // Unlike local bindings (block, m, index), components are script-scoped imports.
                     if (name.len > 0) {
                         const result = try refs.getOrPut(allocator, name);
                         if (!result.found_existing) {
@@ -4365,9 +4425,13 @@ fn scanTemplateForComponents(
                         i = findMatchingCloseBrace(template, i + 1);
                         // Extract identifiers from attribute expression (includes spreads like {...props})
                         // Skip @attach directives - they're handled separately
+                        // Skip expressions inside snippet bodies - they're handled by emitSnippetBodyExpressions
+                        const svelte_offset = template_start_offset + @as(u32, @intCast(expr_start));
+                        if (isInsideSnippetBody(svelte_offset, snippet_body_ranges)) {
+                            continue;
+                        }
                         const attr_expr = template[expr_start..i];
                         if (!std.mem.startsWith(u8, attr_expr, "{@attach ")) {
-                            const svelte_offset = template_start_offset + @as(u32, @intCast(expr_start));
                             try extractIdentifiersFromExpr(allocator, attr_expr, svelte_offset, refs);
                         }
                     } else if (template[i] == '/' and i + 1 < template.len and template[i + 1] == '>') {
@@ -6085,6 +6149,10 @@ fn emitSnippetBodyExpressions(
     var each_bindings: std.ArrayList(EachBindingInfo) = .empty;
     defer each_bindings.deinit(allocator);
 
+    // Collect const bindings inside the snippet body
+    var const_bindings: std.ArrayList(struct { binding: ConstBindingInfo, offset: u32 }) = .empty;
+    defer const_bindings.deinit(allocator);
+
     for (ast.nodes.items) |node| {
         // Only process nodes within this snippet's body range
         if (node.start < range.body_start or node.start >= range.body_end) continue;
@@ -6159,12 +6227,21 @@ fn emitSnippetBodyExpressions(
                     try each_bindings.append(allocator, binding);
                 }
             },
+            .const_tag => {
+                // Collect const bindings for proper typing inside snippet scope
+                if (extractConstBinding(ast.source, node.start, node.end)) |binding| {
+                    try const_bindings.append(allocator, .{
+                        .binding = binding,
+                        .offset = node.start,
+                    });
+                }
+            },
             else => {},
         }
     }
 
-    // If there are no body expressions, components, or each bindings, nothing to emit
-    if (body_exprs.items.len == 0 and body_components.items.len == 0 and each_bindings.items.len == 0) return;
+    // If there are no body expressions, components, each bindings, or const bindings, nothing to emit
+    if (body_exprs.items.len == 0 and body_components.items.len == 0 and each_bindings.items.len == 0 and const_bindings.items.len == 0) return;
 
     if (!has_expressions.*) {
         try output.appendSlice(allocator, ";// Template expressions\n");
@@ -6220,6 +6297,15 @@ fn emitSnippetBodyExpressions(
         try output.appendSlice(allocator, "\n");
     }
 
+    // Use NarrowingContext to keep if-blocks open across bindings and expressions.
+    // This ensures {#each} bindings remain in scope for expressions that reference them.
+    var narrowing_ctx = NarrowingContext.init(allocator);
+    defer narrowing_ctx.deinit();
+    narrowing_ctx.has_expressions = true; // Already inside snippet IIFE
+
+    // Pre-process outer_enclosing branches to prefix inner branch lookups.
+    // All snippet body items inherit the outer enclosing conditions.
+
     // Emit each bindings with narrowing applied
     // This provides proper typing for loop variables like `{#each m.content as block}`
     for (each_bindings.items) |binding| {
@@ -6227,20 +6313,47 @@ fn emitSnippetBodyExpressions(
         var inner_enclosing = try findAllEnclosingIfBranches(allocator, binding.offset, snippet_branches.items);
         defer inner_enclosing.deinit(allocator);
 
-        // Emit outer enclosing conditions (from if branches containing the snippet)
-        const outer_opened = try emitIfConditionOpenersIndented(allocator, output, outer_enclosing.items, "");
-        // Emit inner enclosing conditions (from if branches within the snippet body)
-        const inner_opened = try emitIfConditionOpenersIndented(allocator, output, inner_enclosing.items, "");
-        const conditions_opened = outer_opened + inner_opened;
+        // Combine outer + inner branches for full context
+        var combined_branches: std.ArrayList(IfBranch) = .empty;
+        defer combined_branches.deinit(allocator);
+        try combined_branches.appendSlice(allocator, outer_enclosing.items);
+        try combined_branches.appendSlice(allocator, inner_enclosing.items);
+
+        // Use NarrowingContext to manage scope - keeps if-blocks open across bindings
+        try narrowing_ctx.ensureOpen(output, combined_branches.items);
 
         // Emit the each binding declarations
         try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
 
-        // Close all opened if blocks
-        var j: u32 = 0;
-        while (j < conditions_opened) : (j += 1) {
-            try output.appendSlice(allocator, "}\n");
-        }
+        // Mark that a binding was emitted - prevents closing this scope
+        narrowing_ctx.markBindingEmitted();
+    }
+
+    // Emit const bindings with narrowing applied
+    // This provides proper typing for {@const} declarations like `{@const lastThinkingIndex = ...}`
+    for (const_bindings.items) |const_info| {
+        // Find enclosing if branches for this const (within snippet scope)
+        var inner_enclosing = try findAllEnclosingIfBranches(allocator, const_info.offset, snippet_branches.items);
+        defer inner_enclosing.deinit(allocator);
+
+        // Combine outer + inner branches for full context
+        var combined_branches: std.ArrayList(IfBranch) = .empty;
+        defer combined_branches.deinit(allocator);
+        try combined_branches.appendSlice(allocator, outer_enclosing.items);
+        try combined_branches.appendSlice(allocator, inner_enclosing.items);
+
+        // Use NarrowingContext to manage scope - keeps if-blocks open across bindings
+        try narrowing_ctx.ensureOpen(output, combined_branches.items);
+
+        // Emit the const binding declaration
+        try output.appendSlice(allocator, "var ");
+        try output.appendSlice(allocator, const_info.binding.name);
+        try output.appendSlice(allocator, " = ");
+        try output.appendSlice(allocator, const_info.binding.expr);
+        try output.appendSlice(allocator, ";\n");
+
+        // Mark that a binding was emitted - prevents closing this scope
+        narrowing_ctx.markBindingEmitted();
     }
 
     // Emit each body expression with narrowing applied
@@ -6249,11 +6362,14 @@ fn emitSnippetBodyExpressions(
         var inner_enclosing = try findAllEnclosingIfBranches(allocator, expr_info.offset, snippet_branches.items);
         defer inner_enclosing.deinit(allocator);
 
-        // Emit outer enclosing conditions (from if branches containing the snippet)
-        const outer_opened = try emitIfConditionOpenersIndented(allocator, output, outer_enclosing.items, "  ");
-        // Emit inner enclosing conditions (from if branches within the snippet body)
-        const inner_opened = try emitIfConditionOpenersIndented(allocator, output, inner_enclosing.items, "  ");
-        const conditions_opened = outer_opened + inner_opened;
+        // Combine outer + inner branches for full context
+        var combined_branches: std.ArrayList(IfBranch) = .empty;
+        defer combined_branches.deinit(allocator);
+        try combined_branches.appendSlice(allocator, outer_enclosing.items);
+        try combined_branches.appendSlice(allocator, inner_enclosing.items);
+
+        // Use NarrowingContext to manage scope
+        try narrowing_ctx.ensureOpen(output, combined_branches.items);
 
         // Emit the actual expression
         try output.appendSlice(allocator, "void (");
@@ -6263,14 +6379,7 @@ fn emitSnippetBodyExpressions(
             .len = @intCast(expr_info.expr.len),
         });
         try output.appendSlice(allocator, expr_info.expr);
-        try output.appendSlice(allocator, ");");
-
-        // Close all opened if blocks
-        var j: u32 = 0;
-        while (j < conditions_opened) : (j += 1) {
-            try output.appendSlice(allocator, " }");
-        }
-        try output.appendSlice(allocator, "\n");
+        try output.appendSlice(allocator, ");\n");
     }
 
     // Emit component props validation for components inside this snippet
@@ -6287,11 +6396,14 @@ fn emitSnippetBodyExpressions(
             var inner_enclosing = try findAllEnclosingIfBranches(allocator, comp_info.node_start, snippet_branches.items);
             defer inner_enclosing.deinit(allocator);
 
-            // Emit outer enclosing conditions (from if branches containing the snippet)
-            const outer_opened = try emitIfConditionOpenersIndented(allocator, output, outer_enclosing.items, "  ");
-            // Emit inner enclosing conditions (from if branches within the snippet body)
-            const inner_opened = try emitIfConditionOpenersIndented(allocator, output, inner_enclosing.items, "  ");
-            const conditions_opened = outer_opened + inner_opened;
+            // Combine outer + inner branches for full context
+            var combined_branches: std.ArrayList(IfBranch) = .empty;
+            defer combined_branches.deinit(allocator);
+            try combined_branches.appendSlice(allocator, outer_enclosing.items);
+            try combined_branches.appendSlice(allocator, inner_enclosing.items);
+
+            // Use NarrowingContext to manage scope
+            try narrowing_ctx.ensureOpen(output, combined_branches.items);
 
             // Emit component props validation
             try emitComponentPropsValidation(
@@ -6304,16 +6416,15 @@ fn emitSnippetBodyExpressions(
                 elem_data.attrs_end,
                 ast.attributes.items,
             );
-
-            // Close all opened if blocks
-            var k: u32 = 0;
-            while (k < conditions_opened) : (k += 1) {
-                try output.appendSlice(allocator, " }");
-            }
-            if (conditions_opened > 0) {
-                try output.appendSlice(allocator, "\n");
-            }
+            try output.appendSlice(allocator, "\n");
         }
+    }
+
+    // Close all remaining if-blocks (respecting min_binding_depth means some may stay open)
+    // Use a force-close to emit all remaining closing braces
+    var j: u32 = 0;
+    while (j < narrowing_ctx.conditions_opened) : (j += 1) {
+        try output.appendSlice(allocator, "}\n");
     }
 
     try output.appendSlice(allocator, "})(");
