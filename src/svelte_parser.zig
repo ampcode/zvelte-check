@@ -588,6 +588,12 @@ pub const Parser = struct {
                         self.advance(); // consume :
                         attr_name_end = self.current.end;
                         self.advance(); // consume modifier name
+                        // Handle |modifier options (e.g., in:fly|global, transition:fade|local)
+                        while (self.current.kind == .pipe and self.peek().kind == .identifier) {
+                            self.advance(); // consume |
+                            attr_name_end = self.current.end;
+                            self.advance(); // consume modifier option name
+                        }
                     }
                     if (std.mem.eql(u8, first_ident, "style")) {
                         // style: directive - check for CSS custom property (--name)
@@ -2592,4 +2598,32 @@ test "complex template literal in attribute doesn't cause false unclosed tag" {
     const ast = try parser.parse();
 
     try std.testing.expectEqual(@as(usize, 0), ast.parse_errors.items.len);
+}
+
+test "transition directive with pipe modifiers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "<div in:fly|global={{ y: 50 }} transition:fade|local></div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    try std.testing.expectEqual(@as(usize, 0), ast.parse_errors.items.len);
+
+    // Should have 1 element (div) with 2 attributes
+    var div_found = false;
+    for (ast.nodes.items) |node| {
+        if (node.kind == .element) {
+            const elem = ast.elements.items[node.data];
+            if (std.mem.eql(u8, elem.tag_name, "div")) {
+                div_found = true;
+                const attrs = ast.attributes.items[elem.attrs_start..elem.attrs_end];
+                try std.testing.expectEqual(@as(usize, 2), attrs.len);
+                try std.testing.expectEqualStrings("in:fly|global", attrs[0].name);
+                try std.testing.expectEqualStrings("transition:fade|local", attrs[1].name);
+            }
+        }
+    }
+    try std.testing.expect(div_found);
 }
