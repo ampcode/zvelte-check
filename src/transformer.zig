@@ -86,6 +86,176 @@ const IfBranch = struct {
     prior_conditions: []const []const u8,
 };
 
+/// Tracks the currently open if-block for narrowing context.
+/// When emitting multiple expressions from the same if-branch, we keep the if-block
+/// open so TypeScript can connect the narrowing context across expressions.
+const NarrowingContext = struct {
+    /// The enclosing branches for the currently open if-block (sorted by body_start).
+    /// Empty means no if-block is currently open.
+    enclosing_branches: std.ArrayList(IfBranch),
+    /// Number of if-blocks currently open (matches enclosing_branches.items.len when open).
+    conditions_opened: u32,
+    /// True if template expressions header has been emitted.
+    has_expressions: bool,
+    /// The allocator for managing enclosing_branches.
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator) NarrowingContext {
+        return .{
+            .enclosing_branches = .empty,
+            .conditions_opened = 0,
+            .has_expressions = false,
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *NarrowingContext) void {
+        self.enclosing_branches.deinit(self.allocator);
+    }
+
+    /// Check if two branches match by their body_start and body_end (unique identifiers).
+    fn branchesEqual(a: IfBranch, b: IfBranch) bool {
+        return a.body_start == b.body_start and a.body_end == b.body_end;
+    }
+
+    /// Find how many leading branches match between current and new contexts.
+    fn findCommonPrefixLen(current: []const IfBranch, new: []const IfBranch) usize {
+        const min_len = @min(current.len, new.len);
+        var i: usize = 0;
+        while (i < min_len) : (i += 1) {
+            if (!branchesEqual(current[i], new[i])) break;
+        }
+        return i;
+    }
+
+    /// Close the currently open if-block (if any).
+    fn close(self: *NarrowingContext, output: *std.ArrayList(u8)) !void {
+        var j: u32 = 0;
+        while (j < self.conditions_opened) : (j += 1) {
+            try output.appendSlice(self.allocator, "}\n");
+        }
+        self.conditions_opened = 0;
+        self.enclosing_branches.clearRetainingCapacity();
+    }
+
+    /// Close some inner if-blocks, keeping the outer ones open.
+    fn closeInner(self: *NarrowingContext, output: *std.ArrayList(u8), keep_count: usize) !void {
+        const to_close = self.conditions_opened - @as(u32, @intCast(keep_count));
+        var j: u32 = 0;
+        while (j < to_close) : (j += 1) {
+            try output.appendSlice(self.allocator, "}\n");
+        }
+        self.conditions_opened = @intCast(keep_count);
+        self.enclosing_branches.shrinkRetainingCapacity(keep_count);
+    }
+
+    /// Ensure the if-block for the given branches is open.
+    /// Handles incremental opening/closing to maintain nested contexts.
+    fn ensureOpen(
+        self: *NarrowingContext,
+        output: *std.ArrayList(u8),
+        new_enclosing: []const IfBranch,
+    ) !void {
+        // Emit template expressions header if needed
+        if (!self.has_expressions) {
+            try output.appendSlice(self.allocator, ";// Template expressions\n");
+            self.has_expressions = true;
+        }
+
+        // Find how many leading branches are the same
+        const common_prefix_len = findCommonPrefixLen(self.enclosing_branches.items, new_enclosing);
+
+        // If there's a complete match, nothing to do
+        if (common_prefix_len == self.enclosing_branches.items.len and common_prefix_len == new_enclosing.len) {
+            return;
+        }
+
+        // Close branches that diverge from the new context
+        if (common_prefix_len < self.enclosing_branches.items.len) {
+            try self.closeInner(output, common_prefix_len);
+        }
+
+        // Open new branches that extend beyond the common prefix
+        if (common_prefix_len < new_enclosing.len) {
+            const new_branches = new_enclosing[common_prefix_len..];
+            const additional = try emitIfConditionOpeners(self.allocator, output, new_branches);
+            self.conditions_opened += additional;
+            try self.enclosing_branches.appendSlice(self.allocator, new_branches);
+        }
+    }
+
+    /// Emit an expression within the current narrowing context.
+    /// The if-block is kept open across multiple expressions with the same enclosing branches.
+    fn emitExpression(
+        self: *NarrowingContext,
+        output: *std.ArrayList(u8),
+        mappings: *std.ArrayList(SourceMap.Mapping),
+        expr: []const u8,
+        svelte_offset: u32,
+        if_branches: []const IfBranch,
+    ) !void {
+        // Find all enclosing if branches for this expression
+        var enclosing = try findAllEnclosingIfBranches(self.allocator, svelte_offset, if_branches);
+        defer enclosing.deinit(self.allocator);
+
+        // Ensure we're in the right if-block context
+        try self.ensureOpen(output, enclosing.items);
+
+        // Emit the actual expression
+        try output.appendSlice(self.allocator, "void (");
+        try mappings.append(self.allocator, .{
+            .svelte_offset = svelte_offset,
+            .ts_offset = @intCast(output.items.len),
+            .len = @intCast(expr.len),
+        });
+        try output.appendSlice(self.allocator, expr);
+        try output.appendSlice(self.allocator, ");\n");
+    }
+
+    /// Emit {#each} binding declarations within the current narrowing context.
+    fn emitEachBinding(
+        self: *NarrowingContext,
+        output: *std.ArrayList(u8),
+        mappings: *std.ArrayList(SourceMap.Mapping),
+        binding: EachBindingInfo,
+        is_typescript: bool,
+        if_branches: []const IfBranch,
+    ) !void {
+        // Find all enclosing if branches for this {#each} block
+        var enclosing = try findAllEnclosingIfBranches(self.allocator, binding.offset, if_branches);
+        defer enclosing.deinit(self.allocator);
+
+        // Ensure we're in the right if-block context
+        try self.ensureOpen(output, enclosing.items);
+
+        // Emit the binding declarations
+        try emitEachBindingDeclarations(self.allocator, output, mappings, binding, binding.iterable, is_typescript);
+    }
+
+    /// Emit {@const} binding within the current narrowing context.
+    fn emitConstBinding(
+        self: *NarrowingContext,
+        output: *std.ArrayList(u8),
+        binding: ConstBindingInfo,
+        svelte_offset: u32,
+        if_branches: []const IfBranch,
+    ) !void {
+        // Find all enclosing if branches for this {@const}
+        var enclosing = try findAllEnclosingIfBranches(self.allocator, svelte_offset, if_branches);
+        defer enclosing.deinit(self.allocator);
+
+        // Ensure we're in the right if-block context
+        try self.ensureOpen(output, enclosing.items);
+
+        // Emit the const binding
+        try output.appendSlice(self.allocator, "var ");
+        try output.appendSlice(self.allocator, binding.name);
+        try output.appendSlice(self.allocator, " = ");
+        try output.appendSlice(self.allocator, binding.expr);
+        try output.appendSlice(self.allocator, ";\n");
+    }
+};
+
 const ExportInfo = struct {
     name: []const u8,
     type_repr: ?[]const u8,
@@ -1590,13 +1760,23 @@ fn emitTemplateExpressions(
     snippet_body_ranges: []const SnippetBodyRange,
     if_branches: []const IfBranch,
 ) !void {
-    var has_expressions = false;
+    // Track narrowing context to keep if-blocks open across multiple expressions.
+    // This enables TypeScript to connect narrowing across declarations and usages.
+    var narrowing_ctx = NarrowingContext.init(allocator);
+    defer narrowing_ctx.deinit();
 
     // First pass: collect snippet parameter names.
     // Snippet parameters are only in scope inside the snippet body, not at module scope.
     // We need to exclude them from template_refs to avoid "Cannot find name" errors.
     var snippet_params: std.StringHashMapUnmanaged(void) = .empty;
     defer snippet_params.deinit(allocator);
+
+    // Track template binding names (from {#each} and {@const}).
+    // These are declarations, not references, so they shouldn't get void statements.
+    // Emitting `void block;` at module scope causes TypeScript to merge types from
+    // different if-branches where the same binding name is declared with `var`.
+    var template_bindings: std.StringHashMapUnmanaged(void) = .empty;
+    defer template_bindings.deinit(allocator);
 
     for (ast.nodes.items) |node| {
         if (node.kind == .snippet) {
@@ -1645,6 +1825,9 @@ fn emitTemplateExpressions(
                     // Find the body range for this snippet
                     for (snippet_body_ranges) |range| {
                         if (std.mem.eql(u8, range.name, info.name)) {
+                            // Close any open narrowing context before emitting snippet body
+                            // Snippets create their own scope, so we can't share the if-block
+                            try narrowing_ctx.close(output);
                             // Emit snippet body expressions inside a block.
                             // This creates a scope where snippet parameters are available.
                             try emitSnippetBodyExpressions(
@@ -1655,7 +1838,7 @@ fn emitTemplateExpressions(
                                 range,
                                 is_typescript,
                                 if_branches,
-                                &has_expressions,
+                                &narrowing_ctx.has_expressions,
                             );
                             break;
                         }
@@ -1671,15 +1854,13 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
 
                 if (extractRenderExpression(ast.source, node.start, node.end)) |render_info| {
-                    // Use narrowed expression emission for type narrowing in {#if} blocks
-                    try emitNarrowedExpression(
-                        allocator,
+                    // Use narrowing context to keep if-blocks open across expressions
+                    try narrowing_ctx.emitExpression(
                         output,
                         mappings,
                         render_info.expr,
                         node.start + render_info.offset,
                         if_branches,
-                        &has_expressions,
                     );
                 }
             },
@@ -1693,15 +1874,13 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractPlainExpression(ast.source, node.start, node.end)) |expr_info| {
-                    // Use narrowed expression emission for type narrowing in {#if} blocks
-                    try emitNarrowedExpression(
-                        allocator,
+                    // Use narrowing context to keep if-blocks open across expressions
+                    try narrowing_ctx.emitExpression(
                         output,
                         mappings,
                         expr_info.expr,
                         node.start + expr_info.offset,
                         if_branches,
-                        &has_expressions,
                     );
                 }
             },
@@ -1714,14 +1893,12 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractIfExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try emitNarrowedExpression(
-                        allocator,
+                    try narrowing_ctx.emitExpression(
                         output,
                         mappings,
                         expr_info.expr,
                         node.start + expr_info.offset,
                         if_branches,
-                        &has_expressions,
                     );
                 }
             },
@@ -1733,14 +1910,12 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractKeyExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try emitNarrowedExpression(
-                        allocator,
+                    try narrowing_ctx.emitExpression(
                         output,
                         mappings,
                         expr_info.expr,
                         node.start + expr_info.offset,
                         if_branches,
-                        &has_expressions,
                     );
                 }
             },
@@ -1751,15 +1926,13 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractHtmlExpression(ast.source, node.start, node.end)) |expr_info| {
-                    // Use narrowed expression emission for type narrowing in {#if} blocks
-                    try emitNarrowedExpression(
-                        allocator,
+                    // Use narrowing context to keep if-blocks open across expressions
+                    try narrowing_ctx.emitExpression(
                         output,
                         mappings,
                         expr_info.expr,
                         node.start + expr_info.offset,
                         if_branches,
-                        &has_expressions,
                     );
                 }
             },
@@ -1772,11 +1945,9 @@ fn emitTemplateExpressions(
 
                 // Emit the const declaration with narrowing (for {#if} contexts)
                 if (extractConstBinding(ast.source, node.start, node.end)) |binding| {
-                    if (!has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
-                    }
-                    try emitNarrowedConstBinding(allocator, output, binding, node.start, if_branches);
+                    // Track binding name to avoid void statement at module scope
+                    try template_bindings.put(allocator, binding.name, {});
+                    try narrowing_ctx.emitConstBinding(output, binding, node.start, if_branches);
                 }
             },
 
@@ -1787,14 +1958,12 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractDebugExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try emitNarrowedExpression(
-                        allocator,
+                    try narrowing_ctx.emitExpression(
                         output,
                         mappings,
                         expr_info.expr,
                         node.start + expr_info.offset,
                         if_branches,
-                        &has_expressions,
                     );
                 }
             },
@@ -1809,23 +1978,22 @@ fn emitTemplateExpressions(
                     current_await_expr = await_info.expr;
 
                     // Emit the await expression for property access checking
-                    // Use narrowed expression emission for proper type narrowing.
-                    try emitNarrowedExpression(
-                        allocator,
+                    try narrowing_ctx.emitExpression(
                         output,
                         mappings,
                         await_info.expr,
                         node.start + await_info.offset,
                         if_branches,
-                        &has_expressions,
                     );
 
                     // Handle inline {#await promise then value} syntax
                     // This is different from {:then value} which gets its own .then_block node
                     if (extractInlineThenBinding(ast.source, node.start, node.end)) |binding_pattern| {
-                        if (!has_expressions) {
+                        // Close any open narrowing context before emitting standalone declaration
+                        try narrowing_ctx.close(output);
+                        if (!narrowing_ctx.has_expressions) {
                             try output.appendSlice(allocator, ";// Template expressions\n");
-                            has_expressions = true;
+                            narrowing_ctx.has_expressions = true;
                         }
                         const is_destructuring = binding_pattern.len > 0 and (binding_pattern[0] == '{' or binding_pattern[0] == '[');
                         if (is_destructuring) {
@@ -1853,9 +2021,11 @@ fn emitTemplateExpressions(
                 // {:then value} - emit binding for the resolved value
                 // Don't extract identifiers from the full expression (would extract "then" keyword)
                 if (extractThenCatchBinding(ast.source, node.start, node.end, "then")) |binding_pattern| {
-                    if (!has_expressions) {
+                    // Close any open narrowing context before emitting standalone declaration
+                    try narrowing_ctx.close(output);
+                    if (!narrowing_ctx.has_expressions) {
                         try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
+                        narrowing_ctx.has_expressions = true;
                     }
                     // For destructuring patterns, we need an initializer
                     // For simple identifiers, we can use await to infer the type
@@ -1895,9 +2065,11 @@ fn emitTemplateExpressions(
             .catch_block => {
                 // {:catch error} - emit binding for the error
                 if (extractThenCatchBinding(ast.source, node.start, node.end, "catch")) |binding_pattern| {
-                    if (!has_expressions) {
+                    // Close any open narrowing context before emitting standalone declaration
+                    try narrowing_ctx.close(output);
+                    if (!narrowing_ctx.has_expressions) {
                         try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
+                        narrowing_ctx.has_expressions = true;
                     }
                     // For destructuring patterns, we need an initializer
                     // For simple identifiers, type annotation is sufficient
@@ -1941,13 +2113,15 @@ fn emitTemplateExpressions(
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
 
                 // Parse and emit each block bindings (item, index variables)
-                // Use narrowed emission so {#each} inside {#if} respects type narrowing
+                // Use narrowing context so {#each} inside {#if} shares the same if-block
                 if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
-                    if (!has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        has_expressions = true;
+                    // Track binding names to avoid emitting void statements for them at module scope.
+                    // This prevents TypeScript from merging types across different if-branches.
+                    try template_bindings.put(allocator, binding.item_binding, {});
+                    if (binding.index_binding) |idx| {
+                        try template_bindings.put(allocator, idx, {});
                     }
-                    try emitNarrowedEachBindingDeclarations(allocator, output, mappings, binding, is_typescript, if_branches);
+                    try narrowing_ctx.emitEachBinding(output, mappings, binding, is_typescript, if_branches);
                 }
             },
 
@@ -2094,9 +2268,12 @@ fn emitTemplateExpressions(
 
             if (!has_validatable_attrs) continue;
 
-            if (!has_expressions) {
+            // Close any open narrowing context before emitting HTML element validation
+            // Element props are validated independently, not within a narrowing block
+            try narrowing_ctx.close(output);
+            if (!narrowing_ctx.has_expressions) {
                 try output.appendSlice(allocator, ";// Template expressions\n");
-                has_expressions = true;
+                narrowing_ctx.has_expressions = true;
             }
 
             // Find enclosing if branches for this element and emit if wrappers
@@ -2240,9 +2417,11 @@ fn emitTemplateExpressions(
 
             if (!has_validatable_props) continue;
 
-            if (!has_expressions) {
+            // Close any open narrowing context before emitting component props validation
+            try narrowing_ctx.close(output);
+            if (!narrowing_ctx.has_expressions) {
                 try output.appendSlice(allocator, ";// Template expressions\n");
-                has_expressions = true;
+                narrowing_ctx.has_expressions = true;
             }
 
             // Find enclosing if branches for this component and emit if wrappers
@@ -2353,9 +2532,12 @@ fn emitTemplateExpressions(
         }
     }
 
+    // Close any open narrowing context before the final sections
+    try narrowing_ctx.close(output);
+
     // Fallback: scan template source directly for {#each} patterns not captured by AST
     // The parser sometimes misses {#each} blocks inside component elements
-    try scanTemplateForEachBlocks(allocator, ast, output, mappings, &template_refs, &has_expressions, is_typescript, snippet_body_ranges, if_branches);
+    try scanTemplateForEachBlocks(allocator, ast, output, mappings, &template_refs, &narrowing_ctx.has_expressions, is_typescript, snippet_body_ranges, if_branches);
 
     // Emit void statements for template-referenced identifiers
     // This marks them as "used" for noUnusedLocals checking
@@ -2369,10 +2551,13 @@ fn emitTemplateExpressions(
         // User imports can shadow built-in names (e.g., `import Map from './icons/map'`),
         // so if a name is declared in script, we should emit void for it.
         if (isJsKeywordOrBuiltin(name) and !declared_names.contains(name)) continue;
+        // Skip template bindings ({#each}, {@const}) - they're declarations, not references.
+        // Emitting void at module scope causes TypeScript to merge types across branches.
+        if (template_bindings.contains(name)) continue;
 
-        if (!has_expressions) {
+        if (!narrowing_ctx.has_expressions) {
             try output.appendSlice(allocator, ";// Template expressions\n");
-            has_expressions = true;
+            narrowing_ctx.has_expressions = true;
         }
         try output.appendSlice(allocator, "void ");
         // Add source mapping so "Cannot find name" errors point to the template location
@@ -2385,7 +2570,7 @@ fn emitTemplateExpressions(
         try output.appendSlice(allocator, ";\n");
     }
 
-    if (has_expressions) {
+    if (narrowing_ctx.has_expressions) {
         try output.appendSlice(allocator, "\n");
     }
 }
@@ -3995,21 +4180,34 @@ fn scanTemplateForEachBlocks(
         try extractIdentifiersFromExpr(allocator, full_expr, svelte_offset, template_refs);
 
         // Special handling for {#each} - emit binding declarations with narrowing
+        // Only emit if AST didn't already capture this {#each} block
         if (std.mem.startsWith(u8, full_expr, "{#each ")) {
             const abs_start = svelte_offset;
             const abs_end: u32 = @intCast(template_start + j);
-            if (extractEachBindings(ast.source, abs_start, abs_end)) |binding| {
-                if (!has_expressions.*) {
-                    try output.appendSlice(allocator, ";// Template expressions\n");
-                    has_expressions.* = true;
+
+            // Check if this {#each} was already handled by AST-based emission
+            var already_handled = false;
+            for (ast.nodes.items) |node| {
+                if (node.kind == .each_block and node.start == abs_start) {
+                    already_handled = true;
+                    break;
                 }
-                // If inside snippet body, emit a simplified declaration without referencing
-                // the iterable (which may be a snippet parameter not in scope at module level)
-                if (isInsideSnippetBody(abs_start, snippet_body_ranges)) {
-                    try emitEachBindingDeclarationsSimplified(allocator, output, binding, is_typescript);
-                } else {
-                    // Use narrowed emission so {#each} inside {#if} respects type narrowing
-                    try emitNarrowedEachBindingDeclarations(allocator, output, mappings, binding, is_typescript, if_branches);
+            }
+
+            if (!already_handled) {
+                if (extractEachBindings(ast.source, abs_start, abs_end)) |binding| {
+                    if (!has_expressions.*) {
+                        try output.appendSlice(allocator, ";// Template expressions\n");
+                        has_expressions.* = true;
+                    }
+                    // If inside snippet body, emit a simplified declaration without referencing
+                    // the iterable (which may be a snippet parameter not in scope at module level)
+                    if (isInsideSnippetBody(abs_start, snippet_body_ranges)) {
+                        try emitEachBindingDeclarationsSimplified(allocator, output, binding, is_typescript);
+                    } else {
+                        // Use narrowed emission so {#each} inside {#if} respects type narrowing
+                        try emitNarrowedEachBindingDeclarations(allocator, output, mappings, binding, is_typescript, if_branches);
+                    }
                 }
             }
         }
@@ -4357,14 +4555,16 @@ fn emitEachBindingDeclarations(
     iterable: []const u8,
     is_typescript: bool,
 ) !void {
-    // Emit item binding: var item = __svelte_ensureArray(iterable)[0];
-    // Using var allows redeclaration for multiple blocks with same name
+    // Emit item binding: let item = __svelte_ensureArray(iterable)[0];
+    // Using let (not var) prevents TypeScript from merging types across exclusive branches.
+    // With var, declarations hoist to function scope and get union types from all branches.
+    // With let + incremental narrowing context, each branch keeps its own typed binding.
     // The __svelte_ensureArray validates the iterable is array-like (generating TS errors if not)
     // and handles null/undefined by returning empty array
     // Also transform [...x] spreads inside the iterable to [...(x ?? [])] for null safety
     const safe_iterable = try makeIterableNullSafe(allocator, iterable);
 
-    try output.appendSlice(allocator, "var ");
+    try output.appendSlice(allocator, "let ");
     try output.appendSlice(allocator, binding.item_binding);
     if (is_typescript) {
         // Use __svelte_ensureArray for type validation in TypeScript
@@ -4385,9 +4585,9 @@ fn emitEachBindingDeclarations(
         try output.appendSlice(allocator, ") ?? [])[0];\n");
     }
 
-    // Emit index binding if present: var i = 0;
+    // Emit index binding if present: let i = 0;
     if (binding.index_binding) |idx| {
-        try output.appendSlice(allocator, "var ");
+        try output.appendSlice(allocator, "let ");
         try output.appendSlice(allocator, idx);
         try output.appendSlice(allocator, " = 0;\n");
     }
