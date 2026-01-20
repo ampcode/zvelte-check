@@ -2766,6 +2766,11 @@ fn extractIdentifiersFromExprWithContext(
     local_decls: *const std.StringHashMapUnmanaged(void),
     param_regions: []const ParamRegion,
 ) std.mem.Allocator.Error!void {
+    // Track function scope depth to skip identifiers inside function bodies.
+    // Variables inside IIFEs or callbacks should not be extracted to module scope.
+    var func_depth: u32 = 0;
+    var saw_arrow = false;
+
     var i: usize = 0;
     while (i < expr.len) {
         const c = expr[i];
@@ -2784,10 +2789,17 @@ fn extractIdentifiersFromExprWithContext(
         // Handle strings - for template literals, extract from interpolations
         if (c == '"' or c == '\'') {
             i = skipStringLiteral(expr, i);
+            saw_arrow = false;
             continue;
         }
         if (c == '`') {
-            i = try skipStringLiteralAndExtractWithContext(allocator, expr, i, base_offset, refs, arrow_params, local_decls);
+            // Only extract from template literals if we're at top level
+            if (func_depth == 0) {
+                i = try skipStringLiteralAndExtractWithContext(allocator, expr, i, base_offset, refs, arrow_params, local_decls);
+            } else {
+                i = skipStringLiteral(expr, i);
+            }
+            saw_arrow = false;
             continue;
         }
 
@@ -2795,20 +2807,56 @@ fn extractIdentifiersFromExprWithContext(
         if (i + 1 < expr.len and c == '/') {
             if (expr[i + 1] == '/') {
                 while (i < expr.len and expr[i] != '\n') : (i += 1) {}
+                saw_arrow = false;
                 continue;
             }
             if (expr[i + 1] == '*') {
                 i += 2;
                 while (i + 1 < expr.len and !(expr[i] == '*' and expr[i + 1] == '/')) : (i += 1) {}
                 if (i + 1 < expr.len) i += 2;
+                saw_arrow = false;
                 continue;
             }
             // Check for regex literal: /pattern/flags
             // Regex follows operators, punctuation, or start - not expressions
             if (couldBeRegex(expr, i)) {
                 i = skipRegexLiteral(expr, i);
+                saw_arrow = false;
                 continue;
             }
+        }
+
+        // Track arrow => which starts a function scope
+        if (c == '=' and i + 1 < expr.len and expr[i + 1] == '>') {
+            saw_arrow = true;
+            i += 2;
+            continue;
+        }
+
+        // Track function body entry
+        if (c == '{') {
+            if (saw_arrow) {
+                func_depth += 1;
+                saw_arrow = false;
+            } else if (func_depth > 0) {
+                func_depth += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        if (c == '}') {
+            if (func_depth > 0) {
+                func_depth -= 1;
+            }
+            i += 1;
+            saw_arrow = false;
+            continue;
+        }
+
+        // Non-brace token after arrow: single-expression body, no scope change needed
+        if (saw_arrow and !std.ascii.isWhitespace(c)) {
+            saw_arrow = false;
         }
 
         // Check for identifier start
@@ -2816,6 +2864,30 @@ fn extractIdentifiersFromExprWithContext(
             const start = i;
             while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_' or expr[i] == '$')) : (i += 1) {}
             const ident = expr[start..i];
+
+            // Track 'function' keyword - skip to its body and increase scope depth
+            if (std.mem.eql(u8, ident, "function")) {
+                // Skip to opening paren of parameters
+                while (i < expr.len and expr[i] != '(') : (i += 1) {}
+                if (i < expr.len) {
+                    var paren_depth: u32 = 1;
+                    i += 1;
+                    while (i < expr.len and paren_depth > 0) {
+                        if (expr[i] == '(') paren_depth += 1;
+                        if (expr[i] == ')') paren_depth -= 1;
+                        i += 1;
+                    }
+                    while (i < expr.len and std.ascii.isWhitespace(expr[i])) : (i += 1) {}
+                    if (i < expr.len and expr[i] == '{') {
+                        func_depth += 1;
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+
+            // Skip identifiers inside function bodies - they're scoped to the function
+            if (func_depth > 0) continue;
 
             // Skip if preceded by dot (member access) - but NOT spread syntax (...)
             // Member access: obj.prop (single dot before identifier)
@@ -3118,13 +3190,20 @@ fn collectLocalDeclarations(
     expr: []const u8,
     decls: *std.StringHashMapUnmanaged(void),
 ) std.mem.Allocator.Error!void {
+    // Only collect declarations at the top-level scope of the expression.
+    // Declarations inside function bodies (arrow functions, IIFEs, etc.) are scoped
+    // to that function and should not be added to module-level local_decls.
     var i: usize = 0;
+    var func_depth: u32 = 0; // Track nested function scopes
+    var saw_arrow = false; // Track if we just saw => and should enter function scope on next {
+
     while (i < expr.len) {
         const c = expr[i];
 
         // Skip string literals
         if (c == '"' or c == '\'' or c == '`') {
             i = skipStringLiteral(expr, i);
+            saw_arrow = false;
             continue;
         }
 
@@ -3132,26 +3211,89 @@ fn collectLocalDeclarations(
         if (i + 1 < expr.len and c == '/') {
             if (expr[i + 1] == '/') {
                 while (i < expr.len and expr[i] != '\n') : (i += 1) {}
+                saw_arrow = false;
                 continue;
             }
             if (expr[i + 1] == '*') {
                 i += 2;
                 while (i + 1 < expr.len and !(expr[i] == '*' and expr[i + 1] == '/')) : (i += 1) {}
                 if (i + 1 < expr.len) i += 2;
+                saw_arrow = false;
                 continue;
             }
         }
 
-        // Look for const/let/var declarations
+        // Track arrow => which starts a function scope
+        if (c == '=' and i + 1 < expr.len and expr[i + 1] == '>') {
+            saw_arrow = true;
+            i += 2;
+            continue;
+        }
+
+        // Track function body entry
+        if (c == '{') {
+            if (saw_arrow) {
+                // Opening brace after => starts function body
+                func_depth += 1;
+                saw_arrow = false;
+            } else if (func_depth > 0) {
+                // Nested brace inside function body
+                func_depth += 1;
+            }
+            // Note: { at top level without => is an object literal, not a function
+            i += 1;
+            continue;
+        }
+
+        if (c == '}') {
+            if (func_depth > 0) {
+                func_depth -= 1;
+            }
+            i += 1;
+            saw_arrow = false;
+            continue;
+        }
+
+        // Non-brace token clears arrow flag (arrow body without braces is a single expression)
+        if (saw_arrow and !std.ascii.isWhitespace(c)) {
+            saw_arrow = false;
+        }
+
+        // Look for const/let/var declarations, but only at top-level scope
         if (std.ascii.isAlphabetic(c)) {
             const kw_start = i;
             while (i < expr.len and std.ascii.isAlphanumeric(expr[i])) : (i += 1) {}
             const keyword = expr[kw_start..i];
 
-            // Check if this is a declaration keyword
-            if (std.mem.eql(u8, keyword, "const") or
-                std.mem.eql(u8, keyword, "let") or
-                std.mem.eql(u8, keyword, "var"))
+            // Track 'function' keyword - the next { will be a function body
+            if (std.mem.eql(u8, keyword, "function")) {
+                // Skip to opening paren of parameters
+                while (i < expr.len and expr[i] != '(') : (i += 1) {}
+                if (i < expr.len) {
+                    // Skip the parameter list
+                    var paren_depth: u32 = 1;
+                    i += 1;
+                    while (i < expr.len and paren_depth > 0) {
+                        if (expr[i] == '(') paren_depth += 1;
+                        if (expr[i] == ')') paren_depth -= 1;
+                        i += 1;
+                    }
+                    // Skip whitespace
+                    while (i < expr.len and std.ascii.isWhitespace(expr[i])) : (i += 1) {}
+                    // The next { is the function body
+                    if (i < expr.len and expr[i] == '{') {
+                        func_depth += 1;
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+
+            // Check if this is a declaration keyword - only collect at top-level
+            if (func_depth == 0 and
+                (std.mem.eql(u8, keyword, "const") or
+                    std.mem.eql(u8, keyword, "let") or
+                    std.mem.eql(u8, keyword, "var")))
             {
                 // Skip whitespace
                 while (i < expr.len and std.ascii.isWhitespace(expr[i])) : (i += 1) {}
@@ -10109,4 +10251,56 @@ test "@const declarations emitted before usages in each blocks" {
     try std.testing.expect(usage_pos != null);
     // Declaration must come before usage
     try std.testing.expect(decl_pos.? < usage_pos.?);
+}
+
+test "IIFE local variables should not be extracted to module scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\let position = { left: 100 };
+        \\</script>
+        \\<div style={`left: ${(() => {
+        \\  const menuWidth = 425;
+        \\  const leftPos = Math.min(position.left, 100);
+        \\  return leftPos;
+        \\})()}px`}></div>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // IIFE-local variables should NOT appear as void statements
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void menuWidth") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void leftPos") == null);
+    // The IIFE itself should still be in the template expression (for type-checking)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "const menuWidth = 425") != null);
+}
+
+test "function expression local variables should not be extracted to module scope" {
+    const allocator = std.testing.allocator;
+    var refs: std.StringHashMapUnmanaged(u32) = .empty;
+    defer refs.deinit(allocator);
+
+    const expr = "(() => { const localVar = 1; return localVar; })()";
+    try extractIdentifiersFromExpr(allocator, expr, 0, &refs);
+
+    // localVar should NOT be extracted (it's inside the function body)
+    try std.testing.expect(!refs.contains("localVar"));
+}
+
+test "regular function local variables should not be extracted to module scope" {
+    const allocator = std.testing.allocator;
+    var refs: std.StringHashMapUnmanaged(u32) = .empty;
+    defer refs.deinit(allocator);
+
+    const expr = "(function() { const inner = 1; return inner; })()";
+    try extractIdentifiersFromExpr(allocator, expr, 0, &refs);
+
+    // inner should NOT be extracted (it's inside the function body)
+    try std.testing.expect(!refs.contains("inner"));
 }
