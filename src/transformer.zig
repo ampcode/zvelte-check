@@ -2628,17 +2628,44 @@ fn extractIdentifiersFromAttributeValue(
             const expr_start = i;
             var depth: usize = 1;
             var j = i + 1;
-            while (j < val.len and depth > 0) : (j += 1) {
-                switch (val[j]) {
-                    '{' => depth += 1,
-                    '}' => depth -= 1,
+            while (j < val.len and depth > 0) {
+                const c = val[j];
+                switch (c) {
+                    '{' => {
+                        depth += 1;
+                        j += 1;
+                    },
+                    '}' => {
+                        depth -= 1;
+                        j += 1;
+                    },
+                    '/' => {
+                        // Handle line comments - apostrophes inside shouldn't be treated as strings
+                        if (j + 1 < val.len and val[j + 1] == '/') {
+                            j += 2;
+                            while (j < val.len and val[j] != '\n') : (j += 1) {}
+                        } else if (j + 1 < val.len and val[j + 1] == '*') {
+                            // Handle block comments
+                            j += 2;
+                            while (j + 1 < val.len) {
+                                if (val[j] == '*' and val[j + 1] == '/') {
+                                    j += 2;
+                                    break;
+                                }
+                                j += 1;
+                            }
+                        } else {
+                            j += 1;
+                        }
+                    },
                     '"', '\'' => {
                         // Skip string literal
-                        const quote = val[j];
+                        const quote = c;
                         j += 1;
                         while (j < val.len and val[j] != quote) : (j += 1) {
                             if (val[j] == '\\' and j + 1 < val.len) j += 1;
                         }
+                        if (j < val.len) j += 1; // Skip closing quote
                     },
                     '`' => {
                         // Skip template literal
@@ -2646,8 +2673,9 @@ fn extractIdentifiersFromAttributeValue(
                         while (j < val.len and val[j] != '`') : (j += 1) {
                             if (val[j] == '\\' and j + 1 < val.len) j += 1;
                         }
+                        if (j < val.len) j += 1; // Skip closing backtick
                     },
-                    else => {},
+                    else => j += 1,
                 }
             }
 
@@ -3650,6 +3678,24 @@ fn findMatchingCloseBrace(template: []const u8, start: usize) usize {
     var i = start;
     while (i < template.len and depth > 0) {
         const c = template[i];
+        // Skip line comments - apostrophes inside shouldn't be treated as strings
+        if (c == '/' and i + 1 < template.len and template[i + 1] == '/') {
+            i += 2;
+            while (i < template.len and template[i] != '\n') : (i += 1) {}
+            continue;
+        }
+        // Skip block comments
+        if (c == '/' and i + 1 < template.len and template[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < template.len) {
+                if (template[i] == '*' and template[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
         // Skip string literals - braces inside strings shouldn't affect depth
         if (c == '"' or c == '\'' or c == '`') {
             i = skipStringLiteral(template, i);
