@@ -1105,8 +1105,58 @@ fn extractInstanceExports(allocator: std.mem.Allocator, content: []const u8, exp
                     continue;
                 }
 
+                // Handle "export async function name(...): ReturnType"
+                // Extract inline function signature since functions are inside __render and
+                // can't be referenced with typeof at module scope
+                if (startsWithKeyword(content[i..], "async")) {
+                    const async_start = i;
+                    i += 5;
+                    i = skipWhitespace(content, i);
+
+                    if (startsWithKeyword(content[i..], "function")) {
+                        i += 8;
+                        i = skipWhitespace(content, i);
+
+                        const name_start = i;
+                        while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+                        const name = content[name_start..i];
+
+                        if (name.len > 0) {
+                            // Extract the function signature as an inline type
+                            // For async functions, wrap return type in Promise if not already
+                            const sig = try extractFunctionSignature(allocator, content, i);
+                            try exports.append(allocator, .{
+                                .name = name,
+                                .type_repr = sig,
+                            });
+                        }
+
+                        // Skip to end of function body
+                        while (i < content.len and content[i] != '{') : (i += 1) {}
+                        if (i < content.len) {
+                            var body_depth: u32 = 0;
+                            while (i < content.len) {
+                                if (content[i] == '{') body_depth += 1;
+                                if (content[i] == '}') {
+                                    body_depth -= 1;
+                                    if (body_depth == 0) {
+                                        i += 1;
+                                        break;
+                                    }
+                                }
+                                i += 1;
+                            }
+                        }
+                        continue;
+                    } else {
+                        // Not "async function", restore position
+                        i = async_start;
+                    }
+                }
+
                 // Handle "export function name(...): ReturnType"
-                // Use "typeof name" to reference the function's inferred type from the script
+                // Extract inline function signature since functions are inside __render and
+                // can't be referenced with typeof at module scope
                 if (startsWithKeyword(content[i..], "function")) {
                     i += 8;
                     i = skipWhitespace(content, i);
@@ -1116,12 +1166,12 @@ fn extractInstanceExports(allocator: std.mem.Allocator, content: []const u8, exp
                     const name = content[name_start..i];
 
                     if (name.len > 0) {
-                        // Use typeof to reference the actual function's type
-                        // This handles default parameters, generics, overloads correctly
-                        const type_repr = try std.fmt.allocPrint(allocator, "typeof {s}", .{name});
+                        // Extract the function signature as an inline type
+                        // e.g., "function foo(x: number): boolean" => "(x: number) => boolean"
+                        const sig = try extractFunctionSignature(allocator, content, i);
                         try exports.append(allocator, .{
                             .name = name,
-                            .type_repr = type_repr,
+                            .type_repr = sig,
                         });
                     }
 
@@ -1208,6 +1258,90 @@ fn findExportedNameType(content: []const u8, name: []const u8) ?[]const u8 {
     }
 
     return null;
+}
+
+/// Extracts a function signature as an arrow function type.
+/// Given position just after the function name, parses the parameter list and return type.
+/// Example: "function foo(x: number, y?: string): boolean" => "(x: number, y?: string) => boolean"
+/// If no return type is specified, uses "void" as the default.
+fn extractFunctionSignature(allocator: std.mem.Allocator, content: []const u8, start: usize) ![]const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+
+    var i = start;
+    i = skipWhitespace(content, i);
+
+    // Skip optional generic parameters <T, U>
+    if (i < content.len and content[i] == '<') {
+        i += 1;
+        var depth: u32 = 1;
+        while (i < content.len and depth > 0) {
+            if (content[i] == '<') depth += 1;
+            if (content[i] == '>') depth -= 1;
+            i += 1;
+        }
+        i = skipWhitespace(content, i);
+    }
+
+    // Expect opening parenthesis for parameters
+    if (i >= content.len or content[i] != '(') {
+        return try allocator.dupe(u8, "(...args: any[]) => any");
+    }
+
+    // Find matching closing parenthesis
+    const params_start = i;
+    i += 1;
+    var paren_depth: u32 = 1;
+    while (i < content.len and paren_depth > 0) {
+        const c = content[i];
+        if (c == '(') paren_depth += 1;
+        if (c == ')') paren_depth -= 1;
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+        i += 1;
+    }
+    const params_end = i; // Position after ')'
+
+    // Copy parameter list including parentheses
+    try result.appendSlice(allocator, content[params_start..params_end]);
+
+    i = skipWhitespace(content, i);
+
+    // Check for return type annotation
+    var return_type: []const u8 = "void";
+    if (i < content.len and content[i] == ':') {
+        i += 1;
+        i = skipWhitespace(content, i);
+        const ret_start = i;
+        // Find end of return type (before '{' or end of declaration)
+        var angle_depth: u32 = 0;
+        var brace_depth: u32 = 0;
+        while (i < content.len) {
+            const c = content[i];
+            if (c == '<') angle_depth += 1;
+            if (c == '>' and angle_depth > 0) angle_depth -= 1;
+            if (c == '(') brace_depth += 1;
+            if (c == ')' and brace_depth > 0) brace_depth -= 1;
+            // Stop at opening brace (function body) when not in angle brackets
+            if (c == '{' and angle_depth == 0 and brace_depth == 0) break;
+            // Skip strings
+            if (c == '"' or c == '\'' or c == '`') {
+                i = skipString(content, i);
+                continue;
+            }
+            i += 1;
+        }
+        return_type = std.mem.trim(u8, content[ret_start..i], " \t\n\r");
+        if (return_type.len == 0) return_type = "void";
+    }
+
+    try result.appendSlice(allocator, " => ");
+    try result.appendSlice(allocator, return_type);
+
+    return try result.toOwnedSlice(allocator);
 }
 
 /// Extracts props from Svelte 5 $props() destructuring pattern.
@@ -8574,9 +8708,9 @@ test "extract instance exports" {
     try std.testing.expectEqualStrings("handleKeyNavigation", exports.items[0].name);
     try std.testing.expect(exports.items[0].type_repr == null);
 
-    // isReady from export function - type is typeof isReady
+    // isReady from export function - type is inline function signature
     try std.testing.expectEqualStrings("isReady", exports.items[1].name);
-    try std.testing.expectEqualStrings("typeof isReady", exports.items[1].type_repr.?);
+    try std.testing.expectEqualStrings("() => boolean", exports.items[1].type_repr.?);
 
     // MAX_ITEMS from export const - no explicit type
     try std.testing.expectEqualStrings("MAX_ITEMS", exports.items[2].name);
@@ -8603,7 +8737,7 @@ test "instance exports in generated component type" {
     // Should have $$Exports interface with the exports
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Exports") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "handleKey:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "focus: typeof focus") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "focus: () => void") != null);
 
     // $$Exports must have index signature for Record<string, any> compatibility (required by mount())
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "[key: string]: any;") != null);
@@ -8635,6 +8769,38 @@ test "$$Exports is compatible with Record<string, any> for mount()" {
     // Even with no exports, $$Exports must have index signature
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export interface $$Exports") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "[key: string]: any;") != null);
+}
+
+test "exported functions use inline signatures in $$Exports" {
+    // Regression test: exported functions are inside __render() so typeof refs don't work.
+    // $$Exports must use inline function signatures instead of "typeof funcName".
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let value = $state(0);
+        \\  export function getValue(): number { return value; }
+        \\  export function setValue(n: number, flag?: boolean) { value = n; }
+        \\  export async function fetchData(): Promise<string> { return "data"; }
+        \\</script>
+        \\<p>{value}</p>
+    ;
+
+    var parser: @import("svelte_parser.zig").Parser = .init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // Exported functions should have inline signatures, not "typeof funcName"
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "getValue: () => number") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "setValue: (n: number, flag?: boolean) => void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "fetchData: () => Promise<string>") != null);
+
+    // Should NOT use typeof (which would fail at module scope)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "typeof getValue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "typeof setValue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "typeof fetchData") == null);
 }
 
 test "transform typescript component" {
