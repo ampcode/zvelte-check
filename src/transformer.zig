@@ -7646,9 +7646,10 @@ fn filterMixedImport(allocator: std.mem.Allocator, line: []const u8) !?[]const u
 /// - `export let y` → `let y`
 /// - `export var z` → `var z`
 /// - `export async function f()` → `async function f()`
+/// - `export { name1, name2 }` → (removed entirely, already in $$Exports)
 fn stripExportKeyword(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
     // Early exit: skip if no exports to strip
-    if (std.mem.indexOf(u8, content, "export ") == null) return content;
+    if (std.mem.indexOf(u8, content, "export ") == null and std.mem.indexOf(u8, content, "export{") == null) return content;
 
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
@@ -7656,28 +7657,55 @@ fn stripExportKeyword(allocator: std.mem.Allocator, content: []const u8) ![]cons
 
     var i: usize = 0;
     while (i < content.len) {
-        // Check for "export " at a word boundary
-        if (i + 7 <= content.len and std.mem.eql(u8, content[i .. i + 7], "export ")) {
+        // Check for "export " or "export{" at a word boundary
+        if (i + 6 <= content.len and std.mem.eql(u8, content[i .. i + 6], "export")) {
             // Make sure this is at the start of a line (or start of content)
             const at_line_start = (i == 0) or (i > 0 and content[i - 1] == '\n') or
                 (i > 0 and std.ascii.isWhitespace(content[i - 1]) and !isIdentChar(content[i - 1]));
 
             if (at_line_start) {
-                // Check what follows: function, const, let, var, async
-                const rest = content[i + 7 ..];
-                const stripped = std.mem.trimLeft(u8, rest, " \t");
+                const after_export = if (i + 6 < content.len) content[i + 6] else 0;
 
-                const valid_export = std.mem.startsWith(u8, stripped, "function ") or
-                    std.mem.startsWith(u8, stripped, "function(") or
-                    std.mem.startsWith(u8, stripped, "const ") or
-                    std.mem.startsWith(u8, stripped, "let ") or
-                    std.mem.startsWith(u8, stripped, "var ") or
-                    std.mem.startsWith(u8, stripped, "async ");
+                // Handle "export { name1, name2 }" - remove entire statement
+                if (after_export == ' ' or after_export == '{') {
+                    var j = i + 6;
+                    // Skip whitespace
+                    while (j < content.len and (content[j] == ' ' or content[j] == '\t')) : (j += 1) {}
 
-                if (valid_export) {
-                    // Skip "export " (7 chars)
-                    i += 7;
-                    continue;
+                    if (j < content.len and content[j] == '{') {
+                        // Found "export {" - skip to closing brace
+                        j += 1;
+                        while (j < content.len and content[j] != '}') : (j += 1) {}
+                        if (j < content.len) j += 1; // Skip '}'
+                        // Skip trailing whitespace and semicolon/newline
+                        while (j < content.len and (content[j] == ' ' or content[j] == '\t')) : (j += 1) {}
+                        if (j < content.len and content[j] == ';') j += 1;
+                        // Skip trailing newline
+                        if (j < content.len and content[j] == '\n') j += 1;
+                        // Comment out the line to preserve line numbers
+                        try result.appendSlice(allocator, "// export statement removed\n");
+                        i = j;
+                        continue;
+                    }
+                }
+
+                // Handle "export function/const/let/var/async"
+                if (after_export == ' ') {
+                    const rest = content[i + 7 ..];
+                    const stripped = std.mem.trimLeft(u8, rest, " \t");
+
+                    const valid_export = std.mem.startsWith(u8, stripped, "function ") or
+                        std.mem.startsWith(u8, stripped, "function(") or
+                        std.mem.startsWith(u8, stripped, "const ") or
+                        std.mem.startsWith(u8, stripped, "let ") or
+                        std.mem.startsWith(u8, stripped, "var ") or
+                        std.mem.startsWith(u8, stripped, "async ");
+
+                    if (valid_export) {
+                        // Skip "export " (7 chars)
+                        i += 7;
+                        continue;
+                    }
                 }
             }
         }
@@ -8801,6 +8829,37 @@ test "exported functions use inline signatures in $$Exports" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "typeof getValue") == null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "typeof setValue") == null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "typeof fetchData") == null);
+}
+
+test "export { ... } statements are stripped inside __render" {
+    // Regression test: "export { name }" inside instance script becomes invalid
+    // inside __render(). Should be stripped (replaced with comment).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  function handleKeyNavigation(e: KeyboardEvent) { }
+        \\  export { handleKeyNavigation }
+        \\  let value = $state(0);
+        \\</script>
+        \\<p>{value}</p>
+    ;
+
+    var parser: @import("svelte_parser.zig").Parser = .init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // The export { ... } statement should be stripped (replaced with comment)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export { handleKeyNavigation }") == null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "export {handleKeyNavigation}") == null);
+
+    // But the function itself should still be present
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "function handleKeyNavigation") != null);
+
+    // And it should be in $$Exports
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "handleKeyNavigation:") != null);
 }
 
 test "transform typescript component" {
