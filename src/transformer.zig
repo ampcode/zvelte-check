@@ -837,9 +837,11 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         // This ensures JS Svelte files are valid modules that can be imported and used
         // in contexts expecting Component (e.g., Record<string, Component>).
         // We use a function shape since Component<Props, Exports, Bindings> is a function type.
+        // Parameters are given `any` type via JSDoc to avoid implicit-any errors.
         try output.appendSlice(allocator,
             \\// Component export (JavaScript mode)
             \\// Use a function with bind/call/apply properties to match the Component interface
+            \\/** @param {any} internal @param {any} props */
             \\export default function __SvelteComponent__(internal, props) { return {}; };
             \\
         );
