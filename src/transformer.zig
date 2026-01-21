@@ -2868,6 +2868,60 @@ fn emitComponentPropsValidation(
             continue;
         }
 
+        // Handle bind: directives - emit as regular prop with bound value
+        // bind:open={showDialog} → open: showDialog
+        // bind:value → value: value (shorthand)
+        // Note: Svelte 5 allows getter/setter syntax: bind:value={getter, setter}
+        // We only handle simple cases to avoid syntax errors.
+        if (std.mem.startsWith(u8, attr.name, "bind:")) {
+            const prop_name = attr.name[5..]; // Strip "bind:" prefix
+            if (prop_name.len == 0) continue;
+
+            // Skip special bind directives that don't correspond to props
+            if (std.mem.eql(u8, prop_name, "this")) continue;
+
+            // Determine the value expression
+            var value_expr: ?[]const u8 = null;
+            if (attr.value) |val| {
+                if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}') {
+                    const inner = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
+                    // Skip complex expressions (getter/setter pairs, functions)
+                    // These contain commas, arrows, or newlines that would produce invalid TS
+                    if (std.mem.indexOf(u8, inner, ",") != null or
+                        std.mem.indexOf(u8, inner, "=>") != null or
+                        std.mem.indexOf(u8, inner, "\n") != null)
+                    {
+                        // Complex bind expression - emit with `any` to mark as provided
+                        // This prevents "missing required prop" errors while avoiding syntax errors
+                        value_expr = "undefined as any";
+                    } else if (isSingleExpression(val)) {
+                        value_expr = inner;
+                    }
+                }
+            } else {
+                // Shorthand: bind:x → x: x
+                value_expr = prop_name;
+            }
+
+            if (value_expr) |expr| {
+                if (!first_prop) {
+                    try output.appendSlice(allocator, ", ");
+                }
+                first_prop = false;
+
+                // Add source mapping
+                try mappings.append(allocator, .{
+                    .svelte_offset = attr.start,
+                    .ts_offset = @intCast(output.items.len),
+                    .len = @intCast(prop_name.len),
+                });
+                try output.appendSlice(allocator, prop_name);
+                try output.appendSlice(allocator, ": ");
+                try output.appendSlice(allocator, expr);
+            }
+            continue;
+        }
+
         if (!isValidatableComponentProp(attr.name)) continue;
 
         if (!first_prop) {
