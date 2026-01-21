@@ -7698,17 +7698,30 @@ fn findTypeAliasEnd(content: []const u8, start: usize) usize {
         }
 
         // Newline ends type alias only if we're past the = and not inside braces/angles,
-        // AND the next non-whitespace character is not a union continuation '|'
+        // AND the next non-whitespace character is not a union '|' or intersection '&' continuation
         if (c == '\n' and found_equals and brace_depth == 0 and angle_depth == 0) {
-            // Peek ahead to check for union continuation
+            // Peek ahead to check for union/intersection continuation
             var peek = i + 1;
             while (peek < content.len and (content[peek] == ' ' or content[peek] == '\t')) : (peek += 1) {}
-            if (peek < content.len and content[peek] == '|') {
-                // Union continuation - keep scanning
+            if (peek < content.len and (content[peek] == '|' or content[peek] == '&')) {
+                // Union/intersection continuation - keep scanning
                 i += 1;
                 continue;
             }
             return i;
+        }
+
+        // If we're at the end of a line with trailing '&' or '|', continue to next line
+        // This handles `type X = A &` or `type X = A |` at line end
+        if ((c == '&' or c == '|') and found_equals and brace_depth == 0 and angle_depth == 0) {
+            // Check if this is at end of line (only whitespace follows until newline)
+            var peek = i + 1;
+            while (peek < content.len and (content[peek] == ' ' or content[peek] == '\t')) : (peek += 1) {}
+            if (peek < content.len and content[peek] == '\n') {
+                // Trailing operator - skip past the newline and continue
+                i = peek + 1;
+                continue;
+            }
         }
 
         i += 1;
