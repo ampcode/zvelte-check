@@ -177,19 +177,21 @@ const NarrowingContext = struct {
     }
 
     /// Close some inner if-blocks, keeping the outer ones open.
-    /// Respects min_binding_depth to avoid closing scopes with variable declarations.
+    /// Does NOT respect min_binding_depth - caller must decide if force closing is needed.
     fn closeInner(self: *NarrowingContext, output: *std.ArrayList(u8), keep_count: usize) !void {
-        // Never close below min_binding_depth
-        const actual_keep = @max(keep_count, self.min_binding_depth);
-        if (actual_keep >= self.conditions_opened) return;
+        if (keep_count >= self.conditions_opened) return;
 
-        const to_close = self.conditions_opened - @as(u32, @intCast(actual_keep));
+        const to_close = self.conditions_opened - @as(u32, @intCast(keep_count));
         var j: u32 = 0;
         while (j < to_close) : (j += 1) {
             try output.appendSlice(self.allocator, "}\n");
         }
-        self.conditions_opened = @intCast(actual_keep);
-        self.enclosing_branches.shrinkRetainingCapacity(actual_keep);
+        self.conditions_opened = @intCast(keep_count);
+        self.enclosing_branches.shrinkRetainingCapacity(keep_count);
+        // Reset min_binding_depth if we closed past it
+        if (self.min_binding_depth > keep_count) {
+            self.min_binding_depth = @intCast(keep_count);
+        }
     }
 
     /// Ensure the if-block for the given branches is open.
@@ -6310,22 +6312,27 @@ fn emitSnippetBodyExpressions(
     each_body_ranges: []const EachBodyRange,
     has_expressions: *bool,
 ) !void {
-    // Collect render expressions and other expressions from the snippet body
-    var body_exprs: std.ArrayList(struct { expr: []const u8, offset: u32 }) = .empty;
-    defer body_exprs.deinit(allocator);
-
-    // Collect components inside the snippet body for props validation
+    // Unified item type for all snippet body items - enables source-order emission.
+    // Processing items in source order ensures bindings are in scope when expressions use them.
     const ComponentInfo = struct { data_index: u32, node_start: u32 };
-    var body_components: std.ArrayList(ComponentInfo) = .empty;
-    defer body_components.deinit(allocator);
+    const SnippetBodyItem = union(enum) {
+        expression: struct { expr: []const u8, offset: u32 },
+        component: ComponentInfo,
+        each_binding: EachBindingInfo,
+        const_binding: struct { binding: ConstBindingInfo, offset: u32 },
 
-    // Collect each bindings inside the snippet body
-    var each_bindings: std.ArrayList(EachBindingInfo) = .empty;
-    defer each_bindings.deinit(allocator);
+        fn offset(self: @This()) u32 {
+            return switch (self) {
+                .expression => |e| e.offset,
+                .component => |c| c.node_start,
+                .each_binding => |b| b.offset,
+                .const_binding => |c| c.offset,
+            };
+        }
+    };
 
-    // Collect const bindings inside the snippet body
-    var const_bindings: std.ArrayList(struct { binding: ConstBindingInfo, offset: u32 }) = .empty;
-    defer const_bindings.deinit(allocator);
+    var body_items: std.ArrayList(SnippetBodyItem) = .empty;
+    defer body_items.deinit(allocator);
 
     for (ast.nodes.items) |node| {
         // Only process nodes within this snippet's body range
@@ -6334,88 +6341,95 @@ fn emitSnippetBodyExpressions(
         switch (node.kind) {
             .render => {
                 if (extractRenderExpression(ast.source, node.start, node.end)) |render_info| {
-                    try body_exprs.append(allocator, .{
+                    try body_items.append(allocator, .{ .expression = .{
                         .expr = render_info.expr,
                         .offset = node.start + render_info.offset,
-                    });
+                    } });
                 }
             },
             .expression => {
                 if (extractPlainExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try body_exprs.append(allocator, .{
+                    try body_items.append(allocator, .{ .expression = .{
                         .expr = expr_info.expr,
                         .offset = node.start + expr_info.offset,
-                    });
+                    } });
                 }
             },
             .if_block => {
                 if (extractIfExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try body_exprs.append(allocator, .{
+                    try body_items.append(allocator, .{ .expression = .{
                         .expr = expr_info.expr,
                         .offset = node.start + expr_info.offset,
-                    });
+                    } });
                 }
             },
             .key_block => {
                 if (extractKeyExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try body_exprs.append(allocator, .{
+                    try body_items.append(allocator, .{ .expression = .{
                         .expr = expr_info.expr,
                         .offset = node.start + expr_info.offset,
-                    });
+                    } });
                 }
             },
             .html => {
                 if (extractHtmlExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try body_exprs.append(allocator, .{
+                    try body_items.append(allocator, .{ .expression = .{
                         .expr = expr_info.expr,
                         .offset = node.start + expr_info.offset,
-                    });
+                    } });
                 }
             },
             .debug_tag => {
                 if (extractDebugExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try body_exprs.append(allocator, .{
+                    try body_items.append(allocator, .{ .expression = .{
                         .expr = expr_info.expr,
                         .offset = node.start + expr_info.offset,
-                    });
+                    } });
                 }
             },
             .await_block => {
                 if (extractAwaitExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try body_exprs.append(allocator, .{
+                    try body_items.append(allocator, .{ .expression = .{
                         .expr = expr_info.expr,
                         .offset = node.start + expr_info.offset,
-                    });
+                    } });
                 }
             },
             .component => {
                 // Collect component for props validation inside snippet scope
-                try body_components.append(allocator, .{
+                try body_items.append(allocator, .{ .component = .{
                     .data_index = node.data,
                     .node_start = node.start,
-                });
+                } });
             },
             .each_block => {
                 // Collect each bindings for proper typing inside snippet scope
                 if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
-                    try each_bindings.append(allocator, binding);
+                    try body_items.append(allocator, .{ .each_binding = binding });
                 }
             },
             .const_tag => {
                 // Collect const bindings for proper typing inside snippet scope
                 if (extractConstBinding(ast.source, node.start, node.end)) |binding| {
-                    try const_bindings.append(allocator, .{
+                    try body_items.append(allocator, .{ .const_binding = .{
                         .binding = binding,
                         .offset = node.start,
-                    });
+                    } });
                 }
             },
             else => {},
         }
     }
 
-    // If there are no body expressions, components, each bindings, or const bindings, nothing to emit
-    if (body_exprs.items.len == 0 and body_components.items.len == 0 and each_bindings.items.len == 0 and const_bindings.items.len == 0) return;
+    // If there are no body items, nothing to emit
+    if (body_items.items.len == 0) return;
+
+    // Sort items by source offset to ensure bindings come before expressions that use them
+    std.mem.sort(SnippetBodyItem, body_items.items, {}, struct {
+        fn lessThan(_: void, a: SnippetBodyItem, b: SnippetBodyItem) bool {
+            return a.offset() < b.offset();
+        }
+    }.lessThan);
 
     if (!has_expressions.*) {
         try output.appendSlice(allocator, ";// Template expressions\n");
@@ -6477,63 +6491,13 @@ fn emitSnippetBodyExpressions(
     defer narrowing_ctx.deinit();
     narrowing_ctx.has_expressions = true; // Already inside snippet IIFE
 
-    // Pre-process outer_enclosing branches to prefix inner branch lookups.
-    // All snippet body items inherit the outer enclosing conditions.
+    // Emit all items in source order - this ensures bindings come before expressions that use them.
+    // Using a single unified loop instead of separate loops for each item type.
+    for (body_items.items) |item| {
+        const item_offset = item.offset();
 
-    // Emit each bindings with narrowing applied
-    // This provides proper typing for loop variables like `{#each m.content as block}`
-    for (each_bindings.items) |binding| {
-        // Find enclosing if branches for this each block (within snippet scope)
-        var inner_enclosing = try findAllEnclosingIfBranches(allocator, binding.offset, snippet_branches.items);
-        defer inner_enclosing.deinit(allocator);
-
-        // Combine outer + inner branches for full context
-        var combined_branches: std.ArrayList(IfBranch) = .empty;
-        defer combined_branches.deinit(allocator);
-        try combined_branches.appendSlice(allocator, outer_enclosing.items);
-        try combined_branches.appendSlice(allocator, inner_enclosing.items);
-
-        // Use NarrowingContext to manage scope - keeps if-blocks open across bindings
-        try narrowing_ctx.ensureOpen(output, combined_branches.items);
-
-        // Emit the each binding declarations
-        try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
-
-        // Mark that a binding was emitted - prevents closing this scope
-        narrowing_ctx.markBindingEmitted();
-    }
-
-    // Emit const bindings with narrowing applied
-    // This provides proper typing for {@const} declarations like `{@const lastThinkingIndex = ...}`
-    for (const_bindings.items) |const_info| {
-        // Find enclosing if branches for this const (within snippet scope)
-        var inner_enclosing = try findAllEnclosingIfBranches(allocator, const_info.offset, snippet_branches.items);
-        defer inner_enclosing.deinit(allocator);
-
-        // Combine outer + inner branches for full context
-        var combined_branches: std.ArrayList(IfBranch) = .empty;
-        defer combined_branches.deinit(allocator);
-        try combined_branches.appendSlice(allocator, outer_enclosing.items);
-        try combined_branches.appendSlice(allocator, inner_enclosing.items);
-
-        // Use NarrowingContext to manage scope - keeps if-blocks open across bindings
-        try narrowing_ctx.ensureOpen(output, combined_branches.items);
-
-        // Emit the const binding declaration
-        try output.appendSlice(allocator, "var ");
-        try output.appendSlice(allocator, const_info.binding.name);
-        try output.appendSlice(allocator, " = ");
-        try output.appendSlice(allocator, const_info.binding.expr);
-        try output.appendSlice(allocator, ";\n");
-
-        // Mark that a binding was emitted - prevents closing this scope
-        narrowing_ctx.markBindingEmitted();
-    }
-
-    // Emit each body expression with narrowing applied
-    for (body_exprs.items) |expr_info| {
-        // Find enclosing if branches for this expression (within snippet scope)
-        var inner_enclosing = try findAllEnclosingIfBranches(allocator, expr_info.offset, snippet_branches.items);
+        // Find enclosing if branches for this item (within snippet scope)
+        var inner_enclosing = try findAllEnclosingIfBranches(allocator, item_offset, snippet_branches.items);
         defer inner_enclosing.deinit(allocator);
 
         // Combine outer + inner branches for full context
@@ -6545,52 +6509,57 @@ fn emitSnippetBodyExpressions(
         // Use NarrowingContext to manage scope
         try narrowing_ctx.ensureOpen(output, combined_branches.items);
 
-        // Emit the actual expression
-        try output.appendSlice(allocator, "void (");
-        try mappings.append(allocator, .{
-            .svelte_offset = expr_info.offset,
-            .ts_offset = @intCast(output.items.len),
-            .len = @intCast(expr_info.expr.len),
-        });
-        try output.appendSlice(allocator, expr_info.expr);
-        try output.appendSlice(allocator, ");\n");
-    }
+        switch (item) {
+            .each_binding => |binding| {
+                // Emit the each binding declarations
+                try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
+                // Mark that a binding was emitted at current depth
+                narrowing_ctx.markBindingEmitted();
+            },
+            .const_binding => |const_info| {
+                // Emit the const binding declaration
+                try output.appendSlice(allocator, "var ");
+                try output.appendSlice(allocator, const_info.binding.name);
+                try output.appendSlice(allocator, " = ");
+                try output.appendSlice(allocator, const_info.binding.expr);
+                try output.appendSlice(allocator, ";\n");
+                // Mark that a binding was emitted at current depth
+                narrowing_ctx.markBindingEmitted();
+            },
+            .expression => |expr_info| {
+                // Emit the actual expression
+                try output.appendSlice(allocator, "void (");
+                try mappings.append(allocator, .{
+                    .svelte_offset = expr_info.offset,
+                    .ts_offset = @intCast(output.items.len),
+                    .len = @intCast(expr_info.expr.len),
+                });
+                try output.appendSlice(allocator, expr_info.expr);
+                try output.appendSlice(allocator, ");\n");
+            },
+            .component => |comp_info| {
+                // Skip component validation in non-TypeScript mode
+                if (!is_typescript) continue;
 
-    // Emit component props validation for components inside this snippet
-    // Only in TypeScript mode (component props validation requires type checking)
-    if (is_typescript) {
-        for (body_components.items) |comp_info| {
-            const elem_data = ast.elements.items[comp_info.data_index];
-            const tag_name = elem_data.tag_name;
+                const elem_data = ast.elements.items[comp_info.data_index];
+                const tag_name = elem_data.tag_name;
 
-            // Skip svelte: special elements
-            if (std.mem.startsWith(u8, tag_name, "svelte:")) continue;
+                // Skip svelte: special elements
+                if (std.mem.startsWith(u8, tag_name, "svelte:")) continue;
 
-            // Find enclosing if branches for this component (within snippet scope)
-            var inner_enclosing = try findAllEnclosingIfBranches(allocator, comp_info.node_start, snippet_branches.items);
-            defer inner_enclosing.deinit(allocator);
-
-            // Combine outer + inner branches for full context
-            var combined_branches: std.ArrayList(IfBranch) = .empty;
-            defer combined_branches.deinit(allocator);
-            try combined_branches.appendSlice(allocator, outer_enclosing.items);
-            try combined_branches.appendSlice(allocator, inner_enclosing.items);
-
-            // Use NarrowingContext to manage scope
-            try narrowing_ctx.ensureOpen(output, combined_branches.items);
-
-            // Emit component props validation
-            try emitComponentPropsValidation(
-                allocator,
-                ast.source,
-                output,
-                mappings,
-                tag_name,
-                elem_data.attrs_start,
-                elem_data.attrs_end,
-                ast.attributes.items,
-            );
-            try output.appendSlice(allocator, "\n");
+                // Emit component props validation
+                try emitComponentPropsValidation(
+                    allocator,
+                    ast.source,
+                    output,
+                    mappings,
+                    tag_name,
+                    elem_data.attrs_start,
+                    elem_data.attrs_end,
+                    ast.attributes.items,
+                );
+                try output.appendSlice(allocator, "\n");
+            },
         }
     }
 
