@@ -979,8 +979,11 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         // Skip "Argument of type 'X | null' is not assignable to parameter of type 'Y'"
         // False positives from template narrowing: {#if x} narrows x to be non-null,
         // but our transformer emits bindings at module scope without narrowing.
-        if (std.mem.indexOf(u8, message, "| null' is not assignable to parameter of type") != null) {
-            return true;
+        // Only skip for template code - script code should report these as real errors.
+        if (!is_from_script) {
+            if (std.mem.indexOf(u8, message, "| null' is not assignable to parameter of type") != null) {
+                return true;
+            }
         }
 
         // Skip "Argument of type 'unknown' is not assignable" errors
