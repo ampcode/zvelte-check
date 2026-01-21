@@ -1899,7 +1899,7 @@ fn emitTemplateExpressions(
     // Unified item type for source-order emission of all template items.
     // Processing in source order ensures narrowing contexts stay coherent:
     // expressions inside an if-block see the narrowed type from the condition.
-    const ElementInfo = struct { data_index: u32, node_start: u32, is_component: bool };
+    const ElementInfo = struct { data_index: u32, node_start: u32, is_component: bool, has_children: bool };
     const AwaitInfo = struct { expr: []const u8, expr_offset: u32, node_start: u32, node_end: u32 };
     const ThenCatchInfo = struct { binding_pattern: []const u8, node_start: u32 };
     const TemplateItem = union(enum) {
@@ -2145,6 +2145,7 @@ fn emitTemplateExpressions(
                                 .data_index = node.data,
                                 .node_start = node.start,
                                 .is_component = false,
+                                .has_children = false,
                             } });
                         }
                     }
@@ -2174,10 +2175,16 @@ fn emitTemplateExpressions(
                 // Always add components for validation to catch missing required props
                 if (is_typescript) {
                     if (!std.mem.startsWith(u8, tag, "svelte:")) {
+                        // Component has children if it's not self-closing AND has non-snippet content.
+                        // Svelte 5 only passes implicit `children` when there's actual content
+                        // (text, expressions, elements) between tags, NOT just named snippets.
+                        const has_children = !elem_data.is_self_closing and
+                            componentHasNonSnippetChildren(ast.source, tag, node.start);
                         try template_items.append(allocator, .{ .html_element = .{
                             .data_index = node.data,
                             .node_start = node.start,
                             .is_component = true,
+                            .has_children = has_children,
                         } });
                     }
                 }
@@ -2379,6 +2386,7 @@ fn emitTemplateExpressions(
                         elem_data.attrs_end,
                         ast.attributes.items,
                         h.node_start,
+                        h.has_children,
                     );
                 } else {
                     // HTML element: emit attribute validation
@@ -2661,6 +2669,7 @@ fn emitComponentPropsValidation(
     attrs_end: u32,
     attributes: []const AttributeData,
     node_start: u32,
+    has_children: bool,
 ) !void {
     const attrs = attributes[attrs_start..attrs_end];
 
@@ -2751,6 +2760,15 @@ fn emitComponentPropsValidation(
                 try output.appendSlice(allocator, "true");
             }
         }
+    }
+
+    // Emit implicit children snippet prop when component has content between tags.
+    // Svelte 5 automatically passes content as a `children` snippet prop.
+    if (has_children) {
+        if (!first_prop) {
+            try output.appendSlice(allocator, ", ");
+        }
+        try output.appendSlice(allocator, "children: null! as Snippet");
     }
 
     try output.appendSlice(allocator, " });\n");
@@ -6250,6 +6268,110 @@ fn isInsideSnippetBody(pos: u32, ranges: []const SnippetBodyRange) bool {
     return false;
 }
 
+/// Checks if a component has non-snippet children content.
+/// Returns true if there's actual content (text, expressions, elements) between the component tags
+/// that isn't just named snippets. Svelte 5 only passes an implicit `children` prop when there's
+/// such non-snippet content.
+fn componentHasNonSnippetChildren(source: []const u8, tag_name: []const u8, node_start: u32) bool {
+    // Find the end of the opening tag
+    var pos: usize = node_start;
+    var depth: usize = 0;
+    var in_string: u8 = 0;
+
+    // Skip to the closing '>' of the opening tag
+    while (pos < source.len) {
+        const c = source[pos];
+        if (in_string != 0) {
+            if (c == in_string and (pos == 0 or source[pos - 1] != '\\')) {
+                in_string = 0;
+            }
+        } else if (c == '"' or c == '\'') {
+            in_string = c;
+        } else if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            if (depth > 0) depth -= 1;
+        } else if (c == '>' and depth == 0) {
+            pos += 1;
+            break;
+        }
+        pos += 1;
+    }
+
+    if (pos >= source.len) return false;
+
+    // Now scan the content between opening and closing tags
+    const content_start = pos;
+
+    // Find the closing tag </TagName>
+    const closing_pattern_start = "</";
+
+    while (pos < source.len) {
+        if (pos + closing_pattern_start.len + tag_name.len < source.len and
+            std.mem.startsWith(u8, source[pos..], closing_pattern_start))
+        {
+            const after_lt_slash = pos + closing_pattern_start.len;
+            if (std.mem.startsWith(u8, source[after_lt_slash..], tag_name)) {
+                const after_tag = after_lt_slash + tag_name.len;
+                if (after_tag < source.len and (source[after_tag] == '>' or std.ascii.isWhitespace(source[after_tag]))) {
+                    // Found the closing tag at pos
+                    break;
+                }
+            }
+        }
+        pos += 1;
+    }
+
+    const content_end = pos;
+    if (content_end <= content_start) return false;
+
+    const content = source[content_start..content_end];
+
+    // Check if content contains anything other than whitespace and named snippets.
+    // Strategy: strip all {#snippet ...}{/snippet} blocks and whitespace, see if anything remains.
+    var i: usize = 0;
+    var snippet_depth: usize = 0;
+
+    while (i < content.len) {
+        // Skip whitespace outside snippets
+        if (snippet_depth == 0 and std.ascii.isWhitespace(content[i])) {
+            i += 1;
+            continue;
+        }
+
+        // Check for {#snippet start
+        if (snippet_depth == 0 and i + 10 < content.len and std.mem.startsWith(u8, content[i..], "{#snippet ")) {
+            snippet_depth = 1;
+            i += 10;
+            continue;
+        }
+
+        // Check for {/snippet} end
+        if (snippet_depth > 0 and i + 10 <= content.len and std.mem.startsWith(u8, content[i..], "{/snippet}")) {
+            snippet_depth -= 1;
+            i += 10;
+            continue;
+        }
+
+        // Inside a snippet, skip everything
+        if (snippet_depth > 0) {
+            // Handle nested snippets
+            if (i + 10 < content.len and std.mem.startsWith(u8, content[i..], "{#snippet ")) {
+                snippet_depth += 1;
+                i += 10;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Found non-whitespace, non-snippet content
+        return true;
+    }
+
+    return false;
+}
+
 /// Emits expressions from inside a snippet body, wrapped in a block with snippet parameters in scope.
 /// This ensures that expressions like `{@render threadItem(thread)}` inside `{#snippet children(thread: T)}`
 /// have access to the `thread` parameter.
@@ -6267,7 +6389,7 @@ fn emitSnippetBodyExpressions(
 ) !void {
     // Unified item type for all snippet body items - enables source-order emission.
     // Processing items in source order ensures bindings are in scope when expressions use them.
-    const ComponentInfo = struct { data_index: u32, node_start: u32 };
+    const ComponentInfo = struct { data_index: u32, node_start: u32, has_children: bool };
     const SnippetBodyItem = union(enum) {
         expression: struct { expr: []const u8, offset: u32 },
         component: ComponentInfo,
@@ -6350,9 +6472,13 @@ fn emitSnippetBodyExpressions(
             },
             .component => {
                 // Collect component for props validation inside snippet scope
+                const elem_data = ast.elements.items[node.data];
+                const has_children = !elem_data.is_self_closing and
+                    componentHasNonSnippetChildren(ast.source, elem_data.tag_name, node.start);
                 try body_items.append(allocator, .{ .component = .{
                     .data_index = node.data,
                     .node_start = node.start,
+                    .has_children = has_children,
                 } });
             },
             .each_block => {
@@ -6526,6 +6652,7 @@ fn emitSnippetBodyExpressions(
                     elem_data.attrs_end,
                     ast.attributes.items,
                     comp_info.node_start,
+                    comp_info.has_children,
                 );
                 try output.appendSlice(allocator, "\n");
             },
