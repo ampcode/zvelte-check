@@ -1882,9 +1882,44 @@ fn emitTemplateExpressions(
     // subsequent {:then value} can emit `let value = await (promiseExpr);`
     var current_await_expr: ?[]const u8 = null;
 
+    // Unified item type for source-order emission of all template items.
+    // Processing in source order ensures narrowing contexts stay coherent:
+    // expressions inside an if-block see the narrowed type from the condition.
+    const ElementInfo = struct { data_index: u32, node_start: u32, is_component: bool };
+    const AwaitInfo = struct { expr: []const u8, expr_offset: u32, node_start: u32, node_end: u32 };
+    const ThenCatchInfo = struct { binding_pattern: []const u8, node_start: u32 };
+    const TemplateItem = union(enum) {
+        expression: struct { expr: []const u8, offset: u32 },
+        const_binding: struct { binding: ConstBindingInfo, offset: u32 },
+        each_binding: struct { binding: EachBindingInfo, offset: u32 },
+        snippet: struct { name: []const u8, range: SnippetBodyRange },
+        html_element: ElementInfo,
+        await_block: AwaitInfo,
+        then_block: ThenCatchInfo,
+        catch_block: ThenCatchInfo,
+        else_block: struct { node_start: u32, node_end: u32 },
+
+        fn offset(self: @This()) u32 {
+            return switch (self) {
+                .expression => |e| e.offset,
+                .const_binding => |c| c.offset,
+                .each_binding => |e| e.offset,
+                .snippet => |s| s.range.snippet_start,
+                .html_element => |h| h.node_start,
+                .await_block => |a| a.node_start,
+                .then_block => |t| t.node_start,
+                .catch_block => |c| c.node_start,
+                .else_block => |e| e.node_start,
+            };
+        }
+    };
+
+    var template_items: std.ArrayList(TemplateItem) = .empty;
+    defer template_items.deinit(allocator);
+
+    // First pass: collect all template items from AST nodes
     for (ast.nodes.items) |node| {
         // Skip nodes that are inside snippet bodies - they'll be handled inside the snippet function.
-        // This prevents "Cannot find name" errors for snippet parameters used in body expressions.
         // Exception: the snippet node itself, which we need to process to emit the full snippet function.
         if (node.kind != .snippet and isInsideSnippetBody(node.start, snippet_body_ranges)) {
             continue;
@@ -1892,9 +1927,6 @@ fn emitTemplateExpressions(
 
         switch (node.kind) {
             .snippet => {
-                // Emit the full snippet function with its body expressions.
-                // This replaces the empty hoisted declaration with a proper implementation
-                // that has snippet parameters in scope for body expressions.
                 if (extractSnippetName(ast.source, node.start, node.end)) |info| {
                     // Mark snippet name as "used" to suppress "declared but never read" warnings
                     if (!declared_names.contains(info.name)) {
@@ -1907,22 +1939,10 @@ fn emitTemplateExpressions(
                     // Find the body range for this snippet
                     for (snippet_body_ranges) |range| {
                         if (std.mem.eql(u8, range.name, info.name)) {
-                            // Close any open narrowing context before emitting snippet body
-                            // Snippets create their own scope, so we can't share the if-block
-                            try narrowing_ctx.close(output);
-                            // Emit snippet body expressions inside a block.
-                            // This creates a scope where snippet parameters are available.
-                            try emitSnippetBodyExpressions(
-                                allocator,
-                                ast,
-                                output,
-                                mappings,
-                                range,
-                                is_typescript,
-                                if_branches,
-                                each_body_ranges,
-                                &narrowing_ctx.has_expressions,
-                            );
+                            try template_items.append(allocator, .{ .snippet = .{
+                                .name = info.name,
+                                .range = range,
+                            } });
                             break;
                         }
                     }
@@ -1930,716 +1950,465 @@ fn emitTemplateExpressions(
             },
 
             .render => {
-                // Emit the full render expression to validate snippet call signatures.
-                // {@render snippet(args)} → void (snippet(args));
-                // This allows TypeScript to check argument count/types against snippet definition.
                 const expr = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
 
                 if (extractRenderExpression(ast.source, node.start, node.end)) |render_info| {
-                    // Use narrowing context to keep if-blocks open across expressions
-                    try narrowing_ctx.emitExpression(
-                        output,
-                        mappings,
-                        render_info.expr,
-                        node.start + render_info.offset,
-                        if_branches,
-                    );
+                    try template_items.append(allocator, .{ .expression = .{
+                        .expr = render_info.expr,
+                        .offset = node.start + render_info.offset,
+                    } });
                 }
             },
 
             .expression => {
-                // Extract identifiers AND emit full expression for property access checking.
-                // For {searchUsers.pending}, we emit both:
-                // - void searchUsers; (for noUnusedLocals)
-                // - void (searchUsers.pending); (for property access type-checking)
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractPlainExpression(ast.source, node.start, node.end)) |expr_info| {
-                    // Use narrowing context to keep if-blocks open across expressions
-                    try narrowing_ctx.emitExpression(
-                        output,
-                        mappings,
-                        expr_info.expr,
-                        node.start + expr_info.offset,
-                        if_branches,
-                    );
+                    try template_items.append(allocator, .{ .expression = .{
+                        .expr = expr_info.expr,
+                        .offset = node.start + expr_info.offset,
+                    } });
                 }
             },
 
             .if_block => {
-                // Extract identifiers AND emit full condition for property access checking.
-                // Use narrowed expression emission - if this {#if} is nested inside another
-                // {#if}/{:else if} block, the enclosing narrowing should apply.
+                // Extract identifiers for noUnusedLocals checking.
+                // We do NOT emit the condition as a void expression because:
+                // 1. The condition is already type-checked when NarrowingContext emits `if (condition) {`
+                // 2. Emitting it separately can break TypeScript's control flow analysis
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
-
-                if (extractIfExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try narrowing_ctx.emitExpression(
-                        output,
-                        mappings,
-                        expr_info.expr,
-                        node.start + expr_info.offset,
-                        if_branches,
-                    );
-                }
             },
 
             .key_block => {
-                // Extract identifiers AND emit full key expression.
-                // Use narrowed expression emission for proper type narrowing.
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractKeyExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try narrowing_ctx.emitExpression(
-                        output,
-                        mappings,
-                        expr_info.expr,
-                        node.start + expr_info.offset,
-                        if_branches,
-                    );
+                    try template_items.append(allocator, .{ .expression = .{
+                        .expr = expr_info.expr,
+                        .offset = node.start + expr_info.offset,
+                    } });
                 }
             },
 
             .html => {
-                // Extract identifiers AND emit full expression.
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractHtmlExpression(ast.source, node.start, node.end)) |expr_info| {
-                    // Use narrowing context to keep if-blocks open across expressions
-                    try narrowing_ctx.emitExpression(
-                        output,
-                        mappings,
-                        expr_info.expr,
-                        node.start + expr_info.offset,
-                        if_branches,
-                    );
+                    try template_items.append(allocator, .{ .expression = .{
+                        .expr = expr_info.expr,
+                        .offset = node.start + expr_info.offset,
+                    } });
                 }
             },
 
             .const_tag => {
-                // {@const} declares a variable - emit it BEFORE expressions that use it.
-                // Extract identifiers from the RHS for noUnusedLocals checking.
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
-                // Emit the const declaration with narrowing (for {#if} contexts)
                 if (extractConstBinding(ast.source, node.start, node.end)) |binding| {
-                    // Track binding name to avoid void statement at module scope
                     try template_bindings.put(allocator, binding.name, {});
-                    try narrowing_ctx.emitConstBinding(output, binding, node.start, if_branches);
+                    try template_items.append(allocator, .{ .const_binding = .{
+                        .binding = binding,
+                        .offset = node.start,
+                    } });
                 }
             },
 
             .debug_tag => {
-                // Extract identifiers AND emit debug expressions.
-                // Use narrowed expression emission for proper type narrowing.
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
 
                 if (extractDebugExpression(ast.source, node.start, node.end)) |expr_info| {
-                    try narrowing_ctx.emitExpression(
-                        output,
-                        mappings,
-                        expr_info.expr,
-                        node.start + expr_info.offset,
-                        if_branches,
-                    );
+                    try template_items.append(allocator, .{ .expression = .{
+                        .expr = expr_info.expr,
+                        .offset = node.start + expr_info.offset,
+                    } });
                 }
             },
 
             .await_block => {
-                // {#await promise} or {#await promise then value} - extract identifiers
-                // and track the promise expression for subsequent {:then} blocks
                 const raw = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
-                // Store the await expression for {:then}/{:catch} type inference
+
                 if (extractAwaitExpression(ast.source, node.start, node.end)) |await_info| {
-                    current_await_expr = await_info.expr;
-
-                    // Emit the await expression for property access checking
-                    try narrowing_ctx.emitExpression(
-                        output,
-                        mappings,
-                        await_info.expr,
-                        node.start + await_info.offset,
-                        if_branches,
-                    );
-
-                    // Handle inline {#await promise then value} syntax
-                    // This is different from {:then value} which gets its own .then_block node
-                    if (extractInlineThenBinding(ast.source, node.start, node.end)) |binding_pattern| {
-                        // Track binding names to avoid emitting void statements for them at module scope.
-                        // For destructuring patterns like [a, b] or {x, y}, extract individual names.
-                        try extractBindingNames(allocator, binding_pattern, &template_bindings);
-
-                        // Close any open narrowing context before emitting standalone declaration
-                        try narrowing_ctx.close(output);
-                        if (!narrowing_ctx.has_expressions) {
-                            try output.appendSlice(allocator, ";// Template expressions\n");
-                            narrowing_ctx.has_expressions = true;
-                        }
-                        const is_destructuring = binding_pattern.len > 0 and (binding_pattern[0] == '{' or binding_pattern[0] == '[');
-                        if (is_destructuring) {
-                            // Emit: var { x, y } = await (promiseExpr);
-                            try output.appendSlice(allocator, "var ");
-                            try output.appendSlice(allocator, binding_pattern);
-                            try output.appendSlice(allocator, " = await (");
-                            try output.appendSlice(allocator, await_info.expr);
-                            try output.appendSlice(allocator, ");\n");
-                        } else {
-                            // Emit: let value = await (promiseExpr);
-                            try output.appendSlice(allocator, "let ");
-                            try output.appendSlice(allocator, binding_pattern);
-                            try output.appendSlice(allocator, " = await (");
-                            try output.appendSlice(allocator, await_info.expr);
-                            try output.appendSlice(allocator, ");\n");
-                        }
-                    }
-                } else {
-                    current_await_expr = null;
+                    try template_items.append(allocator, .{ .await_block = .{
+                        .expr = await_info.expr,
+                        .expr_offset = node.start + await_info.offset,
+                        .node_start = node.start,
+                        .node_end = node.end,
+                    } });
                 }
             },
 
             .then_block => {
-                // {:then value} - emit binding for the resolved value
-                // Don't extract identifiers from the full expression (would extract "then" keyword)
                 if (extractThenCatchBinding(ast.source, node.start, node.end, "then")) |binding_pattern| {
-                    // Track binding names to avoid emitting void statements for them at module scope.
-                    // For destructuring patterns like [a, b] or {x, y}, extract individual names.
                     try extractBindingNames(allocator, binding_pattern, &template_bindings);
-
-                    // Close any open narrowing context before emitting standalone declaration
-                    try narrowing_ctx.close(output);
-                    if (!narrowing_ctx.has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        narrowing_ctx.has_expressions = true;
-                    }
-                    // For destructuring patterns, we need an initializer
-                    // For simple identifiers, we can use await to infer the type
-                    const is_destructuring = binding_pattern.len > 0 and (binding_pattern[0] == '{' or binding_pattern[0] == '[');
-                    if (is_destructuring) {
-                        // Emit: var { x, y } = await (promiseExpr);
-                        // This infers the type from the promise's resolved value
-                        try output.appendSlice(allocator, "var ");
-                        try output.appendSlice(allocator, binding_pattern);
-                        if (current_await_expr) |await_expr| {
-                            try output.appendSlice(allocator, " = await (");
-                            try output.appendSlice(allocator, await_expr);
-                            try output.appendSlice(allocator, ");\n");
-                        } else if (is_typescript) {
-                            try output.appendSlice(allocator, " = {} as any;\n");
-                        } else {
-                            try output.appendSlice(allocator, " = {};\n");
-                        }
-                    } else {
-                        // Emit: let value = await (promiseExpr);
-                        // This infers the type from the promise's resolved value
-                        try output.appendSlice(allocator, "let ");
-                        try output.appendSlice(allocator, binding_pattern);
-                        if (current_await_expr) |await_expr| {
-                            try output.appendSlice(allocator, " = await (");
-                            try output.appendSlice(allocator, await_expr);
-                            try output.appendSlice(allocator, ");\n");
-                        } else if (is_typescript) {
-                            try output.appendSlice(allocator, ": unknown;\n");
-                        } else {
-                            try output.appendSlice(allocator, ";\n");
-                        }
-                    }
+                    try template_items.append(allocator, .{ .then_block = .{
+                        .binding_pattern = binding_pattern,
+                        .node_start = node.start,
+                    } });
                 }
             },
 
             .catch_block => {
-                // {:catch error} - emit binding for the error
                 if (extractThenCatchBinding(ast.source, node.start, node.end, "catch")) |binding_pattern| {
-                    // Track binding names to avoid emitting void statements for them at module scope.
-                    // For destructuring patterns like [a, b] or {x, y}, extract individual names.
                     try extractBindingNames(allocator, binding_pattern, &template_bindings);
-
-                    // Close any open narrowing context before emitting standalone declaration
-                    try narrowing_ctx.close(output);
-                    if (!narrowing_ctx.has_expressions) {
-                        try output.appendSlice(allocator, ";// Template expressions\n");
-                        narrowing_ctx.has_expressions = true;
-                    }
-                    // For destructuring patterns, we need an initializer
-                    // For simple identifiers, type annotation is sufficient
-                    const is_destructuring = binding_pattern.len > 0 and (binding_pattern[0] == '{' or binding_pattern[0] == '[');
-                    if (is_destructuring) {
-                        // Emit: var { x, y } = {} as any;
-                        try output.appendSlice(allocator, "var ");
-                        try output.appendSlice(allocator, binding_pattern);
-                        if (is_typescript) {
-                            try output.appendSlice(allocator, " = {} as any;\n");
-                        } else {
-                            try output.appendSlice(allocator, " = {};\n");
-                        }
-                    } else {
-                        // Emit: let error: unknown;
-                        try output.appendSlice(allocator, "let ");
-                        try output.appendSlice(allocator, binding_pattern);
-                        if (is_typescript) {
-                            try output.appendSlice(allocator, ": unknown");
-                        }
-                        try output.appendSlice(allocator, ";\n");
-                    }
+                    try template_items.append(allocator, .{ .catch_block = .{
+                        .binding_pattern = binding_pattern,
+                        .node_start = node.start,
+                    } });
                 }
             },
 
             .else_block => {
-                // {:else} or {:else if condition} - don't extract "else" keyword
-                // If it's {:else if condition}, extract identifiers from the condition
                 const expr = ast.source[node.start..node.end];
-                // Skip {:else prefix and extract from the rest
                 if (std.mem.indexOf(u8, expr, ":else if ")) |idx| {
                     const condition = expr[idx + ":else if ".len ..];
                     try extractIdentifiersFromExpr(allocator, condition, node.start + @as(u32, @intCast(idx + ":else if ".len)), &template_refs);
                 }
-                // Plain {:else} has no expressions to extract
+                try template_items.append(allocator, .{ .else_block = .{
+                    .node_start = node.start,
+                    .node_end = node.end,
+                } });
             },
 
             .each_block => {
-                // Extract identifiers from each expression and emit binding declarations
                 const expr = ast.source[node.start..node.end];
                 try extractIdentifiersFromExpr(allocator, expr, node.start, &template_refs);
 
-                // Parse and emit each block bindings (item, index variables)
-                // Use narrowing context so {#each} inside {#if} shares the same if-block
                 if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
-                    // Track binding names to avoid emitting void statements for them at module scope.
-                    // This prevents TypeScript from merging types across different if-branches.
-                    // For destructuring patterns like [a, b] or {x, y}, extract individual names.
                     try extractBindingNames(allocator, binding.item_binding, &template_bindings);
                     if (binding.index_binding) |idx| {
                         try template_bindings.put(allocator, idx, {});
                     }
-                    try narrowing_ctx.emitEachBinding(output, mappings, binding, is_typescript, if_branches);
+                    try template_items.append(allocator, .{ .each_binding = .{
+                        .binding = binding,
+                        .offset = binding.offset,
+                    } });
                 }
             },
 
-            .element, .component => {
-                // Skip elements inside snippet bodies - they're handled by emitSnippetBodyExpressions.
-                // Extracting identifiers here would add {#each} bindings like `block` to template_refs,
-                // causing invalid `void block;` at module scope where they're not defined.
+            .element => {
                 if (isInsideSnippetBody(node.start, snippet_body_ranges)) continue;
 
                 // Extract identifiers from attribute expressions
                 const elem_data = ast.elements.items[node.data];
+                try extractElementIdentifiers(allocator, ast, elem_data, node.start, &template_refs);
 
-                // For components, extract the component name (or namespace for Namespace.Component)
-                if (node.kind == .component) {
-                    const tag = elem_data.tag_name;
-                    // Extract first identifier (e.g., "Table" from "Table.Root")
-                    var name_end: usize = 0;
-                    while (name_end < tag.len and (std.ascii.isAlphanumeric(tag[name_end]) or tag[name_end] == '_' or tag[name_end] == '$')) : (name_end += 1) {}
-                    if (name_end > 0) {
-                        const result = try template_refs.getOrPut(allocator, tag[0..name_end]);
-                        if (!result.found_existing) {
-                            // Use node.start as approximate offset (tag name follows '<')
-                            result.value_ptr.* = node.start + 1;
-                        }
-                    }
-                }
-
-                for (ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end]) |attr| {
-                    // Skip spread attributes
-                    if (std.mem.eql(u8, attr.name, "...")) continue;
-
-                    // Handle @attach directive: extract the attached function as "used"
-                    // {@attach tooltip(args)} → extract 'tooltip' so import isn't flagged as unused
-                    if (std.mem.eql(u8, attr.name, "@attach")) {
-                        if (attr.value) |val| {
-                            // Value is the full expression like {tooltip(args)}
-                            try extractIdentifiersFromExpr(allocator, val, attr.start, &template_refs);
-                        }
-                        continue;
-                    }
-
-                    if (attr.value) |val| {
-                        // Expression values are wrapped in {} - may be single or mixed (e.g., "{foo} text")
-                        if (val.len > 0 and val[0] == '{') {
-                            // Use extractIdentifiersFromAttributeValue to handle mixed values
-                            // that contain both expressions and static text
-                            try extractIdentifiersFromAttributeValue(allocator, val, attr.start, &template_refs);
-                        }
-                    }
-                    // Shorthand attributes like {foo} use attr name as expression
-                    if (attr.value == null and attr.name.len > 0 and !std.mem.startsWith(u8, attr.name, "on:") and !std.mem.startsWith(u8, attr.name, "bind:")) {
-                        // This might be a shorthand {foo}
-                        const src = ast.source[attr.start..attr.end];
-                        if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
-                            try extractIdentifiersFromExpr(allocator, src, attr.start, &template_refs);
-                        }
-                    }
-                    // Shorthand bind:x directive (bind:open means bind:open={open})
-                    if (attr.value == null and std.mem.startsWith(u8, attr.name, "bind:")) {
-                        const binding_name = attr.name[5..]; // Skip "bind:"
-                        if (binding_name.len > 0) {
-                            const result = try template_refs.getOrPut(allocator, binding_name);
-                            if (!result.found_existing) {
-                                result.value_ptr.* = attr.start;
-                            }
-                        }
-                    }
-                    // Transition, animate, and use directives reference the function name
-                    // e.g., transition:fade, in:fly, out:slide, use:enhance
-                    if (attr.value == null) {
-                        for ([_][]const u8{ "transition:", "in:", "out:", "animate:", "use:" }) |prefix| {
-                            if (std.mem.startsWith(u8, attr.name, prefix)) {
-                                // Extract function name (may have | modifiers like fade|local)
-                                const rest = attr.name[prefix.len..];
-                                var end: usize = 0;
-                                while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_')) : (end += 1) {}
-                                if (end > 0) {
-                                    const result = try template_refs.getOrPut(allocator, rest[0..end]);
-                                    if (!result.found_existing) {
-                                        result.value_ptr.* = attr.start;
-                                    }
-                                }
+                // Collect for HTML element validation (TypeScript only)
+                if (is_typescript) {
+                    if (!std.mem.eql(u8, elem_data.tag_name, "slot") and
+                        !std.mem.startsWith(u8, elem_data.tag_name, "svelte:"))
+                    {
+                        const attrs = ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end];
+                        var has_validatable_attrs = false;
+                        for (attrs) |attr| {
+                            if (isValidatableHtmlAttr(attr.name)) {
+                                has_validatable_attrs = true;
                                 break;
                             }
                         }
-                    }
-                    // class: directive - shorthand class:foo means class:foo={foo}
-                    // e.g., class:hidden, class:active, class:animate
-                    if (std.mem.startsWith(u8, attr.name, "class:")) {
-                        const class_var = attr.name[6..]; // Skip "class:"
-                        if (class_var.len > 0) {
-                            if (attr.value) |val| {
-                                // Full syntax: class:foo={expr} - extract identifiers from expr
-                                try extractIdentifiersFromExpr(allocator, val, attr.start, &template_refs);
-                            } else {
-                                // Shorthand: class:foo uses variable named foo
-                                const result = try template_refs.getOrPut(allocator, class_var);
-                                if (!result.found_existing) {
-                                    result.value_ptr.* = attr.start;
-                                }
-                            }
+                        if (has_validatable_attrs) {
+                            try template_items.append(allocator, .{ .html_element = .{
+                                .data_index = node.data,
+                                .node_start = node.start,
+                                .is_component = false,
+                            } });
                         }
-                    }
-                    // style: directive - shorthand style:prop means style:prop={prop}
-                    // e.g., style:color, style:--custom-property
-                    if (std.mem.startsWith(u8, attr.name, "style:")) {
-                        if (attr.value) |val| {
-                            // Full syntax: style:prop={expr} or style:prop="css {expr} more"
-                            // Use extractIdentifiersFromAttributeValue to handle mixed CSS/expr values
-                            if (val.len > 0 and val[0] == '{') {
-                                try extractIdentifiersFromAttributeValue(allocator, val, attr.start, &template_refs);
-                            }
-                        }
-                        // Note: shorthand style:foo (without value) is rarely used with variables
-                        // because style properties are usually CSS names, not JS identifiers
                     }
                 }
+            },
+
+            .component => {
+                if (isInsideSnippetBody(node.start, snippet_body_ranges)) continue;
+
+                const elem_data = ast.elements.items[node.data];
+                const tag = elem_data.tag_name;
+
+                // Extract component name for noUnusedLocals
+                var name_end: usize = 0;
+                while (name_end < tag.len and (std.ascii.isAlphanumeric(tag[name_end]) or tag[name_end] == '_' or tag[name_end] == '$')) : (name_end += 1) {}
+                if (name_end > 0) {
+                    const result = try template_refs.getOrPut(allocator, tag[0..name_end]);
+                    if (!result.found_existing) {
+                        result.value_ptr.* = node.start + 1;
+                    }
+                }
+
+                // Extract identifiers from attribute expressions
+                try extractElementIdentifiers(allocator, ast, elem_data, node.start, &template_refs);
             },
 
             else => {},
         }
     }
 
-    // Emit HTML element props validation using SvelteHTMLElements type assertion
-    // This validates that attributes are valid for the element type
-    if (is_typescript) {
-        var elem_counter: u32 = 0;
-        for (ast.nodes.items) |node| {
-            if (node.kind != .element) continue;
-
-            // Skip elements inside snippet bodies - they're handled by emitSnippetBodyExpressions
-            if (isInsideSnippetBody(node.start, snippet_body_ranges)) continue;
-
-            const elem_data = ast.elements.items[node.data];
-
-            // Skip special Svelte elements that have custom prop handling
-            if (std.mem.eql(u8, elem_data.tag_name, "slot")) continue;
-            if (std.mem.startsWith(u8, elem_data.tag_name, "svelte:")) continue;
-            const attrs = ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end];
-
-            // Collect validatable attributes (exclude Svelte directives and shorthand props)
-            var has_validatable_attrs = false;
-            for (attrs) |attr| {
-                if (isValidatableHtmlAttr(attr.name)) {
-                    has_validatable_attrs = true;
-                    break;
-                }
-            }
-
-            if (!has_validatable_attrs) continue;
-
-            // Close any open narrowing context before emitting HTML element validation
-            // Element props are validated independently, not within a narrowing block
-            try narrowing_ctx.close(output);
-            if (!narrowing_ctx.has_expressions) {
-                try output.appendSlice(allocator, ";// Template expressions\n");
-                narrowing_ctx.has_expressions = true;
-            }
-
-            // Find enclosing if branches and {#each} blocks for this element
-            // They must be emitted in the correct nested order (by body_start)
-            var enclosing = try findAllEnclosingIfBranches(allocator, node.start, if_branches);
-            defer enclosing.deinit(allocator);
-
-            var enclosing_each = try findAllEnclosingEachRanges(allocator, node.start, each_body_ranges);
-            defer enclosing_each.deinit(allocator);
-
-            // Emit if conditions and each bindings interleaved by their body_start
-            const conditions_opened = try emitInterleavedConditionsAndBindings(allocator, output, enclosing.items, enclosing_each.items, is_typescript);
-
-            // Emit: void ({ attr1: value1 } satisfies Partial<__SvelteElements__['tag']>);
-            // Use 'satisfies' to check attribute types without declaring variables
-            elem_counter += 1;
-            try output.appendSlice(allocator, "void ({ ");
-
-            var first_attr = true;
-            for (attrs) |attr| {
-                if (!isValidatableHtmlAttr(attr.name)) continue;
-
-                if (!first_attr) {
-                    try output.appendSlice(allocator, ", ");
-                }
-                first_attr = false;
-
-                // Check if attribute name needs to be quoted (contains non-identifier chars like -)
-                const needs_quote = blk: {
-                    for (attr.name) |ch| {
-                        if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '$') {
-                            break :blk true;
-                        }
-                    }
-                    break :blk false;
-                };
-
-                // Add source mapping for the attribute name
-                // Include the quote in the mapping if present, since TS errors point to the quote
-                try mappings.append(allocator, .{
-                    .svelte_offset = attr.start,
-                    .ts_offset = @intCast(output.items.len),
-                    .len = @intCast(attr.name.len + (if (needs_quote) @as(u32, 2) else 0)),
-                });
-                if (needs_quote) {
-                    try output.appendSlice(allocator, "'");
-                }
-                try output.appendSlice(allocator, attr.name);
-                if (needs_quote) {
-                    try output.appendSlice(allocator, "'");
-                }
-                try output.appendSlice(allocator, ": ");
-
-                // Emit value (or undefined for valueless attrs)
-                if (attr.value) |val| {
-                    if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}' and isSingleExpression(val)) {
-                        // Pure expression value: strip { } and emit the expression
-                        const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
-                        try output.appendSlice(allocator, expr);
-                    } else if (std.mem.indexOf(u8, val, "{") != null) {
-                        // Mixed value with embedded expressions (e.g., "text {expr} more", "{a} {b}")
-                        // Emit as template literal to handle multi-line values correctly
-                        try emitMixedAttributeValue(allocator, output, mappings, val, attr.start);
-                    } else if (std.mem.indexOf(u8, val, "\n") != null) {
-                        // Multi-line static value - emit as template literal
-                        try output.appendSlice(allocator, "`");
-                        for (val) |c| {
-                            if (c == '`' or c == '$') {
-                                try output.append(allocator, '\\');
-                            }
-                            try output.append(allocator, c);
-                        }
-                        try output.appendSlice(allocator, "`");
-                    } else {
-                        // Static string value - check if it should be emitted as a number
-                        // for numeric HTML attributes (tabindex, aria-level, etc.)
-                        if (isNumericHtmlAttr(attr.name) and isIntegerString(val)) {
-                            // Emit as numeric literal to match type definitions
-                            try output.appendSlice(allocator, val);
-                        } else {
-                            // Emit as string literal
-                            try output.appendSlice(allocator, "\"");
-                            try output.appendSlice(allocator, val);
-                            try output.appendSlice(allocator, "\"");
-                        }
-                    }
-                } else {
-                    // Check if this is a shorthand prop like {foo}
-                    const src = ast.source[attr.start..attr.end];
-                    if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
-                        // Shorthand: {foo} → foo: foo
-                        const expr = std.mem.trim(u8, src[1 .. src.len - 1], " \t\n\r");
-                        try output.appendSlice(allocator, expr);
-                    } else {
-                        // Valueless attribute (e.g., disabled, hidden)
-                        try output.appendSlice(allocator, "true");
-                    }
-                }
-            }
-
-            try output.appendSlice(allocator, " } satisfies Partial<__SvelteElements__['");
-            try output.appendSlice(allocator, elem_data.tag_name);
-            try output.appendSlice(allocator, "']>);");
-
-            // Close all opened if blocks
-            var k: u32 = 0;
-            while (k < conditions_opened) : (k += 1) {
-                try output.appendSlice(allocator, " }");
-            }
-            try output.appendSlice(allocator, "\n");
+    // Sort items by source offset to ensure proper narrowing context flow.
+    // This ensures expressions are emitted in the order they appear in source,
+    // which keeps if-block scopes coherent across related expressions/elements.
+    std.mem.sort(TemplateItem, template_items.items, {}, struct {
+        fn lessThan(_: void, a: TemplateItem, b: TemplateItem) bool {
+            return a.offset() < b.offset();
         }
-    }
+    }.lessThan);
 
-    // Component props validation is temporarily disabled.
-    // The approach of using __ComponentProps__<typeof Component> produces false positives
-    // because it requires ALL props, including those with defaults. Svelte's actual
-    // component prop checking is more nuanced and handles optional props correctly.
-    // TODO: Implement proper component props validation that:
-    // - Distinguishes required vs optional props
-    // - Reports "unknown property" errors like svelte-check does
-    // - Handles generic components correctly
-    const enable_component_props_validation = false;
-    if (enable_component_props_validation and is_typescript) {
-        for (ast.nodes.items) |node| {
-            if (node.kind != .component) continue;
+    // Second pass: emit all items in source order with proper narrowing
+    for (template_items.items) |item| {
+        switch (item) {
+            .snippet => |s| {
+                // Close any open narrowing context before emitting snippet body
+                try narrowing_ctx.close(output);
+                try emitSnippetBodyExpressions(
+                    allocator,
+                    ast,
+                    output,
+                    mappings,
+                    s.range,
+                    is_typescript,
+                    if_branches,
+                    each_body_ranges,
+                    &narrowing_ctx.has_expressions,
+                );
+            },
 
-            // Skip components inside snippet bodies - they're handled by emitSnippetBodyExpressions
-            if (isInsideSnippetBody(node.start, snippet_body_ranges)) continue;
+            .expression => |e| {
+                try narrowing_ctx.emitExpression(
+                    output,
+                    mappings,
+                    e.expr,
+                    e.offset,
+                    if_branches,
+                );
+            },
 
-            const elem_data = ast.elements.items[node.data];
-            const tag_name = elem_data.tag_name;
+            .const_binding => |c| {
+                try narrowing_ctx.emitConstBinding(output, c.binding, c.offset, if_branches);
+            },
 
-            // Skip svelte: special elements
-            if (std.mem.startsWith(u8, tag_name, "svelte:")) continue;
+            .each_binding => |e| {
+                try narrowing_ctx.emitEachBinding(output, mappings, e.binding, is_typescript, if_branches);
+            },
 
-            const attrs = ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end];
+            .await_block => |a| {
+                current_await_expr = a.expr;
+                try narrowing_ctx.emitExpression(
+                    output,
+                    mappings,
+                    a.expr,
+                    a.expr_offset,
+                    if_branches,
+                );
 
-            // Collect validatable component props (exclude Svelte directives)
-            var has_validatable_props = false;
-            for (attrs) |attr| {
-                if (isValidatableComponentProp(attr.name)) {
-                    has_validatable_props = true;
-                    break;
-                }
-            }
-
-            if (!has_validatable_props) continue;
-
-            // Close any open narrowing context before emitting component props validation
-            try narrowing_ctx.close(output);
-            if (!narrowing_ctx.has_expressions) {
-                try output.appendSlice(allocator, ";// Template expressions\n");
-                narrowing_ctx.has_expressions = true;
-            }
-
-            // Find enclosing if branches for this component and emit if wrappers
-            // Skip if-branches that are inside snippet bodies since their conditions
-            // reference variables that are only in scope within the snippet
-            var enclosing = try findAllEnclosingIfBranches(allocator, node.start, if_branches);
-            defer enclosing.deinit(allocator);
-
-            // Filter out branches inside snippet bodies
-            var filtered: std.ArrayList(IfBranch) = .empty;
-            defer filtered.deinit(allocator);
-            for (enclosing.items) |branch| {
-                const branch_inside_snippet = isInsideSnippetBody(branch.body_start, snippet_body_ranges);
-                if (!branch_inside_snippet) {
-                    try filtered.append(allocator, branch);
-                }
-            }
-
-            const conditions_opened = try emitIfConditionOpeners(allocator, output, filtered.items);
-
-            // Emit: ((_: __ComponentProps__<typeof ComponentName>) => {})({ prop1: value1, ... });
-            // This validates props without actually calling the component
-            try output.appendSlice(allocator, "((_: __ComponentProps__<typeof ");
-            try output.appendSlice(allocator, tag_name);
-            try output.appendSlice(allocator, ">) => {})({ ");
-
-            var first_prop = true;
-            for (attrs) |attr| {
-                if (!isValidatableComponentProp(attr.name)) continue;
-
-                if (!first_prop) {
-                    try output.appendSlice(allocator, ", ");
-                }
-                first_prop = false;
-
-                // Check if prop name needs to be quoted
-                const needs_quote = blk: {
-                    for (attr.name) |ch| {
-                        if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '$') {
-                            break :blk true;
-                        }
+                // Handle inline {#await promise then value} syntax
+                if (extractInlineThenBinding(ast.source, a.node_start, a.node_end)) |binding_pattern| {
+                    try extractBindingNames(allocator, binding_pattern, &template_bindings);
+                    try narrowing_ctx.close(output);
+                    if (!narrowing_ctx.has_expressions) {
+                        try output.appendSlice(allocator, ";// Template expressions\n");
+                        narrowing_ctx.has_expressions = true;
                     }
-                    break :blk false;
-                };
-
-                // Add source mapping for the prop name
-                try mappings.append(allocator, .{
-                    .svelte_offset = attr.start,
-                    .ts_offset = @intCast(output.items.len),
-                    .len = @intCast(attr.name.len + (if (needs_quote) @as(u32, 2) else 0)),
-                });
-                if (needs_quote) {
-                    try output.appendSlice(allocator, "'");
-                }
-                try output.appendSlice(allocator, attr.name);
-                if (needs_quote) {
-                    try output.appendSlice(allocator, "'");
-                }
-                try output.appendSlice(allocator, ": ");
-
-                // Emit value
-                if (attr.value) |val| {
-                    if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}' and isSingleExpression(val)) {
-                        // Pure expression value: strip { } and emit the expression
-                        const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
-                        try output.appendSlice(allocator, expr);
-                    } else if (std.mem.indexOf(u8, val, "{") != null) {
-                        // Mixed value with embedded expressions
-                        try emitMixedAttributeValue(allocator, output, mappings, val, attr.start);
-                    } else if (std.mem.indexOf(u8, val, "\n") != null) {
-                        // Multi-line static value - emit as template literal
-                        try output.appendSlice(allocator, "`");
-                        for (val) |c| {
-                            if (c == '`' or c == '$') {
-                                try output.append(allocator, '\\');
-                            }
-                            try output.append(allocator, c);
-                        }
-                        try output.appendSlice(allocator, "`");
+                    const is_destructuring = binding_pattern.len > 0 and (binding_pattern[0] == '{' or binding_pattern[0] == '[');
+                    if (is_destructuring) {
+                        try output.appendSlice(allocator, "var ");
+                        try output.appendSlice(allocator, binding_pattern);
+                        try output.appendSlice(allocator, " = await (");
+                        try output.appendSlice(allocator, a.expr);
+                        try output.appendSlice(allocator, ");\n");
                     } else {
-                        // Static string value
-                        try output.appendSlice(allocator, "\"");
-                        try output.appendSlice(allocator, val);
-                        try output.appendSlice(allocator, "\"");
+                        try output.appendSlice(allocator, "let ");
+                        try output.appendSlice(allocator, binding_pattern);
+                        try output.appendSlice(allocator, " = await (");
+                        try output.appendSlice(allocator, a.expr);
+                        try output.appendSlice(allocator, ");\n");
+                    }
+                }
+            },
+
+            .then_block => |t| {
+                try narrowing_ctx.close(output);
+                if (!narrowing_ctx.has_expressions) {
+                    try output.appendSlice(allocator, ";// Template expressions\n");
+                    narrowing_ctx.has_expressions = true;
+                }
+                const is_destructuring = t.binding_pattern.len > 0 and (t.binding_pattern[0] == '{' or t.binding_pattern[0] == '[');
+                if (is_destructuring) {
+                    try output.appendSlice(allocator, "var ");
+                    try output.appendSlice(allocator, t.binding_pattern);
+                    if (current_await_expr) |await_expr| {
+                        try output.appendSlice(allocator, " = await (");
+                        try output.appendSlice(allocator, await_expr);
+                        try output.appendSlice(allocator, ");\n");
+                    } else if (is_typescript) {
+                        try output.appendSlice(allocator, " = {} as any;\n");
+                    } else {
+                        try output.appendSlice(allocator, " = {};\n");
                     }
                 } else {
-                    // Check if this is a shorthand prop like {foo}
-                    const src = ast.source[attr.start..attr.end];
-                    if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
-                        // Shorthand: {foo} → foo: foo
-                        const expr = std.mem.trim(u8, src[1 .. src.len - 1], " \t\n\r");
-                        try output.appendSlice(allocator, expr);
+                    try output.appendSlice(allocator, "let ");
+                    try output.appendSlice(allocator, t.binding_pattern);
+                    if (current_await_expr) |await_expr| {
+                        try output.appendSlice(allocator, " = await (");
+                        try output.appendSlice(allocator, await_expr);
+                        try output.appendSlice(allocator, ");\n");
+                    } else if (is_typescript) {
+                        try output.appendSlice(allocator, ": unknown;\n");
                     } else {
-                        // Valueless prop (e.g., <Component disabled />)
-                        try output.appendSlice(allocator, "true");
+                        try output.appendSlice(allocator, ";\n");
                     }
                 }
-            }
+            },
 
-            try output.appendSlice(allocator, " });");
+            .catch_block => |c| {
+                try narrowing_ctx.close(output);
+                if (!narrowing_ctx.has_expressions) {
+                    try output.appendSlice(allocator, ";// Template expressions\n");
+                    narrowing_ctx.has_expressions = true;
+                }
+                const is_destructuring = c.binding_pattern.len > 0 and (c.binding_pattern[0] == '{' or c.binding_pattern[0] == '[');
+                if (is_destructuring) {
+                    try output.appendSlice(allocator, "var ");
+                    try output.appendSlice(allocator, c.binding_pattern);
+                    if (is_typescript) {
+                        try output.appendSlice(allocator, " = {} as any;\n");
+                    } else {
+                        try output.appendSlice(allocator, " = {};\n");
+                    }
+                } else {
+                    try output.appendSlice(allocator, "let ");
+                    try output.appendSlice(allocator, c.binding_pattern);
+                    if (is_typescript) {
+                        try output.appendSlice(allocator, ": unknown");
+                    }
+                    try output.appendSlice(allocator, ";\n");
+                }
+            },
 
-            // Close all opened if blocks
-            var k: u32 = 0;
-            while (k < conditions_opened) : (k += 1) {
-                try output.appendSlice(allocator, " }");
-            }
-            try output.appendSlice(allocator, "\n");
+            .else_block => {
+                // else_block is just for identifier extraction, no emission needed
+            },
+
+            .html_element => |h| {
+                // Use narrowing context for HTML element validation
+                const elem_data = ast.elements.items[h.data_index];
+                const attrs = ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end];
+
+                // Find enclosing if branches for this element
+                var enclosing = try findAllEnclosingIfBranches(allocator, h.node_start, if_branches);
+                defer enclosing.deinit(allocator);
+
+                // Ensure we're in the correct narrowing context
+                try narrowing_ctx.ensureOpen(output, enclosing.items);
+
+                // Find enclosing {#each} blocks and emit their bindings if not already emitted
+                var enclosing_each = try findAllEnclosingEachRanges(allocator, h.node_start, each_body_ranges);
+                defer enclosing_each.deinit(allocator);
+
+                // For each enclosing {#each}, we need to emit an IIFE that declares the bindings
+                const needs_each_wrapper = enclosing_each.items.len > 0;
+                if (needs_each_wrapper) {
+                    try output.appendSlice(allocator, "(() => {\n");
+                    for (enclosing_each.items) |each_range| {
+                        try output.appendSlice(allocator, "let ");
+                        try output.appendSlice(allocator, each_range.item_binding);
+                        try output.appendSlice(allocator, " = __svelte_ensureArray(");
+                        try output.appendSlice(allocator, each_range.iterable);
+                        try output.appendSlice(allocator, ")[0];");
+                        if (each_range.index_binding) |idx| {
+                            try output.appendSlice(allocator, " let ");
+                            try output.appendSlice(allocator, idx);
+                            try output.appendSlice(allocator, " = 0;");
+                        }
+                        try output.appendSlice(allocator, "\n");
+                    }
+                }
+
+                // Emit: void ({ attr1: value1 } satisfies Partial<__SvelteElements__['tag']>);
+                try output.appendSlice(allocator, "void ({ ");
+
+                var first_attr = true;
+                for (attrs) |attr| {
+                    if (!isValidatableHtmlAttr(attr.name)) continue;
+
+                    if (!first_attr) {
+                        try output.appendSlice(allocator, ", ");
+                    }
+                    first_attr = false;
+
+                    const needs_quote = blk: {
+                        for (attr.name) |ch| {
+                            if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '$') {
+                                break :blk true;
+                            }
+                        }
+                        break :blk false;
+                    };
+
+                    try mappings.append(allocator, .{
+                        .svelte_offset = attr.start,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(attr.name.len + (if (needs_quote) @as(u32, 2) else 0)),
+                    });
+                    if (needs_quote) {
+                        try output.appendSlice(allocator, "'");
+                    }
+                    try output.appendSlice(allocator, attr.name);
+                    if (needs_quote) {
+                        try output.appendSlice(allocator, "'");
+                    }
+                    try output.appendSlice(allocator, ": ");
+
+                    if (attr.value) |val| {
+                        if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}' and isSingleExpression(val)) {
+                            const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
+                            try output.appendSlice(allocator, expr);
+                        } else if (std.mem.indexOf(u8, val, "{") != null) {
+                            try emitMixedAttributeValue(allocator, output, mappings, val, attr.start);
+                        } else if (std.mem.indexOf(u8, val, "\n") != null) {
+                            try output.appendSlice(allocator, "`");
+                            for (val) |c| {
+                                if (c == '`' or c == '$') {
+                                    try output.append(allocator, '\\');
+                                }
+                                try output.append(allocator, c);
+                            }
+                            try output.appendSlice(allocator, "`");
+                        } else {
+                            if (isNumericHtmlAttr(attr.name) and isIntegerString(val)) {
+                                try output.appendSlice(allocator, val);
+                            } else {
+                                try output.appendSlice(allocator, "\"");
+                                try output.appendSlice(allocator, val);
+                                try output.appendSlice(allocator, "\"");
+                            }
+                        }
+                    } else {
+                        const src = ast.source[attr.start..attr.end];
+                        if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
+                            const expr = std.mem.trim(u8, src[1 .. src.len - 1], " \t\n\r");
+                            try output.appendSlice(allocator, expr);
+                        } else {
+                            try output.appendSlice(allocator, "true");
+                        }
+                    }
+                }
+
+                try output.appendSlice(allocator, " } satisfies Partial<__SvelteElements__['");
+                try output.appendSlice(allocator, elem_data.tag_name);
+                try output.appendSlice(allocator, "']>);\n");
+
+                if (needs_each_wrapper) {
+                    try output.appendSlice(allocator, "})();\n");
+                }
+            },
         }
     }
 
     // Force close all open narrowing contexts before the final sections.
-    // At the end of template expressions, all braces must be balanced.
     try narrowing_ctx.forceCloseAll(output);
 
     // Fallback: scan template source directly for {#each} patterns not captured by AST
@@ -3006,6 +2775,92 @@ fn extractIdentifiersFromAttributeValue(
         } else {
             // Skip static text (not inside {})
             i += 1;
+        }
+    }
+}
+
+/// Extracts identifiers from element/component attribute expressions.
+/// Consolidates the common logic for extracting identifiers from element attributes.
+fn extractElementIdentifiers(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    elem_data: ElementData,
+    node_start: u32,
+    template_refs: *std.StringHashMapUnmanaged(u32),
+) !void {
+    _ = node_start;
+    for (ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end]) |attr| {
+        // Skip spread attributes
+        if (std.mem.eql(u8, attr.name, "...")) continue;
+
+        // Handle @attach directive
+        if (std.mem.eql(u8, attr.name, "@attach")) {
+            if (attr.value) |val| {
+                try extractIdentifiersFromExpr(allocator, val, attr.start, template_refs);
+            }
+            continue;
+        }
+
+        if (attr.value) |val| {
+            if (val.len > 0 and val[0] == '{') {
+                try extractIdentifiersFromAttributeValue(allocator, val, attr.start, template_refs);
+            }
+        }
+        // Shorthand attributes like {foo}
+        if (attr.value == null and attr.name.len > 0 and !std.mem.startsWith(u8, attr.name, "on:") and !std.mem.startsWith(u8, attr.name, "bind:")) {
+            const src = ast.source[attr.start..attr.end];
+            if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
+                try extractIdentifiersFromExpr(allocator, src, attr.start, template_refs);
+            }
+        }
+        // Shorthand bind:x directive
+        if (attr.value == null and std.mem.startsWith(u8, attr.name, "bind:")) {
+            const binding_name = attr.name[5..];
+            if (binding_name.len > 0) {
+                const result = try template_refs.getOrPut(allocator, binding_name);
+                if (!result.found_existing) {
+                    result.value_ptr.* = attr.start;
+                }
+            }
+        }
+        // Transition, animate, and use directives
+        if (attr.value == null) {
+            for ([_][]const u8{ "transition:", "in:", "out:", "animate:", "use:" }) |prefix| {
+                if (std.mem.startsWith(u8, attr.name, prefix)) {
+                    const rest = attr.name[prefix.len..];
+                    var end: usize = 0;
+                    while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_')) : (end += 1) {}
+                    if (end > 0) {
+                        const result = try template_refs.getOrPut(allocator, rest[0..end]);
+                        if (!result.found_existing) {
+                            result.value_ptr.* = attr.start;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        // class: directive
+        if (std.mem.startsWith(u8, attr.name, "class:")) {
+            const class_var = attr.name[6..];
+            if (class_var.len > 0) {
+                if (attr.value) |val| {
+                    try extractIdentifiersFromExpr(allocator, val, attr.start, template_refs);
+                } else {
+                    const result = try template_refs.getOrPut(allocator, class_var);
+                    if (!result.found_existing) {
+                        result.value_ptr.* = attr.start;
+                    }
+                }
+            }
+        }
+        // style: directive
+        if (std.mem.startsWith(u8, attr.name, "style:")) {
+            if (attr.value) |val| {
+                if (val.len > 0 and val[0] == '{') {
+                    try extractIdentifiersFromAttributeValue(allocator, val, attr.start, template_refs);
+                }
+            }
         }
     }
 }
