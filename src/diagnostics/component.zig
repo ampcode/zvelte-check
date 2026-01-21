@@ -1331,16 +1331,74 @@ fn extractDestructuredNames(
                     while (i < pattern.len and isIdentChar(pattern[i])) : (i += 1) {}
                     const local_name = pattern[local_start..i];
                     try names.put(allocator, local_name, {});
+
+                    // Skip whitespace and check for default value after rename
+                    while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+                    if (i < pattern.len and pattern[i] == '=') {
+                        i = skipDefaultValue(pattern, i + 1);
+                    }
                 }
             } else {
-                // Simple identifier or with default value
+                // Simple identifier
                 try names.put(allocator, ident, {});
+
+                // Skip default value if present (e.g., `foo = null`)
+                if (i < pattern.len and pattern[i] == '=') {
+                    i = skipDefaultValue(pattern, i + 1);
+                }
             }
             continue;
         }
 
         i += 1;
     }
+}
+
+/// Skip a default value expression in a destructuring pattern.
+/// Handles simple values (null, undefined, false, numbers) and expressions.
+fn skipDefaultValue(pattern: []const u8, start: usize) usize {
+    var i = start;
+
+    // Skip whitespace
+    while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+
+    // Track nested braces/parens/brackets for complex expressions
+    var brace_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
+
+    while (i < pattern.len) {
+        const c = pattern[i];
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(pattern, i);
+            continue;
+        }
+
+        if (c == '{') brace_depth += 1;
+        if (c == '}') {
+            if (brace_depth > 0) {
+                brace_depth -= 1;
+            } else {
+                // End of destructuring pattern
+                break;
+            }
+        }
+        if (c == '(') paren_depth += 1;
+        if (c == ')' and paren_depth > 0) paren_depth -= 1;
+        if (c == '[') bracket_depth += 1;
+        if (c == ']' and bracket_depth > 0) bracket_depth -= 1;
+
+        // Stop at comma when not inside nested constructs (next property)
+        if (c == ',' and brace_depth == 0 and paren_depth == 0 and bracket_depth == 0) {
+            break;
+        }
+
+        i += 1;
+    }
+
+    return i;
 }
 
 /// Find top-level const/let assignments that reference reactive variables.
@@ -1444,8 +1502,25 @@ fn findStateReferencedLocally(
                     startsWithKeyword(content[i..], "$derived") or
                     startsWithKeyword(content[i..], "$props"))
                 {
-                    // Skip to end of statement
-                    while (i < content.len and content[i] != ';' and content[i] != '\n') : (i += 1) {}
+                    // Skip to end of statement, properly handling multiline expressions
+                    // like $derived.by(() => { ... multiline ... })
+                    var skip_brace_depth: u32 = 0;
+                    var skip_paren_depth: u32 = 0;
+                    while (i < content.len) {
+                        const sc = content[i];
+                        // Skip strings
+                        if (sc == '"' or sc == '\'' or sc == '`') {
+                            i = skipString(content, i);
+                            continue;
+                        }
+                        if (sc == '{') skip_brace_depth += 1;
+                        if (sc == '}' and skip_brace_depth > 0) skip_brace_depth -= 1;
+                        if (sc == '(') skip_paren_depth += 1;
+                        if (sc == ')' and skip_paren_depth > 0) skip_paren_depth -= 1;
+                        // Only stop at statement end when not inside nested constructs
+                        if (skip_brace_depth == 0 and skip_paren_depth == 0 and (sc == ';' or sc == '\n')) break;
+                        i += 1;
+                    }
                     continue;
                 }
 
@@ -1563,18 +1638,19 @@ fn findReactiveReference(text: []const u8, reactive_vars: *std.StringHashMapUnma
     return null;
 }
 
-/// Skip a type annotation (handles generics, unions, intersections, etc.)
+/// Skip a type annotation (handles generics, unions, intersections, object types, etc.)
 fn skipTypeAnnotation(content: []const u8, start: usize) usize {
     var i = start;
     var angle_depth: u32 = 0;
     var paren_depth: u32 = 0;
     var bracket_depth: u32 = 0;
+    var brace_depth: u32 = 0;
 
     while (i < content.len) {
         const c = content[i];
 
         // Stop at = or ; when not inside nested constructs
-        if (angle_depth == 0 and paren_depth == 0 and bracket_depth == 0) {
+        if (angle_depth == 0 and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0) {
             if (c == '=' or c == ';' or c == ',' or c == ')' or c == '}') break;
         }
 
@@ -1584,6 +1660,8 @@ fn skipTypeAnnotation(content: []const u8, start: usize) usize {
         if (c == ')' and paren_depth > 0) paren_depth -= 1;
         if (c == '[') bracket_depth += 1;
         if (c == ']' and bracket_depth > 0) bracket_depth -= 1;
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
 
         i += 1;
     }
@@ -2538,4 +2616,86 @@ test "state_referenced_locally: props with renamed destructuring" {
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings("state_referenced_locally", diagnostics.items[0].code.?);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "pageData") != null);
+}
+
+test "state_referenced_locally: multiline $derived.by is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let editorStatus = $state<{activeFile: string} | undefined>(undefined);
+        \\
+        \\const statusText = $derived.by(() => {
+        \\    if (!editorStatus) {
+        \\        return null;
+        \\    }
+        \\    const { activeFile } = editorStatus;
+        \\    return activeFile;
+        \\});
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Reference inside $derived.by() callback is properly reactive, no warning
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "state_referenced_locally: props with default values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let {
+        \\    showHint = false,
+        \\    message = null,
+        \\    data = undefined,
+        \\} = $props()
+        \\
+        \\const captured = showHint
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should only warn about capturing showHint, NOT about null/undefined/false
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("state_referenced_locally", diagnostics.items[0].code.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "showHint") != null);
+}
+
+test "state_referenced_locally: props with object type annotation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let { value, flag }: { value: string, flag: boolean } = $props();
+        \\let localVar = flag ? "yes" : "no";
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should warn about capturing flag (object type annotation should be properly skipped)
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("state_referenced_locally", diagnostics.items[0].code.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "flag") != null);
 }
