@@ -434,7 +434,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         // Import Component for Svelte 5 type compatibility (makes ComponentProps work)
         // Use a private alias to avoid conflicts with user imports of Component
         // Also import ComponentProps for type-checking component props in templates
-        try output.appendSlice(allocator, "import type { Component as __SvelteComponentType__, ComponentProps as __ComponentProps__ } from \"svelte\";\n");
+        try output.appendSlice(allocator, "import type { Component as __SvelteComponentType__, ComponentInternals as __CI__ } from \"svelte\";\n");
         // Import SvelteHTMLElements for validating HTML element props
         try output.appendSlice(allocator, "import type { SvelteHTMLElements as __SvelteElements__ } from \"svelte/elements\";\n");
         // Note: Snippet is imported later after rune stubs to make it globally available.
@@ -489,6 +489,20 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             \\// Extracts element type from arrays, readonly arrays, and ArrayLike types
             \\// Falls back to any[] for unrecognized types (including `any`) to avoid false positives
             \\declare function __svelte_ensureArray<T>(array: T): T extends readonly (infer U)[] ? U[] : T extends ArrayLike<infer U> ? U[] : any[];
+            \\
+            \\// Component props type checker with contextual typing for callbacks
+            \\// Converts Svelte 5 Component<Props> to a constructor that TypeScript can check props against.
+            \\// The constructor pattern enables contextual typing for callback props like oninput={(e) => ...}
+            \\// Uses custom __Options__ to avoid ComponentConstructorOptions' Record<string, any> constraint.
+            \\interface __Options__<P> { target: Element; props?: P; }
+            \\type __AnyComponent__ = { new(options: __Options__<any>): any } | { (this: void, internals: __CI__, props: any): any };
+            \\type __EnsureComponent__<T> = 
+            \\  T extends { new(options: __Options__<infer P>): any } ? T
+            \\  : T extends { (this: void, internals: __CI__, props: infer P): any }
+            \\    ? new (options: __Options__<P>) => {}
+            \\    : new (options: __Options__<Record<string, any>>) => {};
+            \\declare function __svelte_ensureComponent<T extends __AnyComponent__>(type: T): __EnsureComponent__<T>;
+            \\declare const __svelte_target: Element;
             \\
             \\
         );
@@ -2793,8 +2807,9 @@ fn isSingleExpression(val: []const u8) bool {
 }
 
 /// Emits component props validation code for a single component.
-/// Generates: ((_: __ComponentProps__<typeof TagName>) => {})({ prop1: val1, prop2: val2 });
-/// This is used both for top-level components and components inside snippets/each blocks.
+/// Generates: { const $$_C = __svelte_ensureComponent(X); new $$_C({ target: __svelte_target, props: {...} }); }
+/// This pattern enables contextual typing for callback props like oninput={(e) => ...}
+/// by using a constructor with ComponentConstructorOptions<Props> instead of ComponentProps<typeof X>.
 fn emitComponentPropsValidation(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -2809,12 +2824,11 @@ fn emitComponentPropsValidation(
 ) !void {
     const attrs = attributes[attrs_start..attrs_end];
 
-    // Emit: ((_: __ComponentProps__<typeof ComponentName>) => {})({ prop1: value1, ... });
-    // Always emit this validation call, even with empty props, so TypeScript checks for
-    // missing required props. This catches errors like `<Button />` when `label` is required.
-    try output.appendSlice(allocator, "((_: __ComponentProps__<typeof ");
+    // Emit: { const $$_C = __svelte_ensureComponent(ComponentName); new $$_C({ target: __svelte_target, props: {...} }); }
+    // The constructor pattern enables contextual typing for callback props.
+    try output.appendSlice(allocator, "{ const $$_C = __svelte_ensureComponent(");
     try output.appendSlice(allocator, tag_name);
-    try output.appendSlice(allocator, ">) => {})(");
+    try output.appendSlice(allocator, "); new $$_C({ target: __svelte_target, props: ");
 
     // Add source mapping for the opening brace of the props object.
     // This ensures "missing required prop" errors point to the component tag.
@@ -2907,7 +2921,8 @@ fn emitComponentPropsValidation(
         try output.appendSlice(allocator, "children: null! as Snippet");
     }
 
-    try output.appendSlice(allocator, " });\n");
+    // Close the props object, constructor call, and block
+    try output.appendSlice(allocator, " } }); }\n");
 }
 
 /// Extracts identifier references from an attribute value that may contain mixed text and expressions.
@@ -8891,7 +8906,7 @@ test "transform typescript component" {
     const virtual = try transform(allocator, ast);
 
     // Verify key parts of the generated TypeScript
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Component as __SvelteComponentType__, ComponentProps as __ComponentProps__ }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Component as __SvelteComponentType__, ComponentInternals as __CI__ }") != null);
     // Snippet is globally available in Svelte 5 templates
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import type { Snippet }") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "declare function $state") != null);
