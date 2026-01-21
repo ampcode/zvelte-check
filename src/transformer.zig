@@ -2193,7 +2193,8 @@ fn emitTemplateExpressions(
                 if (extractEachBindings(ast.source, node.start, node.end)) |binding| {
                     // Track binding names to avoid emitting void statements for them at module scope.
                     // This prevents TypeScript from merging types across different if-branches.
-                    try template_bindings.put(allocator, binding.item_binding, {});
+                    // For destructuring patterns like [a, b] or {x, y}, extract individual names.
+                    try extractBindingNames(allocator, binding.item_binding, &template_bindings);
                     if (binding.index_binding) |idx| {
                         try template_bindings.put(allocator, idx, {});
                     }
@@ -5185,6 +5186,162 @@ fn findTopLevelComma(text: []const u8) ?usize {
         i += 1;
     }
     return null;
+}
+
+/// Extracts individual identifier names from a binding pattern.
+/// Handles simple identifiers, array destructuring, and object destructuring.
+/// - Simple: `item` → ["item"]
+/// - Array: `[a, b]` → ["a", "b"]
+/// - Object: `{x, y}` → ["x", "y"]
+/// - Nested: `[a, {b, c}]` → ["a", "b", "c"]
+/// Note: For renamed bindings like `{x: renamed}`, extracts "renamed" (the local name).
+fn extractBindingNames(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    names: *std.StringHashMapUnmanaged(void),
+) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+
+    // Skip leading whitespace
+    while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+    if (i >= pattern.len) return;
+
+    const first = pattern[i];
+
+    if (first == '[') {
+        // Array destructuring: extract each element
+        i += 1; // skip [
+        while (i < pattern.len) {
+            // Skip whitespace
+            while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+            if (i >= pattern.len or pattern[i] == ']') break;
+
+            // Skip rest element (...)
+            if (i + 2 < pattern.len and pattern[i] == '.' and pattern[i + 1] == '.' and pattern[i + 2] == '.') {
+                i += 3;
+            }
+
+            // Check for nested pattern
+            if (i < pattern.len and (pattern[i] == '[' or pattern[i] == '{')) {
+                // Find matching bracket
+                const nested_start = i;
+                var depth: u32 = 1;
+                const open_bracket = pattern[i];
+                const close_bracket: u8 = if (open_bracket == '[') ']' else '}';
+                i += 1;
+                while (i < pattern.len and depth > 0) : (i += 1) {
+                    if (pattern[i] == open_bracket) depth += 1;
+                    if (pattern[i] == close_bracket) depth -= 1;
+                }
+                // Recursively extract from nested pattern
+                try extractBindingNames(allocator, pattern[nested_start..i], names);
+            } else if (i < pattern.len and isIdentifierStart(pattern[i])) {
+                // Simple identifier
+                const id_start = i;
+                while (i < pattern.len and isIdentifierChar(pattern[i])) : (i += 1) {}
+                try names.put(allocator, pattern[id_start..i], {});
+            }
+
+            // Skip to next element (find comma or end)
+            while (i < pattern.len and pattern[i] != ',' and pattern[i] != ']') : (i += 1) {}
+            if (i < pattern.len and pattern[i] == ',') i += 1;
+        }
+    } else if (first == '{') {
+        // Object destructuring: extract each property
+        i += 1; // skip {
+        while (i < pattern.len) {
+            // Skip whitespace
+            while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+            if (i >= pattern.len or pattern[i] == '}') break;
+
+            // Skip rest element (...)
+            if (i + 2 < pattern.len and pattern[i] == '.' and pattern[i + 1] == '.' and pattern[i + 2] == '.') {
+                i += 3;
+                // Extract rest target: ...rest or ...{ nested }
+                while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+                if (i < pattern.len and isIdentifierStart(pattern[i])) {
+                    const id_start = i;
+                    while (i < pattern.len and isIdentifierChar(pattern[i])) : (i += 1) {}
+                    try names.put(allocator, pattern[id_start..i], {});
+                }
+            } else if (i < pattern.len and isIdentifierStart(pattern[i])) {
+                // Property: could be `key` or `key: value` or `key: { nested }`
+                const key_start = i;
+                while (i < pattern.len and isIdentifierChar(pattern[i])) : (i += 1) {}
+                const key = pattern[key_start..i];
+
+                // Skip whitespace
+                while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+
+                if (i < pattern.len and pattern[i] == ':') {
+                    // Renamed or nested: `key: value` or `key: { a, b }`
+                    i += 1; // skip :
+                    while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+
+                    if (i < pattern.len and (pattern[i] == '[' or pattern[i] == '{')) {
+                        // Nested pattern
+                        const nested_start = i;
+                        var depth: u32 = 1;
+                        const open_bracket = pattern[i];
+                        const close_bracket: u8 = if (open_bracket == '[') ']' else '}';
+                        i += 1;
+                        while (i < pattern.len and depth > 0) : (i += 1) {
+                            if (pattern[i] == open_bracket) depth += 1;
+                            if (pattern[i] == close_bracket) depth -= 1;
+                        }
+                        try extractBindingNames(allocator, pattern[nested_start..i], names);
+                    } else if (i < pattern.len and isIdentifierStart(pattern[i])) {
+                        // Renamed: use the local name (after colon)
+                        const local_start = i;
+                        while (i < pattern.len and isIdentifierChar(pattern[i])) : (i += 1) {}
+                        try names.put(allocator, pattern[local_start..i], {});
+                    }
+                } else {
+                    // Shorthand property: `key` means `key: key`
+                    try names.put(allocator, key, {});
+                }
+            }
+
+            // Skip default value (= ...) and move to next element
+            // Need to handle nested braces in default values
+            var brace_depth: u32 = 0;
+            var bracket_depth: u32 = 0;
+            var paren_depth: u32 = 0;
+            while (i < pattern.len) {
+                const c = pattern[i];
+                if (c == '{') brace_depth += 1;
+                if (c == '}') {
+                    if (brace_depth > 0) {
+                        brace_depth -= 1;
+                    } else {
+                        break; // End of object pattern
+                    }
+                }
+                if (c == '[') bracket_depth += 1;
+                if (c == ']' and bracket_depth > 0) bracket_depth -= 1;
+                if (c == '(') paren_depth += 1;
+                if (c == ')' and paren_depth > 0) paren_depth -= 1;
+                if (c == ',' and brace_depth == 0 and bracket_depth == 0 and paren_depth == 0) {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        }
+    } else if (isIdentifierStart(first)) {
+        // Simple identifier
+        const id_start = i;
+        while (i < pattern.len and isIdentifierChar(pattern[i])) : (i += 1) {}
+        try names.put(allocator, pattern[id_start..i], {});
+    }
+}
+
+fn isIdentifierStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_' or c == '$';
+}
+
+fn isIdentifierChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
 }
 
 /// Finds the end of each block bindings (before key expression or closing brace)
