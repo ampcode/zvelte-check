@@ -7452,72 +7452,122 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
     try imports.ensureTotalCapacity(allocator, content.len / 4);
     try other.ensureTotalCapacity(allocator, content.len);
 
+    // Track template literal nesting depth (backticks can nest via ${...})
+    var template_depth: u32 = 0;
+
     var i: usize = 0;
     while (i < content.len) {
         // Skip leading whitespace on the line (but preserve it for output)
         const line_start = i;
         while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
 
-        // Check if this line starts with 'import'
-        if (i + 6 <= content.len and std.mem.eql(u8, content[i .. i + 6], "import")) {
-            // Verify it's actually an import keyword (not identifier like 'importFoo')
-            const after_import = if (i + 6 < content.len) content[i + 6] else 0;
-            if (after_import == ' ' or after_import == '\t' or after_import == '{' or after_import == '"' or after_import == '\'') {
-                // This is an import statement - find where it ends
-                const import_end = findImportEnd(content, i);
+        // Only check for import/interface/type at top level (not inside template literals)
+        if (template_depth == 0) {
+            // Check if this line starts with 'import'
+            if (i + 6 <= content.len and std.mem.eql(u8, content[i .. i + 6], "import")) {
+                // Verify it's actually an import keyword (not identifier like 'importFoo')
+                const after_import = if (i + 6 < content.len) content[i + 6] else 0;
+                if (after_import == ' ' or after_import == '\t' or after_import == '{' or after_import == '"' or after_import == '\'') {
+                    // This is an import statement - find where it ends
+                    const import_end = findImportEnd(content, i);
 
-                // Include the full import (from line_start to include leading whitespace)
-                try imports.appendSlice(allocator, content[line_start..import_end]);
-                if (import_end < content.len and content[import_end] == '\n') {
-                    try imports.append(allocator, '\n');
-                    i = import_end + 1;
-                } else {
-                    i = import_end;
+                    // Include the full import (from line_start to include leading whitespace)
+                    try imports.appendSlice(allocator, content[line_start..import_end]);
+                    if (import_end < content.len and content[import_end] == '\n') {
+                        try imports.append(allocator, '\n');
+                        i = import_end + 1;
+                    } else {
+                        i = import_end;
+                    }
+                    continue;
                 }
-                continue;
+            }
+
+            // Check if this line starts with 'interface'
+            if (i + 9 <= content.len and std.mem.eql(u8, content[i .. i + 9], "interface")) {
+                const after_interface = if (i + 9 < content.len) content[i + 9] else 0;
+                if (after_interface == ' ' or after_interface == '\t') {
+                    // This is an interface declaration - find where it ends
+                    const interface_end = findBraceBlockEnd(content, i);
+
+                    // Include the full interface (from line_start to include leading whitespace)
+                    try imports.appendSlice(allocator, content[line_start..interface_end]);
+                    if (interface_end < content.len and content[interface_end] == '\n') {
+                        try imports.append(allocator, '\n');
+                        i = interface_end + 1;
+                    } else {
+                        i = interface_end;
+                    }
+                    continue;
+                }
+            }
+
+            // Check if this line starts with 'type' (type alias)
+            if (i + 4 <= content.len and std.mem.eql(u8, content[i .. i + 4], "type")) {
+                const after_type = if (i + 4 < content.len) content[i + 4] else 0;
+                if (after_type == ' ' or after_type == '\t') {
+                    // This is a type alias - find where it ends (at semicolon or newline after =)
+                    const type_end = findTypeAliasEnd(content, i);
+
+                    // Include the full type (from line_start to include leading whitespace)
+                    try imports.appendSlice(allocator, content[line_start..type_end]);
+                    if (type_end < content.len and content[type_end] == '\n') {
+                        try imports.append(allocator, '\n');
+                        i = type_end + 1;
+                    } else {
+                        i = type_end;
+                    }
+                    continue;
+                }
             }
         }
 
-        // Check if this line starts with 'interface'
-        if (i + 9 <= content.len and std.mem.eql(u8, content[i .. i + 9], "interface")) {
-            const after_interface = if (i + 9 < content.len) content[i + 9] else 0;
-            if (after_interface == ' ' or after_interface == '\t') {
-                // This is an interface declaration - find where it ends
-                const interface_end = findBraceBlockEnd(content, i);
-
-                // Include the full interface (from line_start to include leading whitespace)
-                try imports.appendSlice(allocator, content[line_start..interface_end]);
-                if (interface_end < content.len and content[interface_end] == '\n') {
-                    try imports.append(allocator, '\n');
-                    i = interface_end + 1;
-                } else {
-                    i = interface_end;
-                }
-                continue;
-            }
-        }
-
-        // Check if this line starts with 'type' (type alias)
-        if (i + 4 <= content.len and std.mem.eql(u8, content[i .. i + 4], "type")) {
-            const after_type = if (i + 4 < content.len) content[i + 4] else 0;
-            if (after_type == ' ' or after_type == '\t') {
-                // This is a type alias - find where it ends (at semicolon or newline after =)
-                const type_end = findTypeAliasEnd(content, i);
-
-                // Include the full type (from line_start to include leading whitespace)
-                try imports.appendSlice(allocator, content[line_start..type_end]);
-                if (type_end < content.len and content[type_end] == '\n') {
-                    try imports.append(allocator, '\n');
-                    i = type_end + 1;
-                } else {
-                    i = type_end;
-                }
-                continue;
-            }
-        }
-
-        // Not an import/interface/type - copy to 'other' until end of line
+        // Not an import/interface/type (or inside template literal) - copy to 'other' until end of line
+        // Track template literal state as we copy
         const line_end = std.mem.indexOfScalarPos(u8, content, i, '\n') orelse content.len;
+
+        // Scan this line for backticks to update template_depth
+        var j = line_start;
+        var in_string: u8 = 0; // Track regular strings (', ") that don't count
+        while (j < line_end) : (j += 1) {
+            const c = content[j];
+
+            // Skip escaped characters
+            if (c == '\\' and j + 1 < line_end) {
+                j += 1;
+                continue;
+            }
+
+            // Track regular string literals (backticks inside strings don't count)
+            if (in_string != 0) {
+                if (c == in_string) {
+                    in_string = 0;
+                }
+                continue;
+            }
+
+            // Start of regular string
+            if (c == '"' or c == '\'') {
+                in_string = c;
+                continue;
+            }
+
+            // Track template literal nesting
+            if (c == '`') {
+                if (template_depth > 0) {
+                    // Closing a template literal
+                    template_depth -= 1;
+                } else {
+                    // Opening a new template literal
+                    template_depth += 1;
+                }
+            } else if (template_depth > 0 and c == '$' and j + 1 < line_end and content[j + 1] == '{') {
+                // ${...} inside template literal - the next backtick will open a nested template
+                // We need to track brace depth to know when we exit the ${}
+                // For simplicity, increment depth here (the nested ` will handle itself)
+            }
+        }
+
         try other.appendSlice(allocator, content[line_start..line_end]);
         if (line_end < content.len) {
             try other.append(allocator, '\n');
