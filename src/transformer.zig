@@ -2065,6 +2065,10 @@ fn emitTemplateExpressions(
                     // Handle inline {#await promise then value} syntax
                     // This is different from {:then value} which gets its own .then_block node
                     if (extractInlineThenBinding(ast.source, node.start, node.end)) |binding_pattern| {
+                        // Track binding names to avoid emitting void statements for them at module scope.
+                        // For destructuring patterns like [a, b] or {x, y}, extract individual names.
+                        try extractBindingNames(allocator, binding_pattern, &template_bindings);
+
                         // Close any open narrowing context before emitting standalone declaration
                         try narrowing_ctx.close(output);
                         if (!narrowing_ctx.has_expressions) {
@@ -2097,6 +2101,10 @@ fn emitTemplateExpressions(
                 // {:then value} - emit binding for the resolved value
                 // Don't extract identifiers from the full expression (would extract "then" keyword)
                 if (extractThenCatchBinding(ast.source, node.start, node.end, "then")) |binding_pattern| {
+                    // Track binding names to avoid emitting void statements for them at module scope.
+                    // For destructuring patterns like [a, b] or {x, y}, extract individual names.
+                    try extractBindingNames(allocator, binding_pattern, &template_bindings);
+
                     // Close any open narrowing context before emitting standalone declaration
                     try narrowing_ctx.close(output);
                     if (!narrowing_ctx.has_expressions) {
@@ -2141,6 +2149,10 @@ fn emitTemplateExpressions(
             .catch_block => {
                 // {:catch error} - emit binding for the error
                 if (extractThenCatchBinding(ast.source, node.start, node.end, "catch")) |binding_pattern| {
+                    // Track binding names to avoid emitting void statements for them at module scope.
+                    // For destructuring patterns like [a, b] or {x, y}, extract individual names.
+                    try extractBindingNames(allocator, binding_pattern, &template_bindings);
+
                     // Close any open narrowing context before emitting standalone declaration
                     try narrowing_ctx.close(output);
                     if (!narrowing_ctx.has_expressions) {
