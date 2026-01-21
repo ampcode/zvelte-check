@@ -7502,6 +7502,22 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
                 }
             }
 
+            // Check if this line starts with 'export type' (exported type alias)
+            if (i + 12 <= content.len and std.mem.eql(u8, content[i .. i + 12], "export type ")) {
+                // This is an exported type alias - find where it ends
+                const type_end = findTypeAliasEnd(content, i + 7); // Skip "export " to find type end
+
+                // Include the full type (from line_start to include leading whitespace)
+                try imports.appendSlice(allocator, content[line_start..type_end]);
+                if (type_end < content.len and content[type_end] == '\n') {
+                    try imports.append(allocator, '\n');
+                    i = type_end + 1;
+                } else {
+                    i = type_end;
+                }
+                continue;
+            }
+
             // Check if this line starts with 'type' (type alias)
             if (i + 4 <= content.len and std.mem.eql(u8, content[i .. i + 4], "type")) {
                 const after_type = if (i + 4 < content.len) content[i + 4] else 0;
@@ -7526,7 +7542,10 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
         // Track template literal state as we copy
         const line_end = std.mem.indexOfScalarPos(u8, content, i, '\n') orelse content.len;
 
-        // Scan this line for backticks to update template_depth
+        // Scan this line for backticks to update template_depth.
+        // We only track regular strings (', ") when at top level (template_depth == 0).
+        // Inside template literals, single/double quotes are just content - they don't
+        // start strings that would contain backticks.
         var j = line_start;
         var in_string: u8 = 0; // Track regular strings (', ") that don't count
         while (j < line_end) : (j += 1) {
@@ -7538,18 +7557,21 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
                 continue;
             }
 
-            // Track regular string literals (backticks inside strings don't count)
-            if (in_string != 0) {
-                if (c == in_string) {
-                    in_string = 0;
+            // Track regular string literals ONLY at top level (not inside templates).
+            // Inside template literals, quotes are just content and don't start strings.
+            if (template_depth == 0) {
+                if (in_string != 0) {
+                    if (c == in_string) {
+                        in_string = 0;
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            // Start of regular string
-            if (c == '"' or c == '\'') {
-                in_string = c;
-                continue;
+                // Start of regular string (only at top level)
+                if (c == '"' or c == '\'') {
+                    in_string = c;
+                    continue;
+                }
             }
 
             // Track template literal nesting
@@ -7561,10 +7583,6 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
                     // Opening a new template literal
                     template_depth += 1;
                 }
-            } else if (template_depth > 0 and c == '$' and j + 1 < line_end and content[j + 1] == '{') {
-                // ${...} inside template literal - the next backtick will open a nested template
-                // We need to track brace depth to know when we exit the ${}
-                // For simplicity, increment depth here (the nested ` will handle itself)
             }
         }
 
@@ -11467,6 +11485,43 @@ test "each destructuring in IIFE wrapper emits void statements" {
         std.mem.indexOf(u8, virtual.content, "void groupKey") != null);
 }
 
+test "template literal with concatenation operators" {
+    // Regression test: Template literals with + operators should pass through verbatim.
+    // This tests the pattern `hello` + '' + `world` used in Vite workarounds.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // This is a minimal reproduction of the bug from diff-display-story.svelte.
+    // The template literal contains content that looks like code with single quotes,
+    // and also includes ${} interpolations elsewhere in the file.
+    const source =
+        \\<script lang="ts">
+        \\  const x = {
+        \\    msg: `File ${filename} changed: ${event}`,
+        \\    diff:
+        \\      `--- a/src/components/OldButton.tsx
+        \\+++ b/src/components/Button.tsx
+        \\@@ -1,5 +1,5 @@
+        \\ import React from 'reax` +
+        \\      '' /* split the import to keep it from matching vite scans */ +
+        \\      `xxct'
+        \\-import { cn } from '../utils/cn'
+        \\+import { cn } from '../../utils/cn'`,
+        \\  };
+        \\</script>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // The template literal content should be preserved verbatim
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "import React from 'reax` +") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "`xxct'") != null);
+}
+
 test "instance script wrapped in __render function" {
     // Regression test: Instance scripts are wrapped in __render() to match svelte2tsx behavior.
     // This ensures TypeScript catches errors like `declare global` being inside a function.
@@ -11510,4 +11565,45 @@ test "instance script wrapped in __render function" {
     const declare_pos = std.mem.indexOf(u8, virtual.content, "declare global");
     try std.testing.expect(declare_pos != null);
     try std.testing.expect(declare_pos.? > render_pos.?);
+}
+
+test "separateImports handles interface keyword inside template literal" {
+    // Regression test: interface keyword appearing inside a template literal
+    // should NOT be extracted as a top-level interface declaration.
+    // This matches the pattern from diff-display-story.svelte where diff content
+    // contains a line " interface ButtonProps {" (space-prefixed) inside backticks.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // This matches the exact structure from the failing file:
+    // - Template literal contains concatenation with `...` + '' + `...`
+    // - Content inside template has a line " interface ButtonProps {" (space-prefixed)
+    // - There's an empty line before the interface line
+    // Uses explicit tab characters since multiline string literals can't have literal tabs.
+    const content = "import type { Foo } from 'bar';\n" ++
+        "\n" ++
+        "const x = {\n" ++
+        "\tdiff:\n" ++
+        "\t\t`--- a/src/Old.tsx\n" ++
+        "+++ b/src/New.tsx\n" ++
+        "@@ -1,5 +1,5 @@\n" ++
+        " import React from 'reax` +\n" ++
+        "\t\t'' /* split */ +\n" ++
+        "\t\t`xxct'\n" ++
+        "-import { cn } from '../utils/cn'\n" ++
+        "+import { cn } from '../../utils/cn'\n" ++
+        "\n" ++
+        " interface ButtonProps {\n" ++
+        "   children: React.ReactNode`,\n" ++
+        "};\n";
+
+    const sep = try separateImports(allocator, content);
+
+    // Only the import should be in imports
+    try std.testing.expect(std.mem.indexOf(u8, sep.imports, "import type { Foo }") != null);
+    // The interface inside the template should NOT be in imports
+    try std.testing.expect(std.mem.indexOf(u8, sep.imports, "interface ButtonProps") == null);
+    // The interface should be in other (as part of the template literal)
+    try std.testing.expect(std.mem.indexOf(u8, sep.other, "interface ButtonProps") != null);
 }
