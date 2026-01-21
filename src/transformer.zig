@@ -2337,6 +2337,8 @@ fn emitTemplateExpressions(
                             try output.appendSlice(allocator, " = 0;");
                         }
                         try output.appendSlice(allocator, "\n");
+                        // Mark destructured binding names as used to avoid "All destructured elements are unused"
+                        try emitBindingVoidStatements(allocator, output, each_range.item_binding, each_range.index_binding);
                     }
                 }
 
@@ -5076,6 +5078,44 @@ fn findTopLevelComma(text: []const u8) ?usize {
     return null;
 }
 
+/// Emits void statements for binding names to mark them as used.
+/// Handles both destructuring patterns and simple identifiers.
+/// For `[a, b]` emits `void a; void b;`
+/// For simple `item` emits `void item;`
+fn emitBindingVoidStatements(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    item_binding: []const u8,
+    index_binding: ?[]const u8,
+) !void {
+    // Check if it's a destructuring pattern
+    const trimmed = std.mem.trim(u8, item_binding, " \t\n\r");
+    if (trimmed.len > 0 and (trimmed[0] == '[' or trimmed[0] == '{')) {
+        // Destructuring pattern - extract names
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(allocator);
+        try extractBindingNames(allocator, item_binding, &names);
+
+        var name_iter = names.iterator();
+        while (name_iter.next()) |entry| {
+            try output.appendSlice(allocator, "void ");
+            try output.appendSlice(allocator, entry.key_ptr.*);
+            try output.appendSlice(allocator, "; ");
+        }
+        if (names.count() > 0) {
+            try output.appendSlice(allocator, "\n");
+        }
+    }
+    // Simple identifiers don't need void statements - they're used directly in expressions
+
+    // Emit void for index binding if present
+    if (index_binding) |idx| {
+        try output.appendSlice(allocator, "void ");
+        try output.appendSlice(allocator, idx);
+        try output.appendSlice(allocator, ";\n");
+    }
+}
+
 /// Extracts individual identifier names from a binding pattern.
 /// Handles simple identifiers, array destructuring, and object destructuring.
 /// - Simple: `item` → ["item"]
@@ -6365,6 +6405,8 @@ fn emitSnippetBodyExpressions(
             try output.appendSlice(allocator, " = 0;");
         }
         try output.appendSlice(allocator, "\n");
+        // Mark destructured binding names as used to avoid "All destructured elements are unused"
+        try emitBindingVoidStatements(allocator, output, each_range.item_binding, each_range.index_binding);
     }
 
     // Use NarrowingContext to keep if-blocks open across bindings and expressions.
@@ -11102,4 +11144,38 @@ test "@const binding used as component should be in scope" {
     // Previously, scanTemplateForComponents would add component names from inside snippets
     // to template_refs, causing `void IconComponent;` at module scope where it's not in scope.
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void IconComponent") == null);
+}
+
+test "each destructuring in IIFE wrapper emits void statements" {
+    // Regression test for "All destructured elements are unused" errors.
+    // When {#each} uses destructuring like [groupKey, group], and HTML elements
+    // inside the loop are wrapped in IIFEs for narrowing context, the destructured
+    // binding names must be marked as used inside each IIFE.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let groupedTools: Map<string, { label: string; tools: string[] }> = new Map();
+        \\  let expandedGroups: Set<string> = new Set();
+        \\</script>
+        \\
+        \\{#each groupedTools as [groupKey, group] (groupKey)}
+        \\  <div class="test">{group.label}</div>
+        \\  {#if expandedGroups.has(groupKey)}expanded{/if}
+        \\{/each}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // Verify the destructured binding variables are marked as used
+    // with void statements (not just the iterable or key expression)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void (group") != null or
+        std.mem.indexOf(u8, virtual.content, "void group") != null);
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void (groupKey") != null or
+        std.mem.indexOf(u8, virtual.content, "void groupKey") != null);
 }
