@@ -618,7 +618,25 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
 
             try output.appendSlice(allocator, content);
         } else {
-            try output.appendSlice(allocator, "// <script>\n");
+            // For non-generic components, also wrap in a render function like svelte2tsx does.
+            // This ensures TypeScript errors for constructs like `declare global` that are
+            // invalid inside a function, matching svelte-check's behavior.
+            const separated = try separateImports(allocator, store_transformed);
+
+            // Emit imports at module level
+            if (separated.imports.len > 0) {
+                try output.appendSlice(allocator, "// <script> imports (hoisted)\n");
+                try output.appendSlice(allocator, separated.imports);
+                try output.appendSlice(allocator, "\n");
+            }
+
+            // Wrap non-import code in async render function like svelte2tsx does.
+            // async allows await expressions to be valid TypeScript syntax.
+            try output.appendSlice(allocator, "// <script>\nasync function __render() {\n");
+
+            // Strip 'export' keyword since it's invalid inside a function.
+            // The exports are already tracked in $$Exports interface.
+            const content = try stripExportKeyword(allocator, separated.other);
 
             try mappings.append(allocator, .{
                 .svelte_offset = script.content_start,
@@ -626,7 +644,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
                 .len = @intCast(raw_content.len),
             });
 
-            try output.appendSlice(allocator, store_transformed);
+            try output.appendSlice(allocator, content);
         }
     }
 
@@ -649,29 +667,18 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         }
     }
 
-    // For generic components, emit template expressions and bindable void statements INSIDE __render
-    // For non-generic, emit at module level
-    if (instance_generics != null) {
-        if (instance_script != null) {
-            // For generic components, emit template expressions INSIDE __render
-            // so they can access script variables (which are scoped to __render).
-            try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items, each_body_ranges.items);
-
-            // Emit void statements for $bindable() props INSIDE __render to suppress "never read" errors.
-            // For generic components, props are scoped to __render, so void statements must be inside too.
-            try emitBindablePropsVoid(allocator, &output, props.items);
-
-            try output.appendSlice(allocator, "\n}\n\n");
-        }
-    } else {
-        if (instance_script != null) {
-            try output.appendSlice(allocator, "\n\n");
-        }
-        // For non-generic components, emit template expressions at module level
+    // Emit template expressions and bindable void statements INSIDE __render
+    // so they can access script variables (which are scoped to __render).
+    if (instance_script != null) {
         try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items, each_body_ranges.items);
 
-        // Emit void statements for $bindable() props at module level
+        // Emit void statements for $bindable() props INSIDE __render to suppress "never read" errors.
         try emitBindablePropsVoid(allocator, &output, props.items);
+
+        try output.appendSlice(allocator, "\n}\n\n");
+    } else {
+        // No instance script - emit template expressions at module level
+        try emitTemplateExpressions(allocator, &ast, &output, &mappings, declared_names, is_typescript, snippet_body_ranges.items, if_branches.items, each_body_ranges.items);
     }
 
     // Extract slots from AST
@@ -11221,4 +11228,49 @@ test "each destructuring in IIFE wrapper emits void statements" {
         std.mem.indexOf(u8, virtual.content, "void group") != null);
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void (groupKey") != null or
         std.mem.indexOf(u8, virtual.content, "void groupKey") != null);
+}
+
+test "instance script wrapped in __render function" {
+    // Regression test: Instance scripts are wrapped in __render() to match svelte2tsx behavior.
+    // This ensures TypeScript catches errors like `declare global` being inside a function.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  import { onMount } from 'svelte';
+        \\  
+        \\  declare global {
+        \\    interface Window {
+        \\      __test__: string;
+        \\    }
+        \\  }
+        \\  
+        \\  let x = $state(1);
+        \\</script>
+        \\
+        \\<p>{x}</p>
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // Instance script should be wrapped in async function __render()
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "async function __render()") != null);
+
+    // Imports should be hoisted outside __render (at module level)
+    // They should appear BEFORE the __render function
+    const import_pos = std.mem.indexOf(u8, virtual.content, "import { onMount }");
+    const render_pos = std.mem.indexOf(u8, virtual.content, "async function __render()");
+    try std.testing.expect(import_pos != null);
+    try std.testing.expect(render_pos != null);
+    try std.testing.expect(import_pos.? < render_pos.?);
+
+    // `declare global` should be INSIDE __render (causes TS error, matching svelte-check)
+    const declare_pos = std.mem.indexOf(u8, virtual.content, "declare global");
+    try std.testing.expect(declare_pos != null);
+    try std.testing.expect(declare_pos.? > render_pos.?);
 }
