@@ -84,8 +84,11 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
     const all_files = try workspace.scan(allocator, args.workspace, args.ignore);
 
     // Filter files by tsconfig include/exclude patterns
-    const files = if (config) |cfg| blk: {
-        var filtered: std.ArrayList([]const u8) = .empty;
+    var files_list: std.ArrayList([]const u8) = .empty;
+    // Track which files are from the main workspace (for diagnostic filtering)
+    var main_workspace_files: std.StringHashMapUnmanaged(void) = .empty;
+
+    if (config) |cfg| {
         for (all_files) |file_path| {
             // Normalize path for pattern matching:
             // 1. Strip workspace prefix to get relative path
@@ -101,11 +104,25 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
             else
                 relative;
             if (tsconfig.shouldInclude(cfg, normalized)) {
-                try filtered.append(allocator, file_path);
+                try files_list.append(allocator, file_path);
+                try main_workspace_files.put(allocator, file_path, {});
             }
         }
-        break :blk try filtered.toOwnedSlice(allocator);
-    } else all_files;
+
+        // Also scan referenced projects for .svelte files.
+        // This enables proper type checking for components imported from monorepo packages.
+        // These files are NOT added to main_workspace_files since we don't report their diagnostics.
+        for (cfg.references) |ref_path| {
+            const ref_files = try workspace.scan(allocator, ref_path, args.ignore);
+            try files_list.appendSlice(allocator, ref_files);
+        }
+    } else {
+        try files_list.appendSlice(allocator, all_files);
+        for (all_files) |file_path| {
+            try main_workspace_files.put(allocator, file_path, {});
+        }
+    }
+    const files = try files_list.toOwnedSlice(allocator);
 
     if (files.len == 0) {
         try output.printNoFiles(args.output_format);
@@ -176,7 +193,10 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
         }
         try virtual_files.append(allocator, result.virtual_file);
         for (result.diagnostics) |d| {
-            try all_diagnostics.append(allocator, d);
+            // Only report diagnostics from the main workspace, not referenced projects
+            if (main_workspace_files.contains(d.file_path)) {
+                try all_diagnostics.append(allocator, d);
+            }
         }
     }
 
@@ -238,6 +258,8 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
         for (ts_diagnostics) |d| {
             // Skip TS errors for files with fatal Svelte errors
             if (files_to_suppress_ts.contains(d.file_path)) continue;
+            // Only report diagnostics from the main workspace, not referenced projects
+            if (!main_workspace_files.contains(d.file_path)) continue;
             try all_diagnostics.append(allocator, d);
         }
     }

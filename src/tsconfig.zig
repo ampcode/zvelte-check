@@ -8,12 +8,16 @@ const std = @import("std");
 pub const TsConfig = struct {
     include: []const []const u8,
     exclude: []const []const u8,
+    /// Paths to referenced projects (from "references" field)
+    references: []const []const u8 = &.{},
 
     pub fn deinit(self: *TsConfig, allocator: std.mem.Allocator) void {
         for (self.include) |p| allocator.free(p);
         allocator.free(self.include);
         for (self.exclude) |p| allocator.free(p);
         allocator.free(self.exclude);
+        for (self.references) |p| allocator.free(p);
+        allocator.free(self.references);
     }
 };
 
@@ -58,6 +62,11 @@ fn parseConfig(allocator: std.mem.Allocator, content: []const u8, base_dir: []co
     errdefer {
         for (exclude.items) |p| allocator.free(p);
         exclude.deinit(allocator);
+    }
+    var references: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (references.items) |p| allocator.free(p);
+        references.deinit(allocator);
     }
 
     // Handle extends first (base config patterns come before current)
@@ -117,9 +126,28 @@ fn parseConfig(allocator: std.mem.Allocator, content: []const u8, base_dir: []co
         }
     }
 
+    // Parse references array - these are paths to other tsconfig projects
+    // Format: [{"path": "../lib/web-ui"}, {"path": "../core"}]
+    if (root.object.get("references")) |refs_val| {
+        if (refs_val == .array) {
+            for (refs_val.array.items) |item| {
+                if (item == .object) {
+                    if (item.object.get("path")) |path_val| {
+                        if (path_val == .string) {
+                            // Resolve the reference path relative to base_dir
+                            const ref_path = try std.fs.path.join(allocator, &.{ base_dir, path_val.string });
+                            try references.append(allocator, ref_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     return .{
         .include = try include.toOwnedSlice(allocator),
         .exclude = try exclude.toOwnedSlice(allocator),
+        .references = try references.toOwnedSlice(allocator),
     };
 }
 

@@ -136,26 +136,37 @@ pub fn check(
     var workspace_dir = try std.fs.cwd().openDir(workspace_path, .{});
     defer workspace_dir.close();
 
-    // Create stub directory for all generated files (avoids polluting source tree)
+    // Create stub directory for tsconfig and stubs.d.ts
     try workspace_dir.makePath(stub_dir);
     errdefer cleanupStubDir(workspace_dir);
 
-    // Write transformed .svelte.ts files into stub directory
-    for (virtual_files) |vf| {
-        // Strip workspace prefix from virtual_path to get relative path
-        const relative_path = stripWorkspacePrefix(vf.virtual_path, workspace_path);
+    // Track written files for cleanup (includes files outside workspace from referenced projects)
+    var written_files: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (written_files.items) |path| allocator.free(path);
+        written_files.deinit(allocator);
+    }
+    errdefer cleanupWrittenFiles(written_files.items);
 
-        // Write to stub_dir/<relative_path> (e.g., .zvelte-check/src/routes/+page.svelte.ts)
-        const stub_path = try std.fs.path.join(allocator, &.{ stub_dir, relative_path });
-        defer allocator.free(stub_path);
-        try writeVirtualFile(workspace_dir, stub_path, vf.content);
+    // Write transformed .svelte.ts files alongside original .svelte files.
+    // This allows TypeScript to find them via normal module resolution, even for
+    // imports from referenced monorepo packages.
+    for (virtual_files) |vf| {
+        // virtual_path is already the absolute path to the .svelte.ts file
+        const ts_path = try allocator.dupe(u8, vf.virtual_path);
+        try written_files.append(allocator, ts_path);
+
+        // Write file using absolute path
+        const file = try std.fs.cwd().createFile(ts_path, .{});
+        defer file.close();
+        try file.writeAll(vf.content);
     }
 
     // Write SvelteKit ambient type stubs
     try writeSvelteKitStubs(workspace_dir);
 
     // Generate tsconfig that extends project config and includes only our files
-    try writeGeneratedTsconfig(workspace_dir, workspace_path, tsconfig_path, virtual_files);
+    try writeGeneratedTsconfig(workspace_dir, tsconfig_path, virtual_files);
 
     // Find tsgo binary: walk up from workspace looking for node_modules/.bin, then PATH
     const tsgo_path = try findTsgoBinary(allocator, workspace_path);
@@ -202,6 +213,8 @@ pub fn check(
     const stdout = stdout_buf.items;
     const stderr = stderr_buf.items;
 
+    // Clean up generated files
+    cleanupWrittenFiles(written_files.items);
     cleanupStubDir(workspace_dir);
 
     // Parse tsgo output
@@ -264,9 +277,16 @@ fn stripWorkspacePrefix(path: []const u8, workspace_path: []const u8) []const u8
     return if (skip_len < path.len) path[skip_len..] else path;
 }
 
-/// Cleans up the stub directory containing all generated files.
+/// Cleans up the stub directory containing tsconfig and stubs.d.ts.
 fn cleanupStubDir(workspace_dir: std.fs.Dir) void {
     workspace_dir.deleteTree(stub_dir) catch {};
+}
+
+/// Cleans up written .svelte.ts files that were placed alongside .svelte files.
+fn cleanupWrittenFiles(paths: []const []const u8) void {
+    for (paths) |path| {
+        std.fs.cwd().deleteFile(path) catch {};
+    }
 }
 
 /// Path comparison that treats `/` and `\` as equivalent separators.
@@ -289,7 +309,6 @@ fn pathEndsWith(haystack: []const u8, needle: []const u8) bool {
 /// Includes only transformed .svelte.ts files and our type stubs.
 fn writeGeneratedTsconfig(
     workspace_dir: std.fs.Dir,
-    workspace_path: []const u8,
     tsconfig_path: ?[]const u8,
     virtual_files: []const VirtualFile,
 ) !void {
@@ -325,15 +344,14 @@ fn writeGeneratedTsconfig(
     try w.writeAll("    \"noEmit\": true,\n");
     try w.writeAll("    \"skipLibCheck\": true,\n");
     try w.writeAll("    \"allowJs\": true,\n");
-    try w.writeAll("    \"checkJs\": true,\n");
-    // rootDirs makes TS treat .zvelte-check/ and workspace root as the same virtual root,
-    // so relative imports in generated .svelte.ts files resolve correctly
-    try w.writeAll("    \"rootDirs\": [\".\", \"..\"]\n");
+    try w.writeAll("    \"checkJs\": true\n");
     try w.writeAll("  },\n");
 
     // Include source .ts files that .svelte files may import, plus our generated files.
     // When extending a tsconfig, include is completely replaced (not merged), so we
     // must re-include the source files. Paths are relative to .zvelte-check/ directory.
+    // Generated .svelte.ts files are now written in-place alongside original .svelte files,
+    // which may be in referenced projects outside the workspace.
     try w.writeAll("  \"include\": [\n");
     try w.writeAll("    \"stubs.d.ts\",\n");
     // Include SvelteKit generated types (contains AppTypes with route literals)
@@ -344,11 +362,9 @@ fn writeGeneratedTsconfig(
     try w.writeAll("    \"../src/**/*.js\"");
 
     for (virtual_files) |vf| {
-        // Strip workspace prefix from virtual_path to get relative path
-        const relative_path = stripWorkspacePrefix(vf.virtual_path, workspace_path);
-
+        // Use absolute path since files may be outside workspace (from referenced projects)
         try w.writeAll(",\n    \"");
-        try w.writeAll(relative_path);
+        try w.writeAll(vf.virtual_path);
         try w.writeAll("\"");
     }
 
@@ -1320,7 +1336,7 @@ test "writeGeneratedTsconfig generates valid config" {
     }};
 
     // Test with no project tsconfig (empty string as workspace path since paths are already relative)
-    try writeGeneratedTsconfig(workspace_dir, "", null, &virtual_files);
+    try writeGeneratedTsconfig(workspace_dir, null, &virtual_files);
 
     // Read generated config
     const content = try workspace_dir.readFileAlloc(allocator, generated_tsconfig, 10 * 1024);
@@ -1362,7 +1378,7 @@ test "writeGeneratedTsconfig extends project config when available" {
     }};
 
     // Test with project tsconfig auto-detection (empty string as workspace path since paths are already relative)
-    try writeGeneratedTsconfig(workspace_dir, "", null, &virtual_files);
+    try writeGeneratedTsconfig(workspace_dir, null, &virtual_files);
 
     // Read generated config
     const content = try workspace_dir.readFileAlloc(allocator, generated_tsconfig, 10 * 1024);
