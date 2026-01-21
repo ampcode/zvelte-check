@@ -1070,25 +1070,10 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         return true;
     }
 
-    // Skip "Parameter 'X' implicitly has an 'any' type" errors for callback parameters.
-    // These are false positives caused by tsgo's incomplete resolution of complex
-    // SvelteKit conditional types (PageData, LayoutData, etc.). When tsgo can't fully
-    // resolve types like `Expand<OptionalUnion<...>>`, array element types become `any`,
-    // and callback parameters in .filter(), .map(), .sort() can't be inferred.
-    // We specifically filter:
-    // - "Parameter 'X' implicitly has an 'any' type" (callback params)
-    // - "Binding element 'X' implicitly has an 'any' type" (destructured callback params)
-    // We keep:
-    // - "Element implicitly has an 'any' type because expression..." (real indexing errors)
-    // - "Could not find a declaration file..." (real module resolution issues)
-    if (std.mem.indexOf(u8, message, "implicitly has an 'any' type") != null) {
-        // Only filter parameter/binding element errors, not indexing errors
-        if (std.mem.startsWith(u8, message, "Parameter '") or
-            std.mem.startsWith(u8, message, "Binding element '"))
-        {
-            return true;
-        }
-    }
+    // Note: We do NOT skip "Parameter 'X' implicitly has an 'any' type" errors.
+    // While some may be cascade errors from missing $types imports, many are real errors
+    // (e.g., callback parameters on arrays with explicit `any[]` type, snippet parameters
+    // without type annotations). svelte-check reports these, so we should too.
 
     // Skip "Untyped function calls may not accept type arguments" errors
     // These occur when the function's type can't be resolved (e.g., db.query<T>()
