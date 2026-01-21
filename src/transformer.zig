@@ -7629,8 +7629,17 @@ fn findTypeAliasEnd(content: []const u8, start: usize) usize {
             return i + 1;
         }
 
-        // Newline ends type alias only if we're past the = and not inside braces/angles
+        // Newline ends type alias only if we're past the = and not inside braces/angles,
+        // AND the next non-whitespace character is not a union continuation '|'
         if (c == '\n' and found_equals and brace_depth == 0 and angle_depth == 0) {
+            // Peek ahead to check for union continuation
+            var peek = i + 1;
+            while (peek < content.len and (content[peek] == ' ' or content[peek] == '\t')) : (peek += 1) {}
+            if (peek < content.len and content[peek] == '|') {
+                // Union continuation - keep scanning
+                i += 1;
+                continue;
+            }
             return i;
         }
 
