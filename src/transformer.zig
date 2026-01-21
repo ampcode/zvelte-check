@@ -2169,6 +2169,18 @@ fn emitTemplateExpressions(
 
                 // Extract identifiers from attribute expressions
                 try extractElementIdentifiers(allocator, ast, elem_data, node.start, &template_refs);
+
+                // Collect for component props validation (TypeScript only)
+                // Always add components for validation to catch missing required props
+                if (is_typescript) {
+                    if (!std.mem.startsWith(u8, tag, "svelte:")) {
+                        try template_items.append(allocator, .{ .html_element = .{
+                            .data_index = node.data,
+                            .node_start = node.start,
+                            .is_component = true,
+                        } });
+                    }
+                }
             },
 
             else => {},
@@ -2320,9 +2332,8 @@ fn emitTemplateExpressions(
             },
 
             .html_element => |h| {
-                // Use narrowing context for HTML element validation
+                // Use narrowing context for element validation
                 const elem_data = ast.elements.items[h.data_index];
-                const attrs = ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end];
 
                 // Find enclosing if branches for this element
                 var enclosing = try findAllEnclosingIfBranches(allocator, h.node_start, if_branches);
@@ -2356,79 +2367,97 @@ fn emitTemplateExpressions(
                     }
                 }
 
-                // Emit: void ({ attr1: value1 } satisfies Partial<__SvelteElements__['tag']>);
-                try output.appendSlice(allocator, "void ({ ");
+                if (h.is_component) {
+                    // Component: emit props validation
+                    try emitComponentPropsValidation(
+                        allocator,
+                        ast.source,
+                        output,
+                        mappings,
+                        elem_data.tag_name,
+                        elem_data.attrs_start,
+                        elem_data.attrs_end,
+                        ast.attributes.items,
+                        h.node_start,
+                    );
+                } else {
+                    // HTML element: emit attribute validation
+                    const attrs = ast.attributes.items[elem_data.attrs_start..elem_data.attrs_end];
 
-                var first_attr = true;
-                for (attrs) |attr| {
-                    if (!isValidatableHtmlAttr(attr.name)) continue;
+                    // Emit: void ({ attr1: value1 } satisfies Partial<__SvelteElements__['tag']>);
+                    try output.appendSlice(allocator, "void ({ ");
 
-                    if (!first_attr) {
-                        try output.appendSlice(allocator, ", ");
-                    }
-                    first_attr = false;
+                    var first_attr = true;
+                    for (attrs) |attr| {
+                        if (!isValidatableHtmlAttr(attr.name)) continue;
 
-                    const needs_quote = blk: {
-                        for (attr.name) |ch| {
-                            if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '$') {
-                                break :blk true;
-                            }
+                        if (!first_attr) {
+                            try output.appendSlice(allocator, ", ");
                         }
-                        break :blk false;
-                    };
+                        first_attr = false;
 
-                    try mappings.append(allocator, .{
-                        .svelte_offset = attr.start,
-                        .ts_offset = @intCast(output.items.len),
-                        .len = @intCast(attr.name.len + (if (needs_quote) @as(u32, 2) else 0)),
-                    });
-                    if (needs_quote) {
-                        try output.appendSlice(allocator, "'");
-                    }
-                    try output.appendSlice(allocator, attr.name);
-                    if (needs_quote) {
-                        try output.appendSlice(allocator, "'");
-                    }
-                    try output.appendSlice(allocator, ": ");
-
-                    if (attr.value) |val| {
-                        if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}' and isSingleExpression(val)) {
-                            const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
-                            try output.appendSlice(allocator, expr);
-                        } else if (std.mem.indexOf(u8, val, "{") != null) {
-                            try emitMixedAttributeValue(allocator, output, mappings, val, attr.start);
-                        } else if (std.mem.indexOf(u8, val, "\n") != null) {
-                            try output.appendSlice(allocator, "`");
-                            for (val) |c| {
-                                if (c == '`' or c == '$') {
-                                    try output.append(allocator, '\\');
+                        const needs_quote = blk: {
+                            for (attr.name) |ch| {
+                                if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '$') {
+                                    break :blk true;
                                 }
-                                try output.append(allocator, c);
                             }
-                            try output.appendSlice(allocator, "`");
-                        } else {
-                            if (isNumericHtmlAttr(attr.name) and isIntegerString(val)) {
-                                try output.appendSlice(allocator, val);
-                            } else {
-                                try output.appendSlice(allocator, "\"");
-                                try output.appendSlice(allocator, val);
-                                try output.appendSlice(allocator, "\"");
-                            }
+                            break :blk false;
+                        };
+
+                        try mappings.append(allocator, .{
+                            .svelte_offset = attr.start,
+                            .ts_offset = @intCast(output.items.len),
+                            .len = @intCast(attr.name.len + (if (needs_quote) @as(u32, 2) else 0)),
+                        });
+                        if (needs_quote) {
+                            try output.appendSlice(allocator, "'");
                         }
-                    } else {
-                        const src = ast.source[attr.start..attr.end];
-                        if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
-                            const expr = std.mem.trim(u8, src[1 .. src.len - 1], " \t\n\r");
-                            try output.appendSlice(allocator, expr);
+                        try output.appendSlice(allocator, attr.name);
+                        if (needs_quote) {
+                            try output.appendSlice(allocator, "'");
+                        }
+                        try output.appendSlice(allocator, ": ");
+
+                        if (attr.value) |val| {
+                            if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}' and isSingleExpression(val)) {
+                                const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
+                                try output.appendSlice(allocator, expr);
+                            } else if (std.mem.indexOf(u8, val, "{") != null) {
+                                try emitMixedAttributeValue(allocator, output, mappings, val, attr.start);
+                            } else if (std.mem.indexOf(u8, val, "\n") != null) {
+                                try output.appendSlice(allocator, "`");
+                                for (val) |c| {
+                                    if (c == '`' or c == '$') {
+                                        try output.append(allocator, '\\');
+                                    }
+                                    try output.append(allocator, c);
+                                }
+                                try output.appendSlice(allocator, "`");
+                            } else {
+                                if (isNumericHtmlAttr(attr.name) and isIntegerString(val)) {
+                                    try output.appendSlice(allocator, val);
+                                } else {
+                                    try output.appendSlice(allocator, "\"");
+                                    try output.appendSlice(allocator, val);
+                                    try output.appendSlice(allocator, "\"");
+                                }
+                            }
                         } else {
-                            try output.appendSlice(allocator, "true");
+                            const src = ast.source[attr.start..attr.end];
+                            if (src.len > 2 and src[0] == '{' and src[src.len - 1] == '}') {
+                                const expr = std.mem.trim(u8, src[1 .. src.len - 1], " \t\n\r");
+                                try output.appendSlice(allocator, expr);
+                            } else {
+                                try output.appendSlice(allocator, "true");
+                            }
                         }
                     }
-                }
 
-                try output.appendSlice(allocator, " } satisfies Partial<__SvelteElements__['");
-                try output.appendSlice(allocator, elem_data.tag_name);
-                try output.appendSlice(allocator, "']>);\n");
+                    try output.appendSlice(allocator, " } satisfies Partial<__SvelteElements__['");
+                    try output.appendSlice(allocator, elem_data.tag_name);
+                    try output.appendSlice(allocator, "']>);\n");
+                }
 
                 if (needs_each_wrapper) {
                     try output.appendSlice(allocator, "})();\n");
@@ -2631,24 +2660,25 @@ fn emitComponentPropsValidation(
     attrs_start: u32,
     attrs_end: u32,
     attributes: []const AttributeData,
+    node_start: u32,
 ) !void {
     const attrs = attributes[attrs_start..attrs_end];
 
-    // Collect validatable component props (exclude Svelte directives)
-    var has_validatable_props = false;
-    for (attrs) |attr| {
-        if (isValidatableComponentProp(attr.name)) {
-            has_validatable_props = true;
-            break;
-        }
-    }
-
-    if (!has_validatable_props) return;
-
     // Emit: ((_: __ComponentProps__<typeof ComponentName>) => {})({ prop1: value1, ... });
+    // Always emit this validation call, even with empty props, so TypeScript checks for
+    // missing required props. This catches errors like `<Button />` when `label` is required.
     try output.appendSlice(allocator, "((_: __ComponentProps__<typeof ");
     try output.appendSlice(allocator, tag_name);
-    try output.appendSlice(allocator, ">) => {})({ ");
+    try output.appendSlice(allocator, ">) => {})(");
+
+    // Add source mapping for the opening brace of the props object.
+    // This ensures "missing required prop" errors point to the component tag.
+    try mappings.append(allocator, .{
+        .svelte_offset = node_start,
+        .ts_offset = @intCast(output.items.len),
+        .len = 1,
+    });
+    try output.appendSlice(allocator, "{ ");
 
     var first_prop = true;
     for (attrs) |attr| {
@@ -6495,6 +6525,7 @@ fn emitSnippetBodyExpressions(
                     elem_data.attrs_start,
                     elem_data.attrs_end,
                     ast.attributes.items,
+                    comp_info.node_start,
                 );
                 try output.appendSlice(allocator, "\n");
             },
@@ -7396,20 +7427,22 @@ fn stripExportKeyword(allocator: std.mem.Allocator, content: []const u8) ![]cons
     return try result.toOwnedSlice(allocator);
 }
 
-/// Result of separating imports from other code.
+/// Result of separating imports and type declarations from other code.
 const SeparatedCode = struct {
     imports: []const u8,
     other: []const u8,
 };
 
-/// Separates import statements from other code.
-/// Used for generic components where imports must be at module level but other code
-/// goes inside the __render function.
+/// Separates import statements and type declarations from other code.
+/// Used for generic components where imports and types must be at module level but
+/// other code goes inside the __render function.
 /// Handles:
 /// - `import ... from '...'` statements
 /// - `import '...'` (side-effect imports)
 /// - `import type ... from '...'` (TypeScript type imports)
-/// Multi-line imports (with { ... } spanning lines) are supported.
+/// - `interface Name { ... }` (TypeScript interfaces)
+/// - `type Name = ...` (TypeScript type aliases)
+/// Multi-line imports and type declarations are supported.
 fn separateImports(allocator: std.mem.Allocator, content: []const u8) !SeparatedCode {
     var imports: std.ArrayList(u8) = .empty;
     defer imports.deinit(allocator);
@@ -7445,7 +7478,45 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
             }
         }
 
-        // Not an import - copy to 'other' until end of line
+        // Check if this line starts with 'interface'
+        if (i + 9 <= content.len and std.mem.eql(u8, content[i .. i + 9], "interface")) {
+            const after_interface = if (i + 9 < content.len) content[i + 9] else 0;
+            if (after_interface == ' ' or after_interface == '\t') {
+                // This is an interface declaration - find where it ends
+                const interface_end = findBraceBlockEnd(content, i);
+
+                // Include the full interface (from line_start to include leading whitespace)
+                try imports.appendSlice(allocator, content[line_start..interface_end]);
+                if (interface_end < content.len and content[interface_end] == '\n') {
+                    try imports.append(allocator, '\n');
+                    i = interface_end + 1;
+                } else {
+                    i = interface_end;
+                }
+                continue;
+            }
+        }
+
+        // Check if this line starts with 'type' (type alias)
+        if (i + 4 <= content.len and std.mem.eql(u8, content[i .. i + 4], "type")) {
+            const after_type = if (i + 4 < content.len) content[i + 4] else 0;
+            if (after_type == ' ' or after_type == '\t') {
+                // This is a type alias - find where it ends (at semicolon or newline after =)
+                const type_end = findTypeAliasEnd(content, i);
+
+                // Include the full type (from line_start to include leading whitespace)
+                try imports.appendSlice(allocator, content[line_start..type_end]);
+                if (type_end < content.len and content[type_end] == '\n') {
+                    try imports.append(allocator, '\n');
+                    i = type_end + 1;
+                } else {
+                    i = type_end;
+                }
+                continue;
+            }
+        }
+
+        // Not an import/interface/type - copy to 'other' until end of line
         const line_end = std.mem.indexOfScalarPos(u8, content, i, '\n') orelse content.len;
         try other.appendSlice(allocator, content[line_start..line_end]);
         if (line_end < content.len) {
@@ -7460,6 +7531,113 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
         .imports = try imports.toOwnedSlice(allocator),
         .other = try other.toOwnedSlice(allocator),
     };
+}
+
+/// Finds the end of a brace-delimited block (interface, object type, etc.).
+/// Handles nested braces and strings.
+fn findBraceBlockEnd(content: []const u8, start: usize) usize {
+    var i = start;
+    var brace_depth: u32 = 0;
+    var in_string: u8 = 0;
+    var found_brace = false;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Handle string literals
+        if (in_string != 0) {
+            if (c == '\\' and i + 1 < content.len) {
+                i += 2;
+                continue;
+            }
+            if (c == in_string) {
+                in_string = 0;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Start of string
+        if (c == '"' or c == '\'' or c == '`') {
+            in_string = c;
+            i += 1;
+            continue;
+        }
+
+        // Track braces
+        if (c == '{') {
+            brace_depth += 1;
+            found_brace = true;
+        } else if (c == '}') {
+            if (brace_depth > 0) brace_depth -= 1;
+            if (brace_depth == 0 and found_brace) {
+                return i + 1; // Include closing brace
+            }
+        }
+
+        i += 1;
+    }
+
+    return i;
+}
+
+/// Finds the end of a type alias declaration.
+/// Type aliases end at semicolon, or at newline if no brace nesting.
+fn findTypeAliasEnd(content: []const u8, start: usize) usize {
+    var i = start;
+    var brace_depth: u32 = 0;
+    var angle_depth: u32 = 0;
+    var in_string: u8 = 0;
+    var found_equals = false;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Handle string literals
+        if (in_string != 0) {
+            if (c == '\\' and i + 1 < content.len) {
+                i += 2;
+                continue;
+            }
+            if (c == in_string) {
+                in_string = 0;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Start of string
+        if (c == '"' or c == '\'' or c == '`') {
+            in_string = c;
+            i += 1;
+            continue;
+        }
+
+        // Track = to know we're in the type expression
+        if (c == '=') {
+            found_equals = true;
+        }
+
+        // Track braces and angles for complex types
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+        if (c == '<') angle_depth += 1;
+        if (c == '>' and angle_depth > 0) angle_depth -= 1;
+
+        // Semicolon ends the type alias
+        if (c == ';' and brace_depth == 0 and angle_depth == 0) {
+            return i + 1;
+        }
+
+        // Newline ends type alias only if we're past the = and not inside braces/angles
+        if (c == '\n' and found_equals and brace_depth == 0 and angle_depth == 0) {
+            return i;
+        }
+
+        i += 1;
+    }
+
+    return i;
 }
 
 /// Finds the end of an import statement, handling multi-line imports.

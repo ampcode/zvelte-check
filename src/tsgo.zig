@@ -1003,11 +1003,13 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "is not assignable to parameter of type" errors with complex readonly types
-        // False positives from Svelte's Immutable<> wrapper and similar complex generics
+        // Skip "is not assignable to parameter of type" errors for Svelte's Immutable<> wrapper types.
+        // Svelte wraps reactive values with Immutable<> which adds 'readonly' modifiers, causing
+        // false positives when passing mutable values to component props.
+        // Only skip if the message mentions Immutable<> specifically, not just any readonly type.
+        // Real errors with 'readonly' object literals (like toolUse with wrong shape) should be reported.
         if (std.mem.indexOf(u8, message, "is not assignable to parameter of type") != null) {
-            // Only skip if the type is complex (contains readonly, which indicates wrapped types)
-            if (std.mem.indexOf(u8, message, "readonly") != null) {
+            if (std.mem.indexOf(u8, message, "Immutable<") != null) {
                 return true;
             }
         }
