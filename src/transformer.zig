@@ -494,10 +494,17 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             \\// Converts Svelte 5 Component<Props> to a constructor that TypeScript can check props against.
             \\// The constructor pattern enables contextual typing for callback props like oninput={(e) => ...}
             \\// Uses custom __Options__ to avoid ComponentConstructorOptions' Record<string, any> constraint.
+            \\// Also handles svelte2tsx isomorphic components which have constructor without target.
             \\interface __Options__<P> { target: Element; props?: P; }
-            \\type __AnyComponent__ = { new(options: __Options__<any>): any } | { (this: void, internals: __CI__, props: any): any };
+            \\type __HasTarget__<O> = O extends { target: any } ? true : false;
+            \\type __AnyComponent__ = { new(options: any): any } | { (this: void, internals: __CI__, props: any): any };
             \\type __EnsureComponent__<T> = 
-            \\  T extends { new(options: __Options__<infer P>): any } ? T
+            \\  T extends { new(options: infer O): any }
+            \\    ? __HasTarget__<O> extends true
+            \\      ? T
+            \\      : O extends { props?: infer P }
+            \\        ? new (options: __Options__<P>) => {}
+            \\        : new (options: __Options__<Record<string, any>>) => {}
             \\  : T extends { (this: void, internals: __CI__, props: infer P): any }
             \\    ? new (options: __Options__<P>) => {}
             \\    : new (options: __Options__<Record<string, any>>) => {};
