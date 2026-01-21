@@ -517,20 +517,27 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
                         emitted_snippet_header = true;
                     }
                     // Emit as Snippet-typed variable declaration.
-                    // Format: var name: Snippet<[any, ...]> = (..._: any[]) => ({} as any);
+                    // Format: var name: Snippet<[any, any?]> = (..._: any[]) => ({} as any);
                     // This ensures snippets are assignable to Snippet<[T]> props when passed around.
                     // We use `any` parameter types to avoid referencing types not yet imported.
+                    // Parameters with default values are marked optional with `?` in the tuple.
                     if (is_typescript) {
                         try output.appendSlice(allocator, "var ");
                         try output.appendSlice(allocator, info.name);
                         try output.appendSlice(allocator, ": Snippet<[");
-                        // Count parameters and emit [any, any, ...] tuple
+                        // Parse parameters and emit [any, any?, ...] tuple with optionality
                         if (info.params) |params| {
-                            const param_count = countSnippetParams(params);
-                            var param_idx: usize = 0;
-                            while (param_idx < param_count) : (param_idx += 1) {
-                                if (param_idx > 0) try output.appendSlice(allocator, ", ");
-                                try output.appendSlice(allocator, "any");
+                            var param_list: std.ArrayList(ParamInfo) = .empty;
+                            defer param_list.deinit(allocator);
+                            try parseParams(params, &param_list, allocator);
+
+                            for (param_list.items, 0..) |param, idx| {
+                                if (idx > 0) try output.appendSlice(allocator, ", ");
+                                if (param.is_optional) {
+                                    try output.appendSlice(allocator, "any?");
+                                } else {
+                                    try output.appendSlice(allocator, "any");
+                                }
                             }
                         }
                         try output.appendSlice(allocator, "]> = (..._: any[]) => ({} as any);\n");
@@ -9234,8 +9241,8 @@ test "debug Svelte5EdgeCases optional param" {
 
     const virtual = try transform(allocator, ast);
 
-    // Snippets are hoisted as Snippet-typed variables (1 param)
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var optionalParam: Snippet<[any]>") != null);
+    // Snippets are hoisted as Snippet-typed variables (1 optional param)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var optionalParam: Snippet<[any?]>") != null);
 }
 
 test "snippet with object destructuring param" {
@@ -9308,17 +9315,53 @@ test "snippet param optionality - default values and trailing commas" {
     const virtual = try transform(allocator, ast);
 
     // Snippets are now typed as Snippet<[any, ...]> for assignability to Snippet props.
-    // Trailing comma: 3 params, not 4
+    // Trailing comma: 3 required params, not 4
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var trailingComma: Snippet<[any, any, any]>") != null);
 
-    // Default value: 1 param
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var withDefault: Snippet<[any]>") != null);
+    // Default value: 1 optional param (has default)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var withDefault: Snippet<[any?]>") != null);
 
-    // Mixed: 4 params
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var mixedParams: Snippet<[any, any, any, any]>") != null);
+    // Mixed: 2 required + 2 optional params (expanded? and onToggle?)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var mixedParams: Snippet<[any, any, any?, any?]>") != null);
 
-    // Simple default: 2 params
-    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var simpleDefault: Snippet<[any, any]>") != null);
+    // Simple default: 1 required + 1 optional param (isTrigger = false)
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var simpleDefault: Snippet<[any, any?]>") != null);
+}
+
+test "snippet with default param can be called with fewer args" {
+    // Regression test for: "Expected 4 arguments, but got 3" error
+    // when calling a snippet with a parameter that has a default value.
+    // The fix ensures parameters with defaults are marked optional in the tuple type.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Multi-line snippet like amp/web's warningAlert
+    const source =
+        \\<script lang="ts">
+        \\    import type { Component } from 'svelte';
+        \\</script>
+        \\
+        \\{#snippet warningAlert(
+        \\    Icon: Component,
+        \\    title: string,
+        \\    description: string,
+        \\    roleType: 'alert' | 'status' = 'status',
+        \\)}
+        \\    <div role={roleType}>{title}: {description}</div>
+        \\{/snippet}
+        \\
+        \\{@render warningAlert(Icon, 'Title', 'Description')}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "SnippetOptional.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // The 4th param has default, so tuple should be [any, any, any, any?]
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "var warningAlert: Snippet<[any, any, any, any?]>") != null);
 }
 
 test "const tag with template literal" {
