@@ -1919,9 +1919,14 @@ fn emitTemplateExpressions(
 
     // First pass: collect all template items from AST nodes
     for (ast.nodes.items) |node| {
-        // Skip nodes that are inside snippet bodies - they'll be handled inside the snippet function.
-        // Exception: the snippet node itself, which we need to process to emit the full snippet function.
-        if (node.kind != .snippet and isInsideSnippetBody(node.start, snippet_body_ranges)) {
+        // Skip most nodes that are inside snippet bodies - they're handled inside the snippet function.
+        // Exceptions:
+        //   1. The snippet node itself - we need it to emit the full snippet function.
+        //   2. const_tag - we need to register the binding name in template_bindings to prevent
+        //      spurious `void` emissions at module scope for snippet-local bindings.
+        const is_snippet = node.kind == .snippet;
+        const is_const_tag = node.kind == .const_tag;
+        if (!is_snippet and !is_const_tag and isInsideSnippetBody(node.start, snippet_body_ranges)) {
             continue;
         }
 
@@ -2007,11 +2012,19 @@ fn emitTemplateExpressions(
             },
 
             .const_tag => {
-                const raw = ast.source[node.start..node.end];
-                try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
-
                 if (extractConstBinding(ast.source, node.start, node.end)) |binding| {
+                    // Always add binding name to template_bindings to prevent `void` emission.
+                    // This is important for snippet-local bindings - they're not in scope at
+                    // module level, so `void IconComponent;` would fail.
                     try template_bindings.put(allocator, binding.name, {});
+
+                    // For const tags inside snippet bodies, only register the binding name.
+                    // The actual declaration is handled by emitSnippetBodyExpressions.
+                    if (isInsideSnippetBody(node.start, snippet_body_ranges)) continue;
+
+                    const raw = ast.source[node.start..node.end];
+                    try extractIdentifiersFromExpr(allocator, raw, node.start, &template_refs);
+
                     try template_items.append(allocator, .{ .const_binding = .{
                         .binding = binding,
                         .offset = node.start,
@@ -4278,6 +4291,7 @@ fn scanTemplateForComponents(
                     const name = template[i + 1 .. name_end];
                     // Component names are always added (for noUnusedLocals checking on imports).
                     // Unlike local bindings (block, m, index), components are script-scoped imports.
+                    // Note: {@const} bindings are filtered out later via template_bindings check.
                     if (name.len > 0) {
                         const result = try refs.getOrPut(allocator, name);
                         if (!result.found_existing) {
@@ -11045,4 +11059,47 @@ test "class directive with Tailwind arbitrary value brackets" {
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void active") != null);
     // The class name should NOT be extracted as identifiers
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void bg") == null);
+}
+
+test "@const binding used as component should be in scope" {
+    // Regression test: when {@const} declares a component reference inside a snippet
+    // and it's used as a component tag, the binding must be visible for TypeScript.
+    // This matches icon-button-or-close.svelte pattern from amp.
+    // Issue: TypeScript reported "Cannot find name 'IconComponent'" because the binding
+    // was declared inside the snippet but `void IconComponent;` was emitted at module scope.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let { icon }: { icon: any } = $props();
+        \\  let condition = true;
+        \\</script>
+        \\
+        \\{#snippet child({ props }: { props: any })}
+        \\  <button {...props}>
+        \\    {#if condition}
+        \\      {@const IconComponent = icon}
+        \\      <IconComponent class="stroke-[1.5]" />
+        \\    {/if}
+        \\  </button>
+        \\{/snippet}
+        \\
+        \\{@render child({ props: {} })}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+    const virtual = try transform(allocator, ast);
+
+    // The const declaration must be present inside the snippet function for IconComponent to be in scope
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "IconComponent = icon") != null);
+
+    // CRITICAL: IconComponent must NOT appear at module scope as a void statement.
+    // It should only appear inside the snippet arrow function.
+    // Previously, scanTemplateForComponents would add component names from inside snippets
+    // to template_refs, causing `void IconComponent;` at module scope where it's not in scope.
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "void IconComponent") == null);
 }
