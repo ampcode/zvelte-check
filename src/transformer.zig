@@ -689,7 +689,12 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
     if (is_typescript) {
         // Generate $$Props interface
         try output.appendSlice(allocator, "// Component typing\n");
-        if (props_interface_name) |iface| {
+        if (instance_generics != null) {
+            // Generic component: prop types may reference generic parameters like ToolDef,
+            // which are only in scope inside __render<ToolDef>(). Use Record<string, any>
+            // to avoid "Cannot find name" errors at module level.
+            try output.appendSlice(allocator, "export type $$Props = Record<string, any>;\n\n");
+        } else if (props_interface_name) |iface| {
             // Use the existing interface directly
             try output.appendSlice(allocator, "export type $$Props = ");
             try output.appendSlice(allocator, iface);
