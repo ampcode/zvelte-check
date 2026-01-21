@@ -530,7 +530,15 @@ pub const Parser = struct {
                 const is_spread = std.mem.startsWith(u8, std.mem.trim(u8, expr_content, " \t\n\r"), "...");
 
                 if (is_spread) {
-                    // Spread attributes are NOT regular attributes - skip them
+                    // Spread attribute: {...props} or {...toolCallProps(...)}
+                    // Store with name="..." and value containing the spread expression (without ...)
+                    const spread_expr = std.mem.trim(u8, expr_content[3..], " \t\n\r");
+                    try ast.attributes.append(self.allocator, .{
+                        .name = "...",
+                        .value = spread_expr,
+                        .start = expr_start,
+                        .end = expr_end,
+                    });
                     self.lexer.pos = expr_end;
                     self.advance();
                     continue;

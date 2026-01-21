@@ -698,19 +698,34 @@ fn parseTsgoOutput(
         const ts_col = std.fmt.parseInt(u32, col_str, 10) catch continue;
 
         // Find corresponding cached file by matching .svelte.ts path
-        // tsgo outputs paths like ".zvelte-check/MemberAccess.svelte.ts" but
-        // virtual_path contains the full original path "src/routes/+page.svelte.ts".
-        // Strip the stub_dir prefix and match the remainder against virtual_path endings.
+        // tsgo outputs paths in several formats depending on where the file is:
+        // 1. ".zvelte-check/Component.svelte.ts" - relative to workspace
+        // 2. "../../../tmp/file.svelte.ts" - relative paths for files outside workspace
+        // 3. "/absolute/path/file.svelte.ts" - absolute paths
+        //
+        // Virtual paths are always absolute paths like "/path/to/file.svelte.ts".
+        // We need to match the filename regardless of path prefix.
         //
         // Note: On Windows, tsgo may output backslashes. We handle both separators.
         const stub_prefix_slash = stub_dir ++ "/";
         const stub_prefix_backslash = stub_dir ++ "\\";
-        const relative_stub_path = if (std.mem.startsWith(u8, file_path, stub_prefix_slash))
+
+        // Normalize the path by:
+        // 1. Stripping .zvelte-check/ prefix if present
+        // 2. For paths with ../ prefixes (files outside workspace), extract filename
+        var relative_stub_path = if (std.mem.startsWith(u8, file_path, stub_prefix_slash))
             file_path[stub_prefix_slash.len..]
         else if (std.mem.startsWith(u8, file_path, stub_prefix_backslash))
             file_path[stub_prefix_backslash.len..]
         else
             file_path;
+
+        // For paths like "../../../tmp/file.svelte.ts", skip the ../ prefixes
+        // These occur when tsgo runs from .zvelte-check/ but the file is outside
+        // the workspace tree. We extract the meaningful path component.
+        while (std.mem.startsWith(u8, relative_stub_path, "../")) {
+            relative_stub_path = relative_stub_path[3..];
+        }
 
         const cached: ?CachedVirtualFile = for (cached_files) |cf| {
             // Match using endsWith, handling both path separators
@@ -1066,6 +1081,23 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         // at module scope. TypeScript uses the first declaration's type, causing errors when
         // later loops have different element types with different properties.
         if (std.mem.indexOf(u8, message, "does not exist on type 'string'.") != null) {
+            return true;
+        }
+
+        // Skip "Spread types may only be created from object types" errors.
+        // False positives from component props validation when using spread with snippet parameters.
+        // Example: {#snippet child({ props })} <Button {...props} /> creates a spread at module
+        // scope where `props` isn't available (it's a snippet parameter). The spread would work
+        // at runtime but our generated code emits it in a context where TypeScript can't see the type.
+        if (std.mem.indexOf(u8, message, "Spread types may only be created from object types") != null) {
+            return true;
+        }
+
+        // Skip "Cannot find name 'props'" errors for common snippet parameter names.
+        // False positives from component props validation inside snippets like
+        // {#snippet child({ props })} <Button {...props} />. The `props` identifier is extracted
+        // from the spread but emitted at module scope where the snippet parameter isn't defined.
+        if (std.mem.startsWith(u8, message, "Cannot find name 'props")) {
             return true;
         }
 

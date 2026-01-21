@@ -2848,6 +2848,26 @@ fn emitComponentPropsValidation(
 
     var first_prop = true;
     for (attrs) |attr| {
+        // Handle spread attributes: {...props} → ...props
+        if (std.mem.eql(u8, attr.name, "...")) {
+            if (attr.value) |spread_expr| {
+                if (!first_prop) {
+                    try output.appendSlice(allocator, ", ");
+                }
+                first_prop = false;
+
+                // Add source mapping for the spread expression
+                try mappings.append(allocator, .{
+                    .svelte_offset = attr.start,
+                    .ts_offset = @intCast(output.items.len),
+                    .len = @intCast(spread_expr.len + 3), // +3 for ...
+                });
+                try output.appendSlice(allocator, "...");
+                try output.appendSlice(allocator, spread_expr);
+            }
+            continue;
+        }
+
         if (!isValidatableComponentProp(attr.name)) continue;
 
         if (!first_prop) {
