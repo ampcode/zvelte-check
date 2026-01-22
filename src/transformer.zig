@@ -2548,7 +2548,35 @@ fn emitTemplateExpressions(
     for (template_items.items) |item| {
         switch (item) {
             .snippet => |s| {
-                // Close any open narrowing context before emitting snippet body
+                // Find the branches that actually enclose this snippet's position.
+                // We need this to determine which branches are already "satisfied" by the
+                // parent scope and shouldn't be re-emitted inside the snippet IIFE.
+                var snippet_enclosing = try findAllEnclosingIfBranches(allocator, s.range.snippet_start, if_branches);
+                defer snippet_enclosing.deinit(allocator);
+
+                // Count how many of those enclosing branches are currently open in narrowing_ctx.
+                // These are branches where the narrowing is already in effect due to min_binding_depth
+                // (e.g., a {@const} was emitted earlier in the same if-block).
+                var branches_already_open: usize = 0;
+                for (snippet_enclosing.items) |enc_branch| {
+                    var found = false;
+                    for (narrowing_ctx.enclosing_branches.items) |ctx_branch| {
+                        if (ctx_branch.body_start == enc_branch.body_start and
+                            ctx_branch.body_end == enc_branch.body_end)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) {
+                        branches_already_open += 1;
+                    } else {
+                        break; // Stop at first non-matching branch
+                    }
+                }
+
+                // Close any open narrowing context before emitting snippet body.
+                // Note: close() respects min_binding_depth, so some branches may remain open.
                 try narrowing_ctx.close(output);
                 try emitSnippetBodyExpressions(
                     allocator,
@@ -2560,6 +2588,7 @@ fn emitTemplateExpressions(
                     if_branches,
                     each_body_ranges,
                     &narrowing_ctx.has_expressions,
+                    branches_already_open,
                 );
             },
 
@@ -2708,6 +2737,11 @@ fn emitTemplateExpressions(
                     // If we don't, the IIFE would be created inside an already-narrowed scope,
                     // and then emitting if-conditions inside the IIFE would be seen as redundant
                     // by TypeScript (error: "This condition will always return true").
+                    //
+                    // Note: close() respects min_binding_depth, so some branches may remain open
+                    // (e.g., if there's a {@const} binding). We track how many branches remain
+                    // so we don't re-emit them inside the IIFE.
+                    const branches_still_open = narrowing_ctx.enclosing_branches.items.len;
                     try narrowing_ctx.close(output);
 
                     if (!narrowing_ctx.has_expressions) {
@@ -2733,8 +2767,11 @@ fn emitTemplateExpressions(
                         }
                     }
 
-                    // FIRST: emit OUTER if-conditions to establish narrowing context
-                    const outer_conditions = enclosing.items[0..outer_conditions_count];
+                    // FIRST: emit OUTER if-conditions to establish narrowing context.
+                    // Skip conditions that are already open in the narrowing context (due to min_binding_depth).
+                    // Re-emitting these would cause TypeScript to flag them as redundant comparisons.
+                    const conditions_to_skip = @min(branches_still_open, outer_conditions_count);
+                    const outer_conditions = enclosing.items[conditions_to_skip..outer_conditions_count];
                     iife_conditions_opened = try emitIfConditionOpeners(allocator, output, outer_conditions);
 
                     // SECOND: emit each bindings inside the narrowed scope
@@ -7138,6 +7175,11 @@ fn componentHasNonSnippetChildren(source: []const u8, tag_name: []const u8, node
 /// This ensures that expressions like `{@render threadItem(thread)}` inside `{#snippet children(thread: T)}`
 /// have access to the `thread` parameter.
 /// Also applies if-branch narrowing for expressions inside {#if} blocks within the snippet.
+///
+/// @param parent_branches_already_open: Number of enclosing branches that are already open in the parent
+///   context due to min_binding_depth (e.g., a {@const} was emitted earlier in the same if-block).
+///   Since the snippet IIFE is emitted inside the parent's still-open if-block, we skip re-emitting
+///   these branches inside the IIFE to avoid TypeScript flagging redundant comparisons.
 fn emitSnippetBodyExpressions(
     allocator: std.mem.Allocator,
     ast: *const Ast,
@@ -7148,6 +7190,7 @@ fn emitSnippetBodyExpressions(
     if_branches: []const IfBranch,
     each_body_ranges: []const EachBodyRange,
     has_expressions: *bool,
+    parent_branches_already_open: usize,
 ) !void {
     // Unified item type for all snippet body items - enables source-order emission.
     // Processing items in source order ensures bindings are in scope when expressions use them.
@@ -7345,10 +7388,17 @@ fn emitSnippetBodyExpressions(
         var inner_enclosing = try findAllEnclosingIfBranches(allocator, item_offset, snippet_branches.items);
         defer inner_enclosing.deinit(allocator);
 
-        // Combine outer + inner branches for full context
+        // Combine outer + inner branches for full context.
+        // Skip branches that are already open in the parent context.
+        // The snippet IIFE is emitted inside the parent's still-open if-block,
+        // so re-emitting those branches would cause TypeScript to flag redundant comparisons.
         var combined_branches: std.ArrayList(IfBranch) = .empty;
         defer combined_branches.deinit(allocator);
-        try combined_branches.appendSlice(allocator, outer_enclosing.items);
+
+        // Skip the first `parent_branches_already_open` branches from outer_enclosing
+        if (parent_branches_already_open < outer_enclosing.items.len) {
+            try combined_branches.appendSlice(allocator, outer_enclosing.items[parent_branches_already_open..]);
+        }
         try combined_branches.appendSlice(allocator, inner_enclosing.items);
 
         // Use NarrowingContext to manage scope
