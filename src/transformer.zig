@@ -2602,16 +2602,25 @@ fn emitTemplateExpressions(
                 var enclosing = try findAllEnclosingIfBranches(allocator, h.node_start, if_branches);
                 defer enclosing.deinit(allocator);
 
-                // Ensure we're in the correct narrowing context
-                try narrowing_ctx.ensureOpen(output, enclosing.items);
-
                 // Find enclosing {#each} blocks and emit their bindings if not already emitted
                 var enclosing_each = try findAllEnclosingEachRanges(allocator, h.node_start, each_body_ranges);
                 defer enclosing_each.deinit(allocator);
 
                 // For each enclosing {#each}, we need to emit an IIFE that declares the bindings
                 const needs_each_wrapper = enclosing_each.items.len > 0;
+
+                // Track how many if-conditions we open inside the IIFE
+                var iife_conditions_opened: u32 = 0;
+
                 if (needs_each_wrapper) {
+                    // When we have an {#each} wrapper, the if-conditions must go INSIDE the IIFE,
+                    // after the each bindings are declared. This ensures discriminated union
+                    // narrowing works correctly on the locally-scoped variables.
+                    // Emit template expressions header if not already emitted.
+                    if (!narrowing_ctx.has_expressions) {
+                        try output.appendSlice(allocator, ";// Template expressions\n");
+                        narrowing_ctx.has_expressions = true;
+                    }
                     try output.appendSlice(allocator, "(() => {\n");
                     for (enclosing_each.items) |each_range| {
                         try output.appendSlice(allocator, "let ");
@@ -2628,6 +2637,11 @@ fn emitTemplateExpressions(
                         // Mark destructured binding names as used to avoid "All destructured elements are unused"
                         try emitBindingVoidStatements(allocator, output, each_range.item_binding, each_range.index_binding);
                     }
+                    // Now emit if-conditions INSIDE the IIFE, after each bindings are declared
+                    iife_conditions_opened = try emitIfConditionOpeners(allocator, output, enclosing.items);
+                } else {
+                    // No {#each} wrapper, use the normal narrowing context
+                    try narrowing_ctx.ensureOpen(output, enclosing.items);
                 }
 
                 if (h.is_component) {
@@ -2724,6 +2738,11 @@ fn emitTemplateExpressions(
                 }
 
                 if (needs_each_wrapper) {
+                    // Close if-conditions opened inside the IIFE
+                    var j: u32 = 0;
+                    while (j < iife_conditions_opened) : (j += 1) {
+                        try output.appendSlice(allocator, "}\n");
+                    }
                     try output.appendSlice(allocator, "})();\n");
                 }
             },
