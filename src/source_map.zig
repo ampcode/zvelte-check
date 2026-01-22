@@ -30,20 +30,38 @@ pub const SourceMap = struct {
     /// Maps a TS offset to a Svelte offset, returning both the position and
     /// whether an exact mapping was found. Exact mappings are from script content;
     /// fallback mappings are from generated template code.
+    ///
+    /// When multiple mappings cover the same TS offset (e.g., script content mapping
+    /// overlaps with template expression mappings), prefer the more specific (smaller)
+    /// mapping. This ensures template expressions inside snippets get correct line numbers
+    /// even when the script mapping would also match.
     pub fn tsToSvelteWithExactness(self: *const SourceMap, ts_offset: u32) struct { offset: u32, is_exact: bool } {
         var last_mapped_end: u32 = 0;
+        var best_match: ?struct { offset: u32, len: u32 } = null;
 
         for (self.mappings) |m| {
-            // Exact match within a mapping range (script content)
+            // Check if this mapping covers the TS offset
             if (ts_offset >= m.ts_offset and ts_offset < m.ts_offset + m.len) {
                 const delta = ts_offset - m.ts_offset;
-                return .{ .offset = m.svelte_offset + delta, .is_exact = true };
+                const svelte_offset = m.svelte_offset + delta;
+
+                // Prefer smaller (more specific) mappings over larger ones.
+                // Template expression mappings are typically small and precise,
+                // while script content mappings are large and may overlap.
+                if (best_match == null or m.len < best_match.?.len) {
+                    best_match = .{ .offset = svelte_offset, .len = m.len };
+                }
             }
 
             // Track the end of the last mapping we passed (for fallback)
             if (ts_offset >= m.ts_offset + m.len) {
                 last_mapped_end = m.svelte_offset + m.len;
             }
+        }
+
+        // Return exact match if found
+        if (best_match) |match| {
+            return .{ .offset = match.offset, .is_exact = true };
         }
 
         // Fallback: return end of last mapping (generated template code)

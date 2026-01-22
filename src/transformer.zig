@@ -3137,6 +3137,20 @@ fn emitComponentPropsValidation(
             if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}' and isSingleExpression(val)) {
                 // Pure expression value: strip { } and emit the expression
                 const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
+
+                // Calculate the expression's offset in the Svelte source.
+                // The expression starts after the prop name, "=", and "{".
+                // Find the offset of the expression content within the value string.
+                const expr_start_in_val = @as(u32, @intCast(std.mem.indexOf(u8, val, expr) orelse 1));
+                // The svelte offset is: attr.start (start of name) + name.len + 1 (for =) + expr_start_in_val
+                const svelte_expr_offset = attr.start + @as(u32, @intCast(attr.name.len)) + 1 + expr_start_in_val;
+
+                // Add source mapping for the expression so errors point to the right location
+                try mappings.append(allocator, .{
+                    .svelte_offset = svelte_expr_offset,
+                    .ts_offset = @intCast(output.items.len),
+                    .len = @intCast(expr.len),
+                });
                 try output.appendSlice(allocator, expr);
             } else if (std.mem.indexOf(u8, val, "{") != null) {
                 // Mixed value with embedded expressions
