@@ -310,12 +310,14 @@ fn isInsideAsyncFunction(text: []const u8, target_pos: usize) bool {
 }
 
 /// Check if the brace at position is the body of an async arrow function or async function.
+/// Handles:
+/// - `async () => {`
+/// - `async function name() {`
+/// - `async function name(): ReturnType {`
+/// - `async function name(): Promise<T> {`
 fn isAsyncFunctionBrace(text: []const u8, brace_pos: usize) bool {
     if (brace_pos == 0) return false;
 
-    // Scan backwards to find either:
-    // - `async ... =>`  (arrow function)
-    // - `async function` (function declaration/expression)
     var i: isize = @intCast(brace_pos - 1);
 
     // Skip whitespace before brace
@@ -358,57 +360,86 @@ fn isAsyncFunctionBrace(text: []const u8, brace_pos: usize) bool {
         }
     }
 
-    // Check for `async function ... {` or `async function name() {`
-    // Scan backwards past function name and params
-    const ui: usize = @intCast(i);
-    if (ui >= 1 and text[ui] == ')') {
-        // Skip params
-        var paren_depth: i32 = 1;
-        i -= 1;
-        while (i >= 0 and paren_depth > 0) {
-            const c = text[@intCast(i)];
-            if (c == ')') paren_depth += 1;
-            if (c == '(') paren_depth -= 1;
-            i -= 1;
+    // Check for `async function ... {` or `async function name(): ReturnType {`
+    // The character before { might be:
+    // - ')' if no return type: function foo() {
+    // - '>' if return type ends with generic: function foo(): Promise<void> {
+    // - any identifier char if return type is simple: function foo(): void {
+    //
+    // We need to scan backwards to find the ')' that closes function params,
+    // skipping over any return type annotation.
+
+    // Find the ')' that closes the function params by scanning backwards
+    // and tracking angle brackets and parens
+    var angle_depth: i32 = 0;
+    var paren_depth: i32 = 0;
+    var found_params_close = false;
+
+    while (i >= 0) {
+        const c = text[@intCast(i)];
+
+        if (c == '>') angle_depth += 1;
+        if (c == '<') {
+            if (angle_depth > 0) angle_depth -= 1;
         }
-        // Skip whitespace before (
+        if (c == ')') {
+            if (angle_depth == 0) {
+                paren_depth += 1;
+                found_params_close = true;
+            }
+        }
+        if (c == '(') {
+            if (angle_depth == 0 and paren_depth > 0) {
+                paren_depth -= 1;
+                if (paren_depth == 0) {
+                    // Found matching '(' for the function params
+                    i -= 1;
+                    break;
+                }
+            }
+        }
+        i -= 1;
+    }
+
+    if (!found_params_close or i < 0) return false;
+
+    // Skip whitespace before '('
+    while (i >= 0 and std.ascii.isWhitespace(text[@intCast(i)])) : (i -= 1) {}
+    if (i < 0) return false;
+
+    // Find the identifier before params (could be function name or "function" keyword)
+    var ident_end: usize = @intCast(i + 1);
+    while (i >= 0 and isIdentChar(text[@intCast(i)])) : (i -= 1) {}
+    var ident_start: usize = @intCast(i + 1);
+    var ident = text[ident_start..ident_end];
+
+    // If this is NOT "function", it's a function name - skip it and find "function"
+    if (!std.mem.eql(u8, ident, "function")) {
+        // Skip whitespace
         while (i >= 0 and std.ascii.isWhitespace(text[@intCast(i)])) : (i -= 1) {}
         if (i < 0) return false;
 
-        // Find the identifier before params (could be function name or "function" keyword)
-        var ident_end: usize = @intCast(i + 1);
+        // Find "function" keyword
+        ident_end = @intCast(i + 1);
         while (i >= 0 and isIdentChar(text[@intCast(i)])) : (i -= 1) {}
-        var ident_start: usize = @intCast(i + 1);
-        var ident = text[ident_start..ident_end];
+        ident_start = @intCast(i + 1);
+        ident = text[ident_start..ident_end];
+    }
 
-        // If this is NOT "function", it's a function name - skip it and find "function"
-        if (!std.mem.eql(u8, ident, "function")) {
-            // Skip whitespace
-            while (i >= 0 and std.ascii.isWhitespace(text[@intCast(i)])) : (i -= 1) {}
-            if (i < 0) return false;
+    if (std.mem.eql(u8, ident, "function")) {
+        // Skip whitespace and check for "async"
+        while (i >= 0 and std.ascii.isWhitespace(text[@intCast(i)])) : (i -= 1) {}
+        if (i < 0) return false;
 
-            // Find "function" keyword
-            ident_end = @intCast(i + 1);
-            while (i >= 0 and isIdentChar(text[@intCast(i)])) : (i -= 1) {}
-            ident_start = @intCast(i + 1);
-            ident = text[ident_start..ident_end];
-        }
+        // Find the identifier before "function"
+        const async_end: usize = @intCast(i + 1);
+        while (i >= 0 and isIdentChar(text[@intCast(i)])) : (i -= 1) {}
+        const async_start: usize = @intCast(i + 1);
 
-        if (std.mem.eql(u8, ident, "function")) {
-            // Skip whitespace and check for "async"
-            while (i >= 0 and std.ascii.isWhitespace(text[@intCast(i)])) : (i -= 1) {}
-            if (i < 0) return false;
-
-            // Find the identifier before "function"
-            const async_end: usize = @intCast(i + 1);
-            while (i >= 0 and isIdentChar(text[@intCast(i)])) : (i -= 1) {}
-            const async_start: usize = @intCast(i + 1);
-
-            if (std.mem.eql(u8, text[async_start..async_end], "async")) {
-                // Verify it's not part of a larger identifier
-                if (async_start == 0 or !isIdentChar(text[async_start - 1])) {
-                    return true;
-                }
+        if (std.mem.eql(u8, text[async_start..async_end], "async")) {
+            // Verify it's not part of a larger identifier
+            if (async_start == 0 or !isIdentChar(text[async_start - 1])) {
+                return true;
             }
         }
     }

@@ -1309,25 +1309,124 @@ fn extractFunctionSignature(allocator: std.mem.Allocator, content: []const u8, s
         return try allocator.dupe(u8, "(...args: any[]) => any");
     }
 
-    // Find matching closing parenthesis
-    const params_start = i;
-    i += 1;
-    var paren_depth: u32 = 1;
-    while (i < content.len and paren_depth > 0) {
-        const c = content[i];
-        if (c == '(') paren_depth += 1;
-        if (c == ')') paren_depth -= 1;
-        // Skip strings
-        if (c == '"' or c == '\'' or c == '`') {
-            i = skipString(content, i);
-            continue;
-        }
-        i += 1;
-    }
-    const params_end = i; // Position after ')'
+    // Parse parameters one by one, stripping default values
+    // Default values are not valid in interface method signatures
+    try result.append(allocator, '(');
+    i += 1; // Skip opening '('
 
-    // Copy parameter list including parentheses
-    try result.appendSlice(allocator, content[params_start..params_end]);
+    var first_param = true;
+    while (i < content.len) {
+        i = skipWhitespace(content, i);
+
+        // Check for end of parameters
+        if (content[i] == ')') {
+            i += 1;
+            break;
+        }
+
+        // Add comma separator for subsequent parameters
+        if (!first_param) {
+            try result.appendSlice(allocator, ", ");
+        }
+        first_param = false;
+
+        // Parse parameter name (may include ... for rest params)
+        const has_rest = i + 2 < content.len and std.mem.eql(u8, content[i .. i + 3], "...");
+        if (has_rest) {
+            try result.appendSlice(allocator, "...");
+            i += 3;
+        }
+
+        const name_start = i;
+        while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+        const param_name = content[name_start..i];
+        try result.appendSlice(allocator, param_name);
+
+        i = skipWhitespace(content, i);
+
+        // Check for optional marker '?'
+        var is_optional = false;
+        if (i < content.len and content[i] == '?') {
+            is_optional = true;
+            i += 1;
+            i = skipWhitespace(content, i);
+        }
+
+        // Parse type annotation if present
+        var param_type: []const u8 = "any";
+        if (i < content.len and content[i] == ':') {
+            i += 1;
+            i = skipWhitespace(content, i);
+            const type_start = i;
+            // Find end of type (before '=', ',', or ')')
+            var angle_depth: u32 = 0;
+            var paren_depth: u32 = 0;
+            while (i < content.len) {
+                const c = content[i];
+                if (c == '<') angle_depth += 1;
+                if (c == '>' and angle_depth > 0) angle_depth -= 1;
+                if (c == '(') paren_depth += 1;
+                if (c == ')' and paren_depth > 0) {
+                    paren_depth -= 1;
+                } else if (c == ')' and paren_depth == 0 and angle_depth == 0) {
+                    break; // End of parameter list
+                }
+                if ((c == '=' or c == ',') and angle_depth == 0 and paren_depth == 0) break;
+                // Skip strings
+                if (c == '"' or c == '\'' or c == '`') {
+                    i = skipString(content, i);
+                    continue;
+                }
+                i += 1;
+            }
+            param_type = std.mem.trim(u8, content[type_start..i], " \t\n\r");
+            if (param_type.len == 0) param_type = "any";
+        }
+
+        // Check for default value - if present, parameter is optional
+        i = skipWhitespace(content, i);
+        if (i < content.len and content[i] == '=') {
+            is_optional = true;
+            // Skip past the default value
+            i += 1;
+            var angle_depth: u32 = 0;
+            var paren_depth: u32 = 0;
+            while (i < content.len) {
+                const c = content[i];
+                if (c == '<') angle_depth += 1;
+                if (c == '>' and angle_depth > 0) angle_depth -= 1;
+                if (c == '(') paren_depth += 1;
+                if (c == ')' and paren_depth > 0) {
+                    paren_depth -= 1;
+                } else if (c == ')' and paren_depth == 0 and angle_depth == 0) {
+                    break; // End of parameter list
+                }
+                if (c == ',' and angle_depth == 0 and paren_depth == 0) break;
+                // Skip strings
+                if (c == '"' or c == '\'' or c == '`') {
+                    i = skipString(content, i);
+                    continue;
+                }
+                i += 1;
+            }
+        }
+
+        // Output the parameter with optional marker if needed
+        if (is_optional and !has_rest) {
+            try result.append(allocator, '?');
+        }
+        try result.append(allocator, ':');
+        try result.append(allocator, ' ');
+        try result.appendSlice(allocator, param_type);
+
+        // Skip comma if present
+        i = skipWhitespace(content, i);
+        if (i < content.len and content[i] == ',') {
+            i += 1;
+        }
+    }
+
+    try result.append(allocator, ')');
 
     i = skipWhitespace(content, i);
 
