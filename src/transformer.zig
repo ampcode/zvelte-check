@@ -2459,6 +2459,11 @@ fn emitTemplateExpressions(
         }
     }.lessThan);
 
+    // Emit store subscription declarations for template $-prefixed identifiers FIRST.
+    // This must happen before any template expressions that use $storeName.
+    // The const declarations enable TypeScript control flow narrowing.
+    try emitTemplateStoreSubscriptions(allocator, output, &template_refs, declared_names);
+
     // Second pass: emit all items in source order with proper narrowing
     for (template_items.items) |item| {
         switch (item) {
@@ -2789,6 +2794,61 @@ fn emitTemplateExpressions(
 
     if (narrowing_ctx.has_expressions) {
         try output.appendSlice(allocator, "\n");
+    }
+}
+
+/// Emits store subscription declarations for template $-prefixed identifiers.
+/// For example, if the template uses $threadStates but it's not declared in the script's
+/// store subscriptions (because it's only referenced in the template), we emit:
+///   const $threadStates = __svelte_store_get(threadStates);
+fn emitTemplateStoreSubscriptions(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    template_refs: *std.StringHashMapUnmanaged(u32),
+    declared_names: std.StringHashMapUnmanaged(void),
+) !void {
+    _ = declared_names;
+
+    const runes = [_][]const u8{
+        "$state", "$derived", "$effect", "$props", "$bindable", "$inspect", "$host",
+    };
+
+    var emitted_header = false;
+    var iter = template_refs.iterator();
+    while (iter.next()) |entry| {
+        const name = entry.key_ptr.*;
+
+        // Only process $-prefixed names
+        if (name.len < 2 or name[0] != '$') continue;
+
+        // Get the store name (without the $ prefix)
+        const store_name = name[1..];
+
+        // Skip runes
+        var is_rune = false;
+        for (runes) |rune| {
+            if (std.mem.eql(u8, name, rune)) {
+                is_rune = true;
+                break;
+            }
+        }
+        if (is_rune) continue;
+
+        // Skip if store_name is empty or starts with $ (like $$props)
+        if (store_name.len == 0 or store_name[0] == '$') continue;
+
+        // Emit store subscription with const for proper control flow narrowing.
+        // TypeScript will catch errors if the store doesn't exist.
+        if (!emitted_header) {
+            try output.appendSlice(allocator, "// Template store subscriptions\n");
+            emitted_header = true;
+        }
+
+        try output.appendSlice(allocator, "const ");
+        try output.appendSlice(allocator, name);
+        try output.appendSlice(allocator, " = __svelte_store_get(");
+        try output.appendSlice(allocator, store_name);
+        try output.appendSlice(allocator, ");\n");
     }
 }
 
@@ -8299,11 +8359,18 @@ fn findImportEnd(content: []const u8, start: usize) usize {
 /// Does NOT transform:
 /// - Runes like `$state`, `$derived`, `$effect`, `$props`, `$bindable`, `$inspect`, `$host`
 /// - Template strings like `${expr}`
+/// - Variables explicitly declared with $-prefix (e.g., `let $threads = ...`)
 /// Collects unique store names from script content (stores are $name where name is not a rune).
 /// Returns a list of store names (without the $ prefix).
 fn collectStoreNames(allocator: std.mem.Allocator, content: []const u8) ![]const []const u8 {
     var store_names: std.StringHashMapUnmanaged(void) = .empty;
     defer store_names.deinit(allocator);
+
+    // First pass: collect all $-prefixed names that are explicitly declared.
+    // These are NOT store subscriptions - they're regular variables with $ in their name.
+    var declared_dollar_names: std.StringHashMapUnmanaged(void) = .empty;
+    defer declared_dollar_names.deinit(allocator);
+    try collectDeclaredDollarNames(allocator, content, &declared_dollar_names);
 
     const runes = [_][]const u8{
         "state", "derived", "effect", "props", "bindable", "inspect", "host",
@@ -8343,7 +8410,8 @@ fn collectStoreNames(allocator: std.mem.Allocator, content: []const u8) ![]const
                                     if (std.mem.eql(u8, name, rune)) break true;
                                 } else false;
 
-                                if (!is_rune and name.len > 0) {
+                                // Exclude declared $-prefixed variables
+                                if (!is_rune and name.len > 0 and !declared_dollar_names.contains(name)) {
                                     try store_names.put(allocator, name, {});
                                 }
                                 i = name_end;
@@ -8397,7 +8465,8 @@ fn collectStoreNames(allocator: std.mem.Allocator, content: []const u8) ![]const
                     if (std.mem.eql(u8, name, rune)) break true;
                 } else false;
 
-                if (!is_rune and name.len > 0) {
+                // Exclude declared $-prefixed variables
+                if (!is_rune and name.len > 0 and !declared_dollar_names.contains(name)) {
                     try store_names.put(allocator, name, {});
                 }
                 i = name_end;
@@ -8415,6 +8484,97 @@ fn collectStoreNames(allocator: std.mem.Allocator, content: []const u8) ![]const
         try result.append(allocator, key.*);
     }
     return try result.toOwnedSlice(allocator);
+}
+
+/// Collects names of $-prefixed variables that are explicitly declared with let/const/var.
+/// These should NOT be treated as store subscriptions.
+/// For example: `let $threads = $state([])` declares `$threads` as a regular variable.
+fn collectDeclaredDollarNames(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    declared: *std.StringHashMapUnmanaged(void),
+) !void {
+    var i: usize = 0;
+    while (i < content.len) {
+        // Skip strings
+        if (content[i] == '"' or content[i] == '\'' or content[i] == '`') {
+            const quote = content[i];
+            i += 1;
+            while (i < content.len) {
+                if (content[i] == '\\' and i + 1 < content.len) {
+                    i += 2;
+                    continue;
+                }
+                if (content[i] == quote) {
+                    i += 1;
+                    break;
+                }
+                // For template literals, skip ${...}
+                if (quote == '`' and content[i] == '$' and i + 1 < content.len and content[i + 1] == '{') {
+                    i += 2;
+                    var depth: u32 = 1;
+                    while (i < content.len and depth > 0) {
+                        if (content[i] == '{') depth += 1;
+                        if (content[i] == '}') depth -= 1;
+                        i += 1;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip single-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
+            while (i < content.len and content[i] != '\n') i += 1;
+            continue;
+        }
+
+        // Skip multi-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < content.len) {
+                if (content[i] == '*' and content[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Look for let/const/var followed by $identifier
+        if (startsWithKeyword(content[i..], "let") or
+            startsWithKeyword(content[i..], "const") or
+            startsWithKeyword(content[i..], "var"))
+        {
+            const keyword_len: usize = if (startsWithKeyword(content[i..], "const")) 5 else 3;
+            i += keyword_len;
+
+            // Skip whitespace after keyword
+            while (i < content.len and (content[i] == ' ' or content[i] == '\t' or content[i] == '\n')) : (i += 1) {}
+
+            // Check for $ prefix
+            if (i < content.len and content[i] == '$') {
+                const name_start = i + 1; // Skip the $
+                if (name_start < content.len and isIdentStartChar(content[name_start])) {
+                    var name_end = name_start;
+                    while (name_end < content.len and isIdentChar(content[name_end])) : (name_end += 1) {}
+                    const name = content[name_start..name_end];
+
+                    if (name.len > 0) {
+                        try declared.put(allocator, name, {});
+                    }
+                    i = name_end;
+                    continue;
+                }
+            }
+            continue;
+        }
+
+        i += 1;
+    }
 }
 
 /// Transforms $state with explicit type annotations to preserve the full type.
@@ -8595,24 +8755,154 @@ fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8
     // If no stores found, return content as-is
     if (store_names.len == 0) return content;
 
+    // Build a set of store names for efficient lookup
+    var store_set: std.StringHashMapUnmanaged(void) = .empty;
+    defer store_set.deinit(allocator);
+    for (store_names) |name| {
+        try store_set.put(allocator, name, {});
+    }
+
+    // Track which stores have `let storeName` declarations
+    var declared_stores: std.StringHashMapUnmanaged(void) = .empty;
+    defer declared_stores.deinit(allocator);
+
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
-    // Estimate: content + declarations (about 60 chars per store)
     try result.ensureTotalCapacity(allocator, content.len + store_names.len * 60);
 
-    // Append original content first
-    try result.appendSlice(allocator, content);
+    // First pass: insert const $storeName declarations after let storeName declarations.
+    // This enables TypeScript control flow narrowing inside callbacks like $derived.by().
+    // Using 'const' tells TypeScript the value won't change, allowing narrowing to persist.
 
-    // Generate store variable declarations at the end (after user declarations)
-    // Use 'var' instead of 'let' for hoisting - this allows using $storeName
-    // before the declaration line (var is hoisted to function/module scope)
-    try result.appendSlice(allocator, "\n// Store subscriptions\n");
+    var i: usize = 0;
+    while (i < content.len) {
+        // Skip strings
+        if (content[i] == '"' or content[i] == '\'' or content[i] == '`') {
+            const start = i;
+            i = skipStringForReactive(content, i);
+            try result.appendSlice(allocator, content[start..i]);
+            continue;
+        }
+
+        // Skip single-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
+            const start = i;
+            while (i < content.len and content[i] != '\n') : (i += 1) {}
+            try result.appendSlice(allocator, content[start..i]);
+            continue;
+        }
+
+        // Skip multi-line comments
+        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '*') {
+            const start = i;
+            i += 2;
+            while (i + 1 < content.len) {
+                if (content[i] == '*' and content[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            try result.appendSlice(allocator, content[start..i]);
+            continue;
+        }
+
+        // Look for "let storeName" or "const storeName" where storeName is a store we need to subscribe to
+        const decl_keyword_len: usize = if (startsWithKeyword(content[i..], "const")) 5 else if (startsWithKeyword(content[i..], "let")) 3 else 0;
+        if (decl_keyword_len > 0) {
+            const let_start = i;
+            i += decl_keyword_len; // skip "let" or "const"
+
+            // Skip whitespace
+            while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
+
+            // Check for identifier
+            if (i < content.len and isIdentStartChar(content[i])) {
+                const name_start = i;
+                while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+                const name = content[name_start..i];
+
+                // Check if this store is used with $ prefix
+                if (store_set.contains(name)) {
+                    // Track that this store has a let declaration
+                    try declared_stores.put(allocator, name, {});
+
+                    // Copy the entire declaration up to end of line/semicolon
+                    try result.appendSlice(allocator, content[let_start..i]);
+
+                    // Find end of statement
+                    const stmt_rest_start = i;
+                    var depth: u32 = 0;
+                    while (i < content.len) {
+                        const c = content[i];
+                        if (c == '(' or c == '{' or c == '[') depth += 1;
+                        if (c == ')' or c == '}' or c == ']') {
+                            if (depth > 0) depth -= 1;
+                        }
+                        if (depth == 0 and c == '\n') {
+                            // Check if next line continues the statement (ternary, chained ops, etc.)
+                            // Look for: ? : . + - * / % | & && || ?? etc.
+                            var peek = i + 1;
+                            while (peek < content.len and (content[peek] == ' ' or content[peek] == '\t')) : (peek += 1) {}
+                            if (peek < content.len) {
+                                const next_char = content[peek];
+                                // Continuation operators that can start a line
+                                if (next_char == '?' or next_char == ':' or next_char == '.' or
+                                    next_char == '+' or next_char == '-' or next_char == '*' or
+                                    next_char == '/' or next_char == '%' or next_char == '|' or
+                                    next_char == '&')
+                                {
+                                    // This is a continuation, keep going
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    try result.appendSlice(allocator, content[stmt_rest_start..i]);
+
+                    // Insert const $name = __svelte_store_get(name);
+                    try result.appendSlice(allocator, "const $");
+                    try result.appendSlice(allocator, name);
+                    try result.appendSlice(allocator, " = __svelte_store_get(");
+                    try result.appendSlice(allocator, name);
+                    try result.appendSlice(allocator, ");\n");
+                    continue;
+                }
+            }
+
+            // Not a store declaration, copy what we've consumed
+            try result.appendSlice(allocator, content[let_start..i]);
+            continue;
+        }
+
+        try result.append(allocator, content[i]);
+        i += 1;
+    }
+
+    // Second pass: emit var declarations at the end for stores without let declarations.
+    // This handles imported stores like `import { page } from '$app/stores'`.
+    // We use 'var' here (not 'const') because:
+    // 1. 'var' allows hoisting so $store can be used before the declaration line
+    // 2. Some stores are assigned to (e.g., $store = newValue)
+    // The tradeoff is that TypeScript won't narrow 'var' in callbacks, but imported
+    // stores are typically not narrowed anyway.
+    var needs_header = true;
     for (store_names) |name| {
-        try result.appendSlice(allocator, "var $");
-        try result.appendSlice(allocator, name);
-        try result.appendSlice(allocator, " = __svelte_store_get(");
-        try result.appendSlice(allocator, name);
-        try result.appendSlice(allocator, ");\n");
+        if (!declared_stores.contains(name)) {
+            if (needs_header) {
+                try result.appendSlice(allocator, "\n// Store subscriptions\n");
+                needs_header = false;
+            }
+            try result.appendSlice(allocator, "var $");
+            try result.appendSlice(allocator, name);
+            try result.appendSlice(allocator, " = __svelte_store_get(");
+            try result.appendSlice(allocator, name);
+            try result.appendSlice(allocator, ");\n");
+        }
     }
 
     return try result.toOwnedSlice(allocator);
