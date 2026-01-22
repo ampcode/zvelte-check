@@ -2703,6 +2703,13 @@ fn emitTemplateExpressions(
                     // 1. Conditions OUTSIDE the {#each} must come first (to narrow types like message.role)
                     // 2. Each bindings come next (let block = ...)
                     // 3. Conditions INSIDE the {#each} come last (they may reference the each binding)
+
+                    // Close any open narrowing context before starting the IIFE.
+                    // If we don't, the IIFE would be created inside an already-narrowed scope,
+                    // and then emitting if-conditions inside the IIFE would be seen as redundant
+                    // by TypeScript (error: "This condition will always return true").
+                    try narrowing_ctx.close(output);
+
                     if (!narrowing_ctx.has_expressions) {
                         try output.appendSlice(allocator, ";// Template expressions\n");
                         narrowing_ctx.has_expressions = true;
