@@ -613,9 +613,15 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             // Separate imports from other code, emit imports first, then wrap the rest.
             const separated = try separateImports(allocator, store_transformed);
 
-            // Emit imports at module level
+            // Emit imports at module level with source mapping
             if (separated.imports.len > 0) {
                 try output.appendSlice(allocator, "// <script> imports (hoisted)\n");
+                // Add mapping for hoisted imports
+                try mappings.append(allocator, .{
+                    .svelte_offset = script.content_start,
+                    .ts_offset = @intCast(output.items.len),
+                    .len = @intCast(separated.imports.len),
+                });
                 try output.appendSlice(allocator, separated.imports);
                 try output.appendSlice(allocator, "\n");
             }
@@ -631,10 +637,12 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             // The exports are already tracked in $$Exports interface.
             const content = try stripExportKeyword(allocator, separated.other);
 
+            // Add mapping for non-import script content
+            // Offset past the imports section in the original script
             try mappings.append(allocator, .{
-                .svelte_offset = script.content_start,
+                .svelte_offset = script.content_start + @as(u32, @intCast(separated.imports.len)),
                 .ts_offset = @intCast(output.items.len),
-                .len = @intCast(raw_content.len),
+                .len = @intCast(raw_content.len - separated.imports.len),
             });
 
             try output.appendSlice(allocator, content);
@@ -644,9 +652,15 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             // invalid inside a function, matching svelte-check's behavior.
             const separated = try separateImports(allocator, store_transformed);
 
-            // Emit imports at module level
+            // Emit imports at module level with source mapping
             if (separated.imports.len > 0) {
                 try output.appendSlice(allocator, "// <script> imports (hoisted)\n");
+                // Add mapping for hoisted imports
+                try mappings.append(allocator, .{
+                    .svelte_offset = script.content_start,
+                    .ts_offset = @intCast(output.items.len),
+                    .len = @intCast(separated.imports.len),
+                });
                 try output.appendSlice(allocator, separated.imports);
                 try output.appendSlice(allocator, "\n");
             }
@@ -659,10 +673,12 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             // The exports are already tracked in $$Exports interface.
             const content = try stripExportKeyword(allocator, separated.other);
 
+            // Add mapping for non-import script content
+            // Offset past the imports section in the original script
             try mappings.append(allocator, .{
-                .svelte_offset = script.content_start,
+                .svelte_offset = script.content_start + @as(u32, @intCast(separated.imports.len)),
                 .ts_offset = @intCast(output.items.len),
-                .len = @intCast(raw_content.len),
+                .len = @intCast(raw_content.len - separated.imports.len),
             });
 
             try output.appendSlice(allocator, content);

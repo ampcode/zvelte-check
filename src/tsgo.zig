@@ -506,14 +506,17 @@ fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
         \\  export function read(asset: string): Response;
         \\}
         \\
-        \\// Generic .svelte file type declaration
-        \\// Allows tsgo to resolve imports like `import Component from './Button.svelte'`
-        \\// Named exports from .svelte files are typed via their generated .svelte.ts files
-        \\// Note: Svelte 5 uses Component interface instead of SvelteComponent class
+        \\// Override any existing `declare module "*.svelte"` shims from dependencies.
+        \\// We need strict module resolution: existing .svelte files have .svelte.ts siblings
+        \\// that TypeScript resolves to, but missing files should error.
+        \\// The `never` type for named exports ensures TypeScript errors on named imports
+        \\// from non-existent .svelte files (default imports will still work as fallback).
         \\declare module "*.svelte" {
         \\  import type { Component } from "svelte";
         \\  const component: Component<any, any, any>;
         \\  export default component;
+        \\  // Named exports typed as never to catch missing modules
+        \\  export const _: never;
         \\}
         \\
         \\// unplugin-icons virtual module stubs
@@ -1116,12 +1119,11 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         if (std.mem.indexOf(u8, message, "/$types") != null) return true;
     }
 
-    // Skip "Module '*.svelte' has no exported member" errors
-    // These occur when .ts files import type exports from .svelte files
-    // which our svelte.d.ts shim doesn't declare
-    if (std.mem.indexOf(u8, message, "Module '\"*.svelte\"'") != null) {
-        return true;
-    }
+    // NOTE: We used to skip "Module '*.svelte' has no exported member" errors here,
+    // but this hides real errors when importing from non-existent .svelte files.
+    // The *.svelte wildcard module declaration now has `export const _: never` to
+    // ensure TypeScript reports errors for named imports from missing .svelte files.
+    // These errors indicate real missing modules and should NOT be suppressed.
 
     // Note: We do NOT skip "Parameter 'X' implicitly has an 'any' type" errors.
     // While some may be cascade errors from missing $types imports, many are real errors
