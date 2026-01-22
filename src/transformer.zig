@@ -3177,7 +3177,22 @@ fn emitComponentPropsValidation(
         if (!first_prop) {
             try output.appendSlice(allocator, ", ");
         }
+        first_prop = false;
         try output.appendSlice(allocator, "children: null! as Snippet");
+    }
+
+    // Emit named snippet children as props.
+    // When a component contains {#snippet foo()}{/snippet} blocks, these are passed
+    // as props to the component. Extract and emit them here.
+    var child_snippets = try getComponentChildSnippetNames(allocator, source, tag_name, node_start);
+    defer child_snippets.deinit(allocator);
+    for (child_snippets.items) |snippet_name| {
+        if (!first_prop) {
+            try output.appendSlice(allocator, ", ");
+        }
+        first_prop = false;
+        try output.appendSlice(allocator, snippet_name);
+        try output.appendSlice(allocator, ": null! as Snippet");
     }
 
     // Close the props object, constructor call, and block
@@ -6682,6 +6697,207 @@ fn isInsideSnippetBody(pos: u32, ranges: []const SnippetBodyRange) bool {
 /// Returns true if there's actual content (text, expressions, elements) between the component tags
 /// that isn't just named snippets. Svelte 5 only passes an implicit `children` prop when there's
 /// such non-snippet content.
+/// Extracts the names of snippet children defined within a component's tags.
+/// For example, for `<Component>{#snippet header()}{/snippet}{#snippet body()}{/snippet}</Component>`,
+/// this returns ["header", "body"].
+fn getComponentChildSnippetNames(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tag_name: []const u8,
+    node_start: u32,
+) !std.ArrayList([]const u8) {
+    var result: std.ArrayList([]const u8) = .empty;
+
+    // Find the end of the opening tag
+    var pos: usize = node_start;
+    var depth: usize = 0;
+    var in_string: u8 = 0;
+    var is_self_closing = false;
+
+    // Skip to the closing '>' of the opening tag
+    while (pos < source.len) {
+        const c = source[pos];
+        if (in_string != 0) {
+            if (c == in_string and (pos == 0 or source[pos - 1] != '\\')) {
+                in_string = 0;
+            }
+        } else if (c == '"' or c == '\'') {
+            in_string = c;
+        } else if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            if (depth > 0) depth -= 1;
+        } else if (c == '>' and depth == 0) {
+            // Check if this is a self-closing tag (has '/' before '>')
+            if (pos > 0 and source[pos - 1] == '/') {
+                is_self_closing = true;
+            }
+            pos += 1;
+            break;
+        }
+        pos += 1;
+    }
+
+    // Self-closing components have no children
+    if (is_self_closing) return result;
+
+    if (pos >= source.len) return result;
+
+    // Find the closing tag </TagName>
+    const content_start = pos;
+    const closing_pattern_start = "</";
+
+    while (pos < source.len) {
+        if (pos + closing_pattern_start.len + tag_name.len < source.len and
+            std.mem.startsWith(u8, source[pos..], closing_pattern_start))
+        {
+            const after_lt_slash = pos + closing_pattern_start.len;
+            if (std.mem.startsWith(u8, source[after_lt_slash..], tag_name)) {
+                const after_tag = after_lt_slash + tag_name.len;
+                if (after_tag < source.len and (source[after_tag] == '>' or std.ascii.isWhitespace(source[after_tag]))) {
+                    break;
+                }
+            }
+        }
+        pos += 1;
+    }
+
+    const content_end = pos;
+    if (content_end <= content_start) return result;
+
+    const content = source[content_start..content_end];
+
+    // Extract snippet names from direct child {#snippet name(...)} blocks.
+    // Track both snippet nesting and component element nesting.
+    // Only extract snippets at element_depth == 0 (not inside child components).
+    var i: usize = 0;
+    var snippet_depth: usize = 0;
+    var element_depth: usize = 0;
+    var content_in_string: u8 = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Handle string literals (for attribute values)
+        if (content_in_string != 0) {
+            if (c == content_in_string and (i == 0 or content[i - 1] != '\\')) {
+                content_in_string = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == '"' or c == '\'') {
+            content_in_string = c;
+            i += 1;
+            continue;
+        }
+
+        // Check for {#snippet at top level only (no nested components or snippets)
+        if (snippet_depth == 0 and element_depth == 0 and i + 10 < content.len and std.mem.startsWith(u8, content[i..], "{#snippet ")) {
+            i += 10;
+            // Skip whitespace
+            while (i < content.len and std.ascii.isWhitespace(content[i])) : (i += 1) {}
+            // Extract the snippet name (up to '(' or whitespace)
+            const name_start = i;
+            while (i < content.len and content[i] != '(' and content[i] != '}' and !std.ascii.isWhitespace(content[i])) : (i += 1) {}
+            if (i > name_start) {
+                try result.append(allocator, content[name_start..i]);
+            }
+            snippet_depth = 1;
+            continue;
+        }
+
+        // Handle nested snippets (at any depth)
+        if (i + 10 < content.len and std.mem.startsWith(u8, content[i..], "{#snippet ")) {
+            snippet_depth += 1;
+            i += 10;
+            continue;
+        }
+
+        // Check for {/snippet} end
+        if (snippet_depth > 0 and i + 10 <= content.len and std.mem.startsWith(u8, content[i..], "{/snippet}")) {
+            snippet_depth -= 1;
+            i += 10;
+            continue;
+        }
+
+        // Track component element nesting via opening tags: <PascalCase or <namespace.Component
+        // Skip snippets since they don't contain component children.
+        if (snippet_depth == 0 and c == '<' and i + 1 < content.len) {
+            const next = content[i + 1];
+            // Check for closing tag first
+            if (next == '/') {
+                // Closing tag - decrement depth
+                if (element_depth > 0) element_depth -= 1;
+                // Skip to '>'
+                while (i < content.len and content[i] != '>') : (i += 1) {}
+                if (i < content.len) i += 1;
+                continue;
+            }
+            // Check for component (uppercase start) or namespace.Component
+            if (std.ascii.isUpper(next) or isNamespacedComponent(content, i + 1)) {
+                // Opening component tag - find the end and check if self-closing
+                const tag_end = findTagEnd(content, i);
+                if (tag_end > 0) {
+                    // Check if self-closing (ends with />)
+                    if (tag_end >= 2 and content[tag_end - 2] == '/') {
+                        // Self-closing, don't increment depth
+                    } else {
+                        element_depth += 1;
+                    }
+                    i = tag_end;
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    return result;
+}
+
+/// Checks if position points to a namespaced component like "Tooltip.Root"
+fn isNamespacedComponent(content: []const u8, start: usize) bool {
+    var i = start;
+    // Skip identifier (lowercase allowed for namespace)
+    while (i < content.len and (std.ascii.isAlphanumeric(content[i]) or content[i] == '_')) : (i += 1) {}
+    // Check for dot followed by uppercase
+    if (i < content.len and content[i] == '.') {
+        if (i + 1 < content.len and std.ascii.isUpper(content[i + 1])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Finds the end of a tag (position after the '>').
+/// Returns 0 if not found.
+fn findTagEnd(content: []const u8, start: usize) usize {
+    var i = start;
+    var in_str: u8 = 0;
+    var brace_depth: usize = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+        if (in_str != 0) {
+            if (c == in_str and (i == 0 or content[i - 1] != '\\')) {
+                in_str = 0;
+            }
+        } else if (c == '"' or c == '\'') {
+            in_str = c;
+        } else if (c == '{') {
+            brace_depth += 1;
+        } else if (c == '}') {
+            if (brace_depth > 0) brace_depth -= 1;
+        } else if (c == '>' and brace_depth == 0) {
+            return i + 1;
+        }
+        i += 1;
+    }
+    return 0;
+}
+
 fn componentHasNonSnippetChildren(source: []const u8, tag_name: []const u8, node_start: u32) bool {
     // Find the end of the opening tag
     var pos: usize = node_start;
