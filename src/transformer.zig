@@ -215,17 +215,81 @@ const NarrowingContext = struct {
             return;
         }
 
-        // Close branches that diverge from the new context (respecting min_binding_depth)
-        if (common_prefix_len < self.enclosing_branches.items.len) {
-            try self.closeInner(output, common_prefix_len);
-        }
+        // Check if we're transitioning between sibling branches of the same if/else chain.
+        // This happens when:
+        // 1. Both old and new enclosing have the same length (same nesting depth)
+        // 2. Only the LAST branch differs (common_prefix_len == len - 1)
+        // 3. The diverging new branch is a sibling of the old branch (has it in prior_conditions)
+        //
+        // We specifically require common_prefix_len == len - 1 because if earlier branches differ,
+        // we need to close those inner scopes before transitioning to the new chain.
+        const can_use_else_if = blk: {
+            // Only use else-if when transitioning between branches at the same depth
+            if (self.enclosing_branches.items.len != new_enclosing.len) {
+                break :blk false;
+            }
+            // Only use else-if when just the last branch differs
+            if (common_prefix_len + 1 != new_enclosing.len) {
+                break :blk false;
+            }
+            if (common_prefix_len < self.enclosing_branches.items.len and
+                common_prefix_len < new_enclosing.len)
+            {
+                const old_branch = self.enclosing_branches.items[common_prefix_len];
+                const new_branch = new_enclosing[common_prefix_len];
+                // Check if new branch has old branch's condition in its prior_conditions
+                if (old_branch.condition) |old_cond| {
+                    for (new_branch.prior_conditions) |prior| {
+                        if (std.mem.eql(u8, prior, old_cond)) {
+                            break :blk true;
+                        }
+                    }
+                }
+            }
+            break :blk false;
+        };
 
-        // Open new branches that extend beyond the common prefix
-        if (common_prefix_len < new_enclosing.len) {
-            const new_branches = new_enclosing[common_prefix_len..];
-            const additional = try emitIfConditionOpeners(self.allocator, output, new_branches);
-            self.conditions_opened += additional;
-            try self.enclosing_branches.appendSlice(self.allocator, new_branches);
+        if (can_use_else_if) {
+            // Transition between sibling branches - emit `} else if (...)` to continue the chain
+            const new_branch = new_enclosing[common_prefix_len];
+
+            // Close just the current branch body (one level)
+            try output.appendSlice(self.allocator, "} else ");
+
+            // Emit the new branch condition
+            if (new_branch.condition) |cond| {
+                try output.appendSlice(self.allocator, "if (");
+                try output.appendSlice(self.allocator, cond);
+                try output.appendSlice(self.allocator, ") { ");
+            } else {
+                // {:else} with no condition
+                try output.appendSlice(self.allocator, "{ ");
+            }
+
+            // Update enclosing_branches: replace the diverging branch with the new one
+            self.enclosing_branches.items[common_prefix_len] = new_branch;
+            self.enclosing_branches.shrinkRetainingCapacity(common_prefix_len + 1);
+
+            // Open any remaining nested branches
+            if (common_prefix_len + 1 < new_enclosing.len) {
+                const remaining = new_enclosing[common_prefix_len + 1 ..];
+                const additional = try emitIfConditionOpeners(self.allocator, output, remaining);
+                self.conditions_opened += additional;
+                try self.enclosing_branches.appendSlice(self.allocator, remaining);
+            }
+        } else {
+            // Close branches that diverge from the new context (respecting min_binding_depth)
+            if (common_prefix_len < self.enclosing_branches.items.len) {
+                try self.closeInner(output, common_prefix_len);
+            }
+
+            // Open new branches that extend beyond the common prefix
+            if (common_prefix_len < new_enclosing.len) {
+                const new_branches = new_enclosing[common_prefix_len..];
+                const additional = try emitIfConditionOpeners(self.allocator, output, new_branches);
+                self.conditions_opened += additional;
+                try self.enclosing_branches.appendSlice(self.allocator, new_branches);
+            }
         }
     }
 
@@ -2634,15 +2698,39 @@ fn emitTemplateExpressions(
                 var iife_conditions_opened: u32 = 0;
 
                 if (needs_each_wrapper) {
-                    // When we have an {#each} wrapper, the if-conditions must go INSIDE the IIFE,
-                    // after the each bindings are declared. This ensures discriminated union
-                    // narrowing works correctly on the locally-scoped variables.
-                    // Emit template expressions header if not already emitted.
+                    // When we have an {#each} wrapper, we need an IIFE for local variables.
+                    // We must carefully order conditions and each bindings:
+                    // 1. Conditions OUTSIDE the {#each} must come first (to narrow types like message.role)
+                    // 2. Each bindings come next (let block = ...)
+                    // 3. Conditions INSIDE the {#each} come last (they may reference the each binding)
                     if (!narrowing_ctx.has_expressions) {
                         try output.appendSlice(allocator, ";// Template expressions\n");
                         narrowing_ctx.has_expressions = true;
                     }
                     try output.appendSlice(allocator, "(() => {\n");
+
+                    // Find conditions that are OUTSIDE vs INSIDE the outermost {#each} block.
+                    // Conditions are sorted by body_start, so we can split at the first {#each}'s body_start.
+                    const outermost_each_start = if (enclosing_each.items.len > 0)
+                        enclosing_each.items[0].body_start
+                    else
+                        std.math.maxInt(u32);
+
+                    var outer_conditions_count: usize = 0;
+                    for (enclosing.items) |branch| {
+                        // If this branch's body starts before the {#each} body, it's an outer condition
+                        if (branch.body_start < outermost_each_start) {
+                            outer_conditions_count += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // FIRST: emit OUTER if-conditions to establish narrowing context
+                    const outer_conditions = enclosing.items[0..outer_conditions_count];
+                    iife_conditions_opened = try emitIfConditionOpeners(allocator, output, outer_conditions);
+
+                    // SECOND: emit each bindings inside the narrowed scope
                     for (enclosing_each.items) |each_range| {
                         try output.appendSlice(allocator, "let ");
                         try output.appendSlice(allocator, each_range.item_binding);
@@ -2658,8 +2746,10 @@ fn emitTemplateExpressions(
                         // Mark destructured binding names as used to avoid "All destructured elements are unused"
                         try emitBindingVoidStatements(allocator, output, each_range.item_binding, each_range.index_binding);
                     }
-                    // Now emit if-conditions INSIDE the IIFE, after each bindings are declared
-                    iife_conditions_opened = try emitIfConditionOpeners(allocator, output, enclosing.items);
+
+                    // THIRD: emit INNER if-conditions (that may reference each bindings)
+                    const inner_conditions = enclosing.items[outer_conditions_count..];
+                    iife_conditions_opened += try emitIfConditionOpeners(allocator, output, inner_conditions);
                 } else {
                     // No {#each} wrapper, use the normal narrowing context
                     try narrowing_ctx.ensureOpen(output, enclosing.items);
@@ -6560,43 +6650,52 @@ fn emitIfConditionOpenersIndented(
     var conditions_opened: u32 = 0;
 
     for (enclosing) |branch| {
-        // For {:else} and {:else if} branches, emit negations of prior conditions.
-        // All prior conditions must be emitted (not just simple ones) because even
-        // compound conditions with || help narrow types. For example, negating
-        // `!x || x === 'pending'` gives `x && x !== 'pending'`, which narrows x
-        // to exclude falsy values and the 'pending' literal - enabling `in` operator
-        // checks like `'user' in x` that require an object type.
         const has_priors = branch.prior_conditions.len > 0;
 
         if (has_priors or branch.condition != null) {
-            try output.appendSlice(allocator, indent);
-            try output.appendSlice(allocator, "if (");
-
-            var needs_and = false;
-
-            // Emit negations of all prior conditions
-            for (branch.prior_conditions) |prior_cond| {
-                if (needs_and) {
-                    try output.appendSlice(allocator, " && ");
+            // For {:else} and {:else if} branches with prior conditions, we emit
+            // proper if/else if chains instead of `if (!(prior) && cond)`.
+            // This allows TypeScript to correctly track control flow for discriminated
+            // union narrowing. Using negated conditions like `!(message.role === 'user')`
+            // causes TypeScript to flag subsequent checks as "comparison appears unintentional"
+            // because the type has already been narrowed.
+            //
+            // Instead of: if (!(a) && (b)) { ... }
+            // We emit:    if (a) {} else if (b) { ... }
+            // Or for {:else}: if (a) {} else if (b) {} else { ... }
+            if (has_priors) {
+                // Emit empty if blocks for each prior condition
+                for (branch.prior_conditions, 0..) |prior_cond, i| {
+                    try output.appendSlice(allocator, indent);
+                    if (i == 0) {
+                        try output.appendSlice(allocator, "if (");
+                    } else {
+                        try output.appendSlice(allocator, "} else if (");
+                    }
+                    try output.appendSlice(allocator, prior_cond);
+                    try output.appendSlice(allocator, ") {");
                 }
-                try output.appendSlice(allocator, "!(");
-                try output.appendSlice(allocator, prior_cond);
-                try output.appendSlice(allocator, ")");
-                needs_and = true;
-            }
-
-            // Emit current condition if present
-            if (branch.condition) |cond| {
-                if (needs_and) {
-                    try output.appendSlice(allocator, " && ");
+                // Now emit the actual branch as else if or else
+                try output.appendSlice(allocator, " } else ");
+                if (branch.condition) |cond| {
+                    try output.appendSlice(allocator, "if (");
+                    try output.appendSlice(allocator, cond);
+                    try output.appendSlice(allocator, ") { ");
+                } else {
+                    // {:else} with no condition
+                    try output.appendSlice(allocator, "{ ");
                 }
-                try output.appendSlice(allocator, "(");
+                // We opened one set of braces for the priors chain, plus one for the actual branch
+                // But they all share closing braces, so we only count one scope level
+                conditions_opened += 1;
+            } else if (branch.condition) |cond| {
+                // No prior conditions, just emit if (cond)
+                try output.appendSlice(allocator, indent);
+                try output.appendSlice(allocator, "if (");
                 try output.appendSlice(allocator, cond);
-                try output.appendSlice(allocator, ")");
+                try output.appendSlice(allocator, ") { ");
+                conditions_opened += 1;
             }
-
-            try output.appendSlice(allocator, ") { ");
-            conditions_opened += 1;
         }
     }
 
