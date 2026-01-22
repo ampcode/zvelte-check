@@ -1136,10 +1136,15 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         return true;
     }
 
-    // Skip "Conversion of type X to type Y may be a mistake" errors
-    // tsgo-specific false positives for type assertions
+    // Skip "Conversion of type X to type Y may be a mistake" errors only for template literal types.
+    // These are tsgo-specific false positives when mock data uses simplified keys like
+    // 'thread-1' instead of full UUID template literals like 'T-${string}-...'
+    // But don't skip legitimate errors like SVGForeignObjectElement -> HTMLElement casts.
     if (std.mem.indexOf(u8, message, "may be a mistake because neither type sufficiently overlaps") != null) {
-        return true;
+        // Only skip if the error message involves template literal types (contains `${`)
+        if (std.mem.indexOf(u8, message, "${") != null) {
+            return true;
+        }
     }
 
     // Skip "File X is not listed within the file list of project" errors
