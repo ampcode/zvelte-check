@@ -7285,21 +7285,10 @@ fn emitSnippetBodyExpressions(
     // Find if branches that ENCLOSE the snippet definition itself.
     // These outer conditions must be applied to all expressions inside the snippet
     // for proper discriminated union narrowing.
-    // IMPORTANT: We filter out {:else if} branches (those with prior_conditions) because
-    // re-checking them inside the IIFE causes TypeScript "no overlap" errors.
-    // When we're inside {:else if status === 'in-progress'}, TypeScript already knows
-    // status is 'in-progress', and re-checking !(status === 'done') causes false positives.
-    var outer_enclosing_raw = try findAllEnclosingIfBranches(allocator, range.snippet_start, if_branches);
-    defer outer_enclosing_raw.deinit(allocator);
-
-    var outer_enclosing: std.ArrayList(IfBranch) = .empty;
+    // emitIfConditionOpenersIndented handles {:else if} branches correctly by emitting
+    // proper if/else if chains like `if (prior) {} else if (cond) { ... }`.
+    var outer_enclosing = try findAllEnclosingIfBranches(allocator, range.snippet_start, if_branches);
     defer outer_enclosing.deinit(allocator);
-    for (outer_enclosing_raw.items) |branch| {
-        // Only include simple {#if} branches, not {:else if} or {:else}
-        if (branch.prior_conditions.len == 0) {
-            try outer_enclosing.append(allocator, branch);
-        }
-    }
 
     // Filter if_branches to only those entirely within this snippet's body range.
     // We only want branches where both body_start and body_end are within the snippet.
