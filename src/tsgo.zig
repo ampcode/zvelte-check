@@ -1224,11 +1224,11 @@ fn shouldSkipAsAnyTypeAssertion(message: []const u8, line_table: LineTable, sour
 
 /// Transform "Module '*.svelte' has no exported member 'X'" errors to "Cannot find module 'path'".
 /// When a .svelte import can't be resolved, TypeScript matches the wildcard module declaration
-/// and reports a confusing error. We extract the actual module path from the import statement
-/// in the source and generate a clearer error message.
+/// and reports a confusing error. We extract the member name from the error message, then search
+/// the source for an import that imports that member from a .svelte file.
 ///
 /// Returns the transformed message, or null if the error doesn't match the pattern or
-/// we can't extract the module path.
+/// we can't find the module path.
 fn transformMissingSvelteModuleError(
     allocator: std.mem.Allocator,
     message: []const u8,
@@ -1236,33 +1236,114 @@ fn transformMissingSvelteModuleError(
     line_table: LineTable,
     line: u32,
 ) ?[]const u8 {
-    // Check if this is a "Module '*.svelte'" error
-    if (std.mem.indexOf(u8, message, "Module '\"*.svelte\"'") == null) {
-        return null;
-    }
+    // Suppress unused parameter warning
+    _ = line_table;
+    _ = line;
 
-    // Get the line from source - find the import statement
-    const line_start = line_table.lineColToOffset(line, 1) orelse return null;
+    // Check if this is a "Module '*.svelte'" error and extract the member name
+    // Error format: "Module '"*.svelte"' has no exported member 'X'."
+    const prefix = "Module '\"*.svelte\"' has no exported member '";
+    const start_idx = std.mem.indexOf(u8, message, prefix) orelse return null;
+    const member_start = start_idx + prefix.len;
+    const member_end = std.mem.indexOfPos(u8, message, member_start, "'") orelse return null;
+    const member_name = message[member_start..member_end];
 
-    // Find the end of this line
-    var line_end = line_start;
-    while (line_end < source.len and source[line_end] != '\n') : (line_end += 1) {}
-    const line_content = source[line_start..line_end];
-
-    // Look for import statement and extract the module path
-    // Patterns:
-    //   import { X } from './path.svelte'
-    //   import X from './path.svelte'
-    //   import type { X } from './path.svelte'
-    const module_path = extractModulePathFromImport(line_content) orelse return null;
-
-    // Check that it's a .svelte import (not some other wildcard match)
-    if (!std.mem.endsWith(u8, module_path, ".svelte")) {
-        return null;
-    }
+    // Search the entire source for an import that imports this member from a .svelte file
+    // This avoids relying on potentially incorrect line number mapping (due to filtered imports)
+    const module_path = findSvelteImportForMember(source, member_name) orelse return null;
 
     // Generate the transformed message
     return std.fmt.allocPrint(allocator, "Cannot find module '{s}' or its corresponding type declarations.", .{module_path}) catch null;
+}
+
+/// Searches the source for an import statement that imports the given member from a .svelte file.
+/// Handles patterns like:
+///   - `import X from './path.svelte'` (default import)
+///   - `import { X } from './path.svelte'` (named import)
+///   - `import type { X } from './path.svelte'` (type import)
+///   - `import { type X, Y } from './path.svelte'` (mixed import with type specifier)
+fn findSvelteImportForMember(source: []const u8, member_name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < source.len) {
+        // Find next line
+        const line_start = i;
+        var line_end = i;
+        while (line_end < source.len and source[line_end] != '\n') : (line_end += 1) {}
+        const line = source[line_start..line_end];
+
+        // Check if this is an import from a .svelte file
+        if (std.mem.indexOf(u8, line, ".svelte") != null) {
+            if (importLineHasMember(line, member_name)) {
+                // Extract the module path
+                if (extractModulePathFromImport(line)) |path| {
+                    if (std.mem.endsWith(u8, path, ".svelte")) {
+                        return path;
+                    }
+                }
+            }
+        }
+
+        i = line_end;
+        if (i < source.len and source[i] == '\n') i += 1;
+    }
+    return null;
+}
+
+/// Checks if an import line imports the given member name.
+/// Handles default imports, named imports, and type imports.
+fn importLineHasMember(line: []const u8, member_name: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+
+    // Must be an import statement
+    if (!std.mem.startsWith(u8, trimmed, "import")) return false;
+
+    // Find "from " to isolate the import clause
+    const from_idx = std.mem.indexOf(u8, trimmed, " from ") orelse return false;
+    const import_clause = trimmed["import".len..from_idx];
+
+    // Check for named imports: { X } or { type X } or { X, Y, type Z }
+    if (std.mem.indexOf(u8, import_clause, "{")) |brace_start| {
+        if (std.mem.indexOf(u8, import_clause, "}")) |brace_end| {
+            if (brace_start < brace_end) {
+                const specifiers = import_clause[brace_start + 1 .. brace_end];
+                // Check each specifier
+                var iter = std.mem.splitScalar(u8, specifiers, ',');
+                while (iter.next()) |spec_raw| {
+                    var spec = std.mem.trim(u8, spec_raw, " \t\r\n");
+                    // Remove "type " prefix if present
+                    if (std.mem.startsWith(u8, spec, "type ")) {
+                        spec = std.mem.trim(u8, spec["type ".len..], " \t");
+                    }
+                    // Handle "X as Y" - we want to match X
+                    if (std.mem.indexOf(u8, spec, " as ")) |as_idx| {
+                        spec = std.mem.trim(u8, spec[0..as_idx], " \t");
+                    }
+                    if (std.mem.eql(u8, spec, member_name)) return true;
+                }
+            }
+        }
+    }
+
+    // Check for default import: import X from './path.svelte'
+    // The clause would be " X " or " type X "
+    const clause_trimmed = std.mem.trim(u8, import_clause, " \t");
+
+    // Skip "type " prefix for type imports
+    var default_name = clause_trimmed;
+    if (std.mem.startsWith(u8, default_name, "type ")) {
+        default_name = std.mem.trim(u8, default_name["type ".len..], " \t");
+    }
+
+    // If there's no { }, this is a default import - check if name matches
+    if (std.mem.indexOf(u8, default_name, "{") == null) {
+        // Handle "* as X" namespace imports
+        if (std.mem.startsWith(u8, default_name, "* as ")) {
+            default_name = std.mem.trim(u8, default_name["* as ".len..], " \t");
+        }
+        if (std.mem.eql(u8, default_name, member_name)) return true;
+    }
+
+    return false;
 }
 
 /// Extract the module path from an import statement.
@@ -1603,4 +1684,104 @@ test "transformMissingSvelteModuleError returns null for non-svelte imports" {
     const result = transformMissingSvelteModuleError(allocator, message, source, line_table, 1);
 
     try std.testing.expect(result == null);
+}
+
+test "transformMissingSvelteModuleError finds member across multiple imports" {
+    // Regression test: when filtered imports cause line number misalignment,
+    // we should still find the correct module by searching for the member name
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Source has multiple svelte imports; the error is about ThreadRestoration
+    const source =
+        \\<script lang="ts">
+        \\  import { type Snippet } from 'svelte'
+        \\  import PromptsTOC from './prompts-toc.svelte'
+        \\  import type { ThreadRestoration } from './restoration-state.svelte'
+        \\</script>
+    ;
+
+    const line_table = try LineTable.init(allocator, source);
+
+    // Error message about ThreadRestoration - even if line number is wrong (2 instead of 4),
+    // we should find the correct module path by searching for the member name
+    const message = "Module '\"*.svelte\"' has no exported member 'ThreadRestoration'. Did you mean to use 'import ThreadRestoration from \"*.svelte\"' instead?";
+
+    // Pass wrong line number (2) to simulate line number misalignment from filtered imports
+    const result = transformMissingSvelteModuleError(allocator, message, source, line_table, 2);
+
+    try std.testing.expect(result != null);
+    // Should find restoration-state.svelte (where ThreadRestoration is imported from),
+    // NOT prompts-toc.svelte (which was on the wrong line)
+    try std.testing.expectEqualStrings(
+        "Cannot find module './restoration-state.svelte' or its corresponding type declarations.",
+        result.?,
+    );
+}
+
+test "findSvelteImportForMember handles default and named imports" {
+    // Default import
+    try std.testing.expect(findSvelteImportForMember(
+        "import Foo from './foo.svelte'",
+        "Foo",
+    ) != null);
+    try std.testing.expectEqualStrings(
+        "./foo.svelte",
+        findSvelteImportForMember("import Foo from './foo.svelte'", "Foo").?,
+    );
+
+    // Named import
+    try std.testing.expectEqualStrings(
+        "./foo.svelte",
+        findSvelteImportForMember("import { Bar } from './foo.svelte'", "Bar").?,
+    );
+
+    // Type import
+    try std.testing.expectEqualStrings(
+        "./foo.svelte",
+        findSvelteImportForMember("import type { Baz } from './foo.svelte'", "Baz").?,
+    );
+
+    // Mixed import with type specifier
+    try std.testing.expectEqualStrings(
+        "./foo.svelte",
+        findSvelteImportForMember("import { type Qux, Other } from './foo.svelte'", "Qux").?,
+    );
+
+    // Non-matching member
+    try std.testing.expect(findSvelteImportForMember(
+        "import Foo from './foo.svelte'",
+        "Bar",
+    ) == null);
+
+    // Non-svelte import
+    try std.testing.expect(findSvelteImportForMember(
+        "import Foo from './foo.ts'",
+        "Foo",
+    ) == null);
+}
+
+test "importLineHasMember handles various import patterns" {
+    // Default import
+    try std.testing.expect(importLineHasMember("import Foo from './foo.svelte'", "Foo"));
+    try std.testing.expect(!importLineHasMember("import Foo from './foo.svelte'", "Bar"));
+
+    // Named import
+    try std.testing.expect(importLineHasMember("import { Foo } from './foo.svelte'", "Foo"));
+    try std.testing.expect(importLineHasMember("import { Foo, Bar } from './foo.svelte'", "Bar"));
+
+    // Type import
+    try std.testing.expect(importLineHasMember("import type { Foo } from './foo.svelte'", "Foo"));
+
+    // Mixed import with type specifier
+    try std.testing.expect(importLineHasMember("import { type Foo, Bar } from './foo.svelte'", "Foo"));
+    try std.testing.expect(importLineHasMember("import { type Foo, Bar } from './foo.svelte'", "Bar"));
+
+    // Aliased import (X as Y - should match X, not Y)
+    try std.testing.expect(importLineHasMember("import { Foo as F } from './foo.svelte'", "Foo"));
+    try std.testing.expect(!importLineHasMember("import { Foo as F } from './foo.svelte'", "F"));
+
+    // Not an import
+    try std.testing.expect(!importLineHasMember("const Foo = 1;", "Foo"));
 }
