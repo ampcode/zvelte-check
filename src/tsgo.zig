@@ -806,11 +806,22 @@ fn parseTsgoOutput(
             }
         }
 
+        // Transform "Module '*.svelte' has no exported member" errors to "Cannot find module"
+        // When a .svelte import can't be resolved, TypeScript matches the wildcard module
+        // declaration which gives a confusing error. Extract the actual module path from
+        // the import statement in the source and report a clearer "Cannot find module" error.
+        var final_message: []const u8 = message;
+        if (cached) |cf| {
+            if (transformMissingSvelteModuleError(allocator, message, cf.vf.source_map.svelte_source, cf.svelte_line_table, svelte_line)) |transformed| {
+                final_message = transformed;
+            }
+        }
+
         try diagnostics.append(allocator, .{
             .source = .js,
             .severity = if (is_error) .@"error" else .warning,
             .code = null,
-            .message = try allocator.dupe(u8, message),
+            .message = try allocator.dupe(u8, final_message),
             .file_path = try allocator.dupe(u8, original_path),
             .start_line = svelte_line,
             .start_col = svelte_col,
@@ -1211,6 +1222,77 @@ fn shouldSkipAsAnyTypeAssertion(message: []const u8, line_table: LineTable, sour
     return true;
 }
 
+/// Transform "Module '*.svelte' has no exported member 'X'" errors to "Cannot find module 'path'".
+/// When a .svelte import can't be resolved, TypeScript matches the wildcard module declaration
+/// and reports a confusing error. We extract the actual module path from the import statement
+/// in the source and generate a clearer error message.
+///
+/// Returns the transformed message, or null if the error doesn't match the pattern or
+/// we can't extract the module path.
+fn transformMissingSvelteModuleError(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+    source: []const u8,
+    line_table: LineTable,
+    line: u32,
+) ?[]const u8 {
+    // Check if this is a "Module '*.svelte'" error
+    if (std.mem.indexOf(u8, message, "Module '\"*.svelte\"'") == null) {
+        return null;
+    }
+
+    // Get the line from source - find the import statement
+    const line_start = line_table.lineColToOffset(line, 1) orelse return null;
+
+    // Find the end of this line
+    var line_end = line_start;
+    while (line_end < source.len and source[line_end] != '\n') : (line_end += 1) {}
+    const line_content = source[line_start..line_end];
+
+    // Look for import statement and extract the module path
+    // Patterns:
+    //   import { X } from './path.svelte'
+    //   import X from './path.svelte'
+    //   import type { X } from './path.svelte'
+    const module_path = extractModulePathFromImport(line_content) orelse return null;
+
+    // Check that it's a .svelte import (not some other wildcard match)
+    if (!std.mem.endsWith(u8, module_path, ".svelte")) {
+        return null;
+    }
+
+    // Generate the transformed message
+    return std.fmt.allocPrint(allocator, "Cannot find module '{s}' or its corresponding type declarations.", .{module_path}) catch null;
+}
+
+/// Extract the module path from an import statement.
+/// Handles: import X from 'path', import { X } from 'path', import type { X } from 'path'
+fn extractModulePathFromImport(line: []const u8) ?[]const u8 {
+    // Look for "from " followed by a quoted string
+    const from_idx = std.mem.indexOf(u8, line, " from ") orelse
+        std.mem.indexOf(u8, line, "\tfrom ") orelse
+        return null;
+
+    const after_from = line[from_idx + " from ".len ..];
+
+    // Find the opening quote (single or double)
+    const quote_char: u8 = blk: {
+        for (after_from) |c| {
+            if (c == '\'' or c == '"') break :blk c;
+            if (c != ' ' and c != '\t') return null; // Non-whitespace before quote
+        }
+        return null;
+    };
+
+    const quote_start = std.mem.indexOfScalar(u8, after_from, quote_char) orelse return null;
+    const path_start = quote_start + 1;
+
+    // Find the closing quote
+    const quote_end = std.mem.indexOfScalarPos(u8, after_from, path_start, quote_char) orelse return null;
+
+    return after_from[path_start..quote_end];
+}
+
 /// Returns true if the path is a test file.
 /// Matches common test file patterns: .test.ts, .test.js, .spec.ts, .spec.js
 fn isTestFile(path: []const u8) bool {
@@ -1424,4 +1506,101 @@ test "writeGeneratedTsconfig extends project config when available" {
 
     // Verify extends uses ../ prefix (tsconfig is in .zvelte-check/ subdirectory)
     try std.testing.expect(std.mem.indexOf(u8, content, "\"extends\": \"../tsconfig.json\"") != null);
+}
+
+test "extractModulePathFromImport handles various import styles" {
+    // Named import with single quotes
+    try std.testing.expectEqualStrings(
+        "./component.svelte",
+        extractModulePathFromImport("import { Foo } from './component.svelte';").?,
+    );
+
+    // Named import with double quotes
+    try std.testing.expectEqualStrings(
+        "./component.svelte",
+        extractModulePathFromImport("import { Foo } from \"./component.svelte\";").?,
+    );
+
+    // Default import
+    try std.testing.expectEqualStrings(
+        "../other.svelte",
+        extractModulePathFromImport("import Foo from '../other.svelte';").?,
+    );
+
+    // Type import
+    try std.testing.expectEqualStrings(
+        "$lib/components/foo.svelte",
+        extractModulePathFromImport("import type { Bar } from '$lib/components/foo.svelte';").?,
+    );
+
+    // Multiple named imports
+    try std.testing.expectEqualStrings(
+        "./utils.svelte",
+        extractModulePathFromImport("import { a, b, c } from './utils.svelte';").?,
+    );
+
+    // No from clause
+    try std.testing.expect(extractModulePathFromImport("const x = 1;") == null);
+
+    // Export instead of import
+    try std.testing.expect(extractModulePathFromImport("export { Foo }") == null);
+}
+
+test "transformMissingSvelteModuleError transforms wildcard errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Source with an import statement on line 3
+    const source =
+        \\<script lang="ts">
+        \\  // Comment
+        \\  import { Foo } from './nonexistent.svelte';
+        \\</script>
+    ;
+
+    const line_table = try LineTable.init(allocator, source);
+
+    // Message that matches the pattern
+    const message = "Module '\"*.svelte\"' has no exported member 'Foo'. Did you mean to use 'import Foo from \"*.svelte\"' instead?";
+
+    // Error is on line 3 (1-based)
+    const result = transformMissingSvelteModuleError(allocator, message, source, line_table, 3);
+
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings(
+        "Cannot find module './nonexistent.svelte' or its corresponding type declarations.",
+        result.?,
+    );
+}
+
+test "transformMissingSvelteModuleError returns null for non-matching messages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source = "import { Foo } from './exists.svelte';";
+    const line_table = try LineTable.init(allocator, source);
+
+    // Different error message
+    const message = "Type 'string' is not assignable to type 'number'.";
+    const result = transformMissingSvelteModuleError(allocator, message, source, line_table, 1);
+
+    try std.testing.expect(result == null);
+}
+
+test "transformMissingSvelteModuleError returns null for non-svelte imports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Import a .ts file (not .svelte)
+    const source = "import { Foo } from './utils.ts';";
+    const line_table = try LineTable.init(allocator, source);
+
+    // Even if the error message matches the pattern, we shouldn't transform non-.svelte imports
+    const message = "Module '\"*.svelte\"' has no exported member 'Foo'.";
+    const result = transformMissingSvelteModuleError(allocator, message, source, line_table, 1);
+
+    try std.testing.expect(result == null);
 }
