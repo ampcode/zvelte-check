@@ -694,6 +694,12 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         const state_transformed = try transformStateWithTypeAnnotation(allocator, reactive_transformed);
         const store_transformed = try transformStoreSubscriptions(allocator, state_transformed);
 
+        // Find where the first non-import line starts in the RAW content.
+        // This is needed for source mapping because imports can be scattered throughout the file.
+        // We need to track where non-import code begins in the ORIGINAL source, not the transformed version.
+        const raw_separated = try separateImports(allocator, raw_content);
+        const first_non_import_offset = raw_separated.first_other_pos;
+
         if (instance_generics) |generics| {
             // For generic components, imports must be at module level (not inside __render).
             // Separate imports from other code, emit imports first, then wrap the rest.
@@ -724,11 +730,12 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             const content = try stripExportKeyword(allocator, separated.other);
 
             // Add mapping for non-import script content
-            // Offset past the imports section in the original script
+            // Use first_non_import_offset from raw content for correct source mapping.
+            // This handles files where imports are scattered throughout (not just at the top).
             try mappings.append(allocator, .{
-                .svelte_offset = script.content_start + @as(u32, @intCast(separated.imports.len)),
+                .svelte_offset = script.content_start + @as(u32, @intCast(first_non_import_offset)),
                 .ts_offset = @intCast(output.items.len),
-                .len = @intCast(raw_content.len - separated.imports.len),
+                .len = @intCast(raw_content.len - first_non_import_offset),
             });
 
             try output.appendSlice(allocator, content);
@@ -760,11 +767,12 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             const content = try stripExportKeyword(allocator, separated.other);
 
             // Add mapping for non-import script content
-            // Offset past the imports section in the original script
+            // Use first_non_import_offset from raw content for correct source mapping.
+            // This handles files where imports are scattered throughout (not just at the top).
             try mappings.append(allocator, .{
-                .svelte_offset = script.content_start + @as(u32, @intCast(separated.imports.len)),
+                .svelte_offset = script.content_start + @as(u32, @intCast(first_non_import_offset)),
                 .ts_offset = @intCast(output.items.len),
-                .len = @intCast(raw_content.len - separated.imports.len),
+                .len = @intCast(raw_content.len - first_non_import_offset),
             });
 
             try output.appendSlice(allocator, content);
@@ -4838,27 +4846,12 @@ fn extractMemberAccessChainsFromBody(
                             break;
                         }
                     } else if (body[i] == '(') {
-                        // Method call - extract member accesses from arguments, then skip
-                        const args_start = i + 1;
-                        var paren_depth: u32 = 1;
-                        i += 1;
-                        while (i < body.len and paren_depth > 0) {
-                            if (body[i] == '"' or body[i] == '\'' or body[i] == '`') {
-                                i = skipStringLiteral(body, i);
-                                continue;
-                            }
-                            if (body[i] == '(') paren_depth += 1;
-                            if (body[i] == ')') paren_depth -= 1;
-                            if (paren_depth > 0) i += 1;
-                        }
-                        const args_end = i;
-                        if (i < body.len) i += 1; // Skip closing )
-
-                        // Recursively extract from the arguments
-                        if (args_end > args_start) {
-                            const args = body[args_start..args_end];
-                            try extractMemberAccessChainsFromBody(allocator, args, body_offset + @as(u32, @intCast(args_start)), results, arrow_params, local_decls);
-                        }
+                        // Method call - stop the chain here to avoid including call arguments.
+                        // The arguments may reference local variables from the closure that
+                        // don't exist at module scope, which would cause "Cannot find name" errors.
+                        // Just extracting the member access chain (e.g., `obj.method`) is enough
+                        // to establish narrowing for `obj`.
+                        break;
                     } else if (body[i] == '[') {
                         // Index access - skip it, just record up to here
                         break;
@@ -8942,6 +8935,9 @@ fn stripExportKeyword(allocator: std.mem.Allocator, content: []const u8) ![]cons
 const SeparatedCode = struct {
     imports: []const u8,
     other: []const u8,
+    /// Position in the original content where the first non-import/non-type line starts.
+    /// Used for source mapping when imports are scattered throughout the file.
+    first_other_pos: usize,
 };
 
 /// Separates import statements and type declarations from other code.
@@ -8965,6 +8961,9 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
 
     // Track template literal nesting depth (backticks can nest via ${...})
     var template_depth: u32 = 0;
+
+    // Track position of first non-import line for source mapping
+    var first_other_pos: ?usize = null;
 
     var i: usize = 0;
     while (i < content.len) {
@@ -9097,6 +9096,16 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
             }
         }
 
+        // Track position of first non-import line that contains actual code.
+        // Skip empty/whitespace-only lines when setting first_other_pos.
+        // This is important for source mapping because the script content often
+        // starts with a newline after <script>, and we don't want to map to that.
+        if (first_other_pos == null and i < line_end) {
+            // i has been advanced past leading whitespace, so if i < line_end,
+            // there's actual content on this line
+            first_other_pos = line_start;
+        }
+
         try other.appendSlice(allocator, content[line_start..line_end]);
         if (line_end < content.len) {
             try other.append(allocator, '\n');
@@ -9109,6 +9118,7 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
     return .{
         .imports = try imports.toOwnedSlice(allocator),
         .other = try other.toOwnedSlice(allocator),
+        .first_other_pos = first_other_pos orelse 0,
     };
 }
 
