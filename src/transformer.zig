@@ -118,19 +118,40 @@ const NarrowingContext = struct {
     has_expressions: bool,
     /// The allocator for managing enclosing_branches.
     allocator: std.mem.Allocator,
+    /// The Svelte source, for computing condition offsets from slices.
+    source: []const u8,
+    /// The mappings array, for emitting source mappings for conditions.
+    mappings: *std.ArrayList(SourceMap.Mapping),
 
-    fn init(allocator: std.mem.Allocator) NarrowingContext {
+    fn init(allocator: std.mem.Allocator, source: []const u8, mappings: *std.ArrayList(SourceMap.Mapping)) NarrowingContext {
         return .{
             .enclosing_branches = .empty,
             .conditions_opened = 0,
             .min_binding_depth = 0,
             .has_expressions = false,
             .allocator = allocator,
+            .source = source,
+            .mappings = mappings,
         };
     }
 
     fn deinit(self: *NarrowingContext) void {
         self.enclosing_branches.deinit(self.allocator);
+    }
+
+    /// Compute the Svelte source offset for a condition slice.
+    /// Conditions are slices of the original source, so we can compute offset via pointer arithmetic.
+    fn conditionOffset(self: *const NarrowingContext, cond: []const u8) u32 {
+        return @intCast(@intFromPtr(cond.ptr) - @intFromPtr(self.source.ptr));
+    }
+
+    /// Emit a source mapping for a condition being written to the output.
+    fn emitConditionMapping(self: *NarrowingContext, output: *std.ArrayList(u8), cond: []const u8) !void {
+        try self.mappings.append(self.allocator, .{
+            .svelte_offset = self.conditionOffset(cond),
+            .ts_offset = @intCast(output.items.len),
+            .len = @intCast(cond.len),
+        });
     }
 
     /// Check if two branches match by their body_start and body_end (unique identifiers).
@@ -256,9 +277,10 @@ const NarrowingContext = struct {
             // Close just the current branch body (one level)
             try output.appendSlice(self.allocator, "} else ");
 
-            // Emit the new branch condition
+            // Emit the new branch condition with source mapping
             if (new_branch.condition) |cond| {
                 try output.appendSlice(self.allocator, "if (");
+                try self.emitConditionMapping(output, cond);
                 try output.appendSlice(self.allocator, cond);
                 try output.appendSlice(self.allocator, ") { ");
             } else {
@@ -270,10 +292,10 @@ const NarrowingContext = struct {
             self.enclosing_branches.items[common_prefix_len] = new_branch;
             self.enclosing_branches.shrinkRetainingCapacity(common_prefix_len + 1);
 
-            // Open any remaining nested branches
+            // Open any remaining nested branches (with source mappings)
             if (common_prefix_len + 1 < new_enclosing.len) {
                 const remaining = new_enclosing[common_prefix_len + 1 ..];
-                const additional = try emitIfConditionOpeners(self.allocator, output, remaining);
+                const additional = try emitIfConditionOpenersWithMappings(self, output, remaining);
                 self.conditions_opened += additional;
                 try self.enclosing_branches.appendSlice(self.allocator, remaining);
             }
@@ -283,10 +305,10 @@ const NarrowingContext = struct {
                 try self.closeInner(output, common_prefix_len);
             }
 
-            // Open new branches that extend beyond the common prefix
+            // Open new branches that extend beyond the common prefix (with source mappings)
             if (common_prefix_len < new_enclosing.len) {
                 const new_branches = new_enclosing[common_prefix_len..];
-                const additional = try emitIfConditionOpeners(self.allocator, output, new_branches);
+                const additional = try emitIfConditionOpenersWithMappings(self, output, new_branches);
                 self.conditions_opened += additional;
                 try self.enclosing_branches.appendSlice(self.allocator, new_branches);
             }
@@ -2194,7 +2216,8 @@ fn emitTemplateExpressions(
 ) !void {
     // Track narrowing context to keep if-blocks open across multiple expressions.
     // This enables TypeScript to connect narrowing across declarations and usages.
-    var narrowing_ctx = NarrowingContext.init(allocator);
+    // Pass source and mappings so condition emissions include source mappings.
+    var narrowing_ctx = NarrowingContext.init(allocator, ast.source, mappings);
     defer narrowing_ctx.deinit();
 
     // First pass: collect snippet parameter names.
@@ -2548,36 +2571,20 @@ fn emitTemplateExpressions(
     for (template_items.items) |item| {
         switch (item) {
             .snippet => |s| {
-                // Find the branches that actually enclose this snippet's position.
-                // We need this to determine which branches are already "satisfied" by the
-                // parent scope and shouldn't be re-emitted inside the snippet IIFE.
-                var snippet_enclosing = try findAllEnclosingIfBranches(allocator, s.range.snippet_start, if_branches);
-                defer snippet_enclosing.deinit(allocator);
-
-                // Count how many of those enclosing branches are currently open in narrowing_ctx.
-                // These are branches where the narrowing is already in effect due to min_binding_depth
-                // (e.g., a {@const} was emitted earlier in the same if-block).
-                var branches_already_open: usize = 0;
-                for (snippet_enclosing.items) |enc_branch| {
-                    var found = false;
-                    for (narrowing_ctx.enclosing_branches.items) |ctx_branch| {
-                        if (ctx_branch.body_start == enc_branch.body_start and
-                            ctx_branch.body_end == enc_branch.body_end)
-                        {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (found) {
-                        branches_already_open += 1;
-                    } else {
-                        break; // Stop at first non-matching branch
-                    }
-                }
+                // Track how many branches are open before closing.
+                // The snippet IIFE will be textually inside these still-open branches,
+                // so we should NOT re-emit those conditions inside the IIFE (TypeScript
+                // already has the narrowing from the outer scope).
+                const branches_before_close = narrowing_ctx.enclosing_branches.items.len;
 
                 // Close any open narrowing context before emitting snippet body.
                 // Note: close() respects min_binding_depth, so some branches may remain open.
                 try narrowing_ctx.close(output);
+
+                const branches_still_open = narrowing_ctx.enclosing_branches.items.len;
+
+                // Emit the snippet body expressions in an IIFE with its own narrowing context.
+                // Pass the number of branches still open so it can skip re-emitting those.
                 try emitSnippetBodyExpressions(
                     allocator,
                     ast,
@@ -2588,8 +2595,10 @@ fn emitTemplateExpressions(
                     if_branches,
                     each_body_ranges,
                     &narrowing_ctx.has_expressions,
-                    branches_already_open,
+                    branches_still_open,
                 );
+
+                _ = branches_before_close; // May be useful for debugging
             },
 
             .expression => |e| {
@@ -2770,9 +2779,41 @@ fn emitTemplateExpressions(
                     // FIRST: emit OUTER if-conditions to establish narrowing context.
                     // Skip conditions that are already open in the narrowing context (due to min_binding_depth).
                     // Re-emitting these would cause TypeScript to flag them as redundant comparisons.
-                    const conditions_to_skip = @min(branches_still_open, outer_conditions_count);
+                    //
+                    // IMPORTANT: When branches are still open, we must skip ALL conditions that are part of
+                    // the same if/else chain. If we're inside `else if (status === 'in-progress')` and try to
+                    // re-emit `if (status === 'done')`, TypeScript would correctly note that status is already
+                    // narrowed to 'in-progress', so checking for 'done' is impossible.
+                    //
+                    // Since the IIFE inherits the outer narrowing context, we only need to re-emit conditions
+                    // that are NOT already established by the outer scope. When any branch from a chain is
+                    // open, we skip the entire chain.
+                    //
+                    // Use the version with mappings so errors in conditions map to correct Svelte lines.
+                    var conditions_to_skip = @min(branches_still_open, outer_conditions_count);
+
+                    // If we're skipping some conditions but not all, check if the remaining conditions
+                    // have prior_conditions from the skipped branches. If so, skip the entire chain.
+                    if (conditions_to_skip > 0 and conditions_to_skip < outer_conditions_count) {
+                        const skipped_branch = enclosing.items[conditions_to_skip - 1];
+                        // Look at the next condition to emit - if it has prior_conditions that include
+                        // any of the skipped conditions, we're in the middle of an if/else chain
+                        // and should skip the rest too.
+                        const next_branch = enclosing.items[conditions_to_skip];
+                        for (next_branch.prior_conditions) |prior_cond| {
+                            if (skipped_branch.condition) |skipped_cond| {
+                                if (std.mem.eql(u8, prior_cond, skipped_cond)) {
+                                    // The next branch is part of the same chain as the skipped branch.
+                                    // Skip all remaining outer conditions since the chain is already narrowed.
+                                    conditions_to_skip = outer_conditions_count;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     const outer_conditions = enclosing.items[conditions_to_skip..outer_conditions_count];
-                    iife_conditions_opened = try emitIfConditionOpeners(allocator, output, outer_conditions);
+                    iife_conditions_opened = try emitIfConditionOpenersWithMappingsEx(allocator, output, outer_conditions, ast.source, mappings);
 
                     // SECOND: emit each bindings inside the narrowed scope
                     for (enclosing_each.items) |each_range| {
@@ -2792,8 +2833,9 @@ fn emitTemplateExpressions(
                     }
 
                     // THIRD: emit INNER if-conditions (that may reference each bindings)
+                    // Use the version with mappings so errors in conditions map to correct Svelte lines.
                     const inner_conditions = enclosing.items[outer_conditions_count..];
-                    iife_conditions_opened += try emitIfConditionOpeners(allocator, output, inner_conditions);
+                    iife_conditions_opened += try emitIfConditionOpenersWithMappingsEx(allocator, output, inner_conditions, ast.source, mappings);
                 } else {
                     // No {#each} wrapper, use the normal narrowing context
                     try narrowing_ctx.ensureOpen(output, enclosing.items);
@@ -4843,7 +4885,7 @@ fn scanTemplateForEachBlocks(
                         try emitEachBindingDeclarationsSimplified(allocator, output, binding, is_typescript);
                     } else {
                         // Use narrowed emission so {#each} inside {#if} respects type narrowing
-                        try emitNarrowedEachBindingDeclarations(allocator, output, mappings, binding, is_typescript, if_branches);
+                        try emitNarrowedEachBindingDeclarations(allocator, output, mappings, binding, is_typescript, if_branches, ast.source);
                     }
                 }
             }
@@ -6756,6 +6798,87 @@ fn emitIfConditionOpeners(
     return emitIfConditionOpenersIndented(allocator, output, enclosing, "");
 }
 
+/// Emits opening if conditions with source mappings for each condition.
+/// This version should be used when NarrowingContext is available.
+/// Returns the number of if blocks opened (caller must close them with `}`).
+fn emitIfConditionOpenersWithMappings(
+    ctx: *NarrowingContext,
+    output: *std.ArrayList(u8),
+    enclosing: []const IfBranch,
+) !u32 {
+    return emitIfConditionOpenersWithMappingsEx(ctx.allocator, output, enclosing, ctx.source, ctx.mappings);
+}
+
+/// Emits opening if conditions with source mappings for each condition.
+/// Standalone version that takes source and mappings directly.
+/// Returns the number of if blocks opened (caller must close them with `}`).
+fn emitIfConditionOpenersWithMappingsEx(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    enclosing: []const IfBranch,
+    source: []const u8,
+    mappings: *std.ArrayList(SourceMap.Mapping),
+) !u32 {
+    var conditions_opened: u32 = 0;
+
+    for (enclosing) |branch| {
+        const has_priors = branch.prior_conditions.len > 0;
+
+        if (has_priors or branch.condition != null) {
+            // For {:else} and {:else if} branches with prior conditions, we emit
+            // proper if/else if chains. Each condition gets a source mapping so
+            // errors in narrowing conditions map back to the correct Svelte line.
+            if (has_priors) {
+                // Emit empty if blocks for each prior condition with mappings
+                for (branch.prior_conditions, 0..) |prior_cond, i| {
+                    if (i == 0) {
+                        try output.appendSlice(allocator, "if (");
+                    } else {
+                        try output.appendSlice(allocator, "} else if (");
+                    }
+                    // Emit source mapping for the condition
+                    try mappings.append(allocator, .{
+                        .svelte_offset = @intCast(@intFromPtr(prior_cond.ptr) - @intFromPtr(source.ptr)),
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(prior_cond.len),
+                    });
+                    try output.appendSlice(allocator, prior_cond);
+                    try output.appendSlice(allocator, ") {");
+                }
+                // Now emit the actual branch as else if or else
+                try output.appendSlice(allocator, " } else ");
+                if (branch.condition) |cond| {
+                    try output.appendSlice(allocator, "if (");
+                    try mappings.append(allocator, .{
+                        .svelte_offset = @intCast(@intFromPtr(cond.ptr) - @intFromPtr(source.ptr)),
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(cond.len),
+                    });
+                    try output.appendSlice(allocator, cond);
+                    try output.appendSlice(allocator, ") { ");
+                } else {
+                    // {:else} with no condition
+                    try output.appendSlice(allocator, "{ ");
+                }
+                conditions_opened += 1;
+            } else if (branch.condition) |cond| {
+                // No prior conditions, just emit if (cond) with mapping
+                try output.appendSlice(allocator, "if (");
+                try mappings.append(allocator, .{
+                    .svelte_offset = @intCast(@intFromPtr(cond.ptr) - @intFromPtr(source.ptr)),
+                    .ts_offset = @intCast(output.items.len),
+                    .len = @intCast(cond.len),
+                });
+                try output.appendSlice(allocator, cond);
+                try output.appendSlice(allocator, ") { ");
+                conditions_opened += 1;
+            }
+        }
+    }
+
+    return conditions_opened;
+}
+
 /// Emits an expression wrapped in the appropriate if conditions for type narrowing.
 /// For expressions inside {#if condition} blocks, wraps in `if (condition) { void (expr); }`
 /// For expressions inside {:else} branches, also emits negations of prior conditions.
@@ -6808,13 +6931,14 @@ fn emitNarrowedEachBindingDeclarations(
     binding: EachBindingInfo,
     is_typescript: bool,
     if_branches: []const IfBranch,
+    source: []const u8,
 ) !void {
     // Find all enclosing if branches for this {#each} block
     var enclosing = try findAllEnclosingIfBranches(allocator, binding.offset, if_branches);
     defer enclosing.deinit(allocator);
 
-    // Emit if wrappers for each enclosing branch
-    const conditions_opened = try emitIfConditionOpeners(allocator, output, enclosing.items);
+    // Emit if wrappers for each enclosing branch (with source mappings)
+    const conditions_opened = try emitIfConditionOpenersWithMappingsEx(allocator, output, enclosing.items, source, mappings);
 
     // Emit the binding declarations (using the existing function)
     try emitEachBindingDeclarations(allocator, output, mappings, binding, binding.iterable, is_typescript);
@@ -7176,7 +7300,7 @@ fn componentHasNonSnippetChildren(source: []const u8, tag_name: []const u8, node
 /// have access to the `thread` parameter.
 /// Also applies if-branch narrowing for expressions inside {#if} blocks within the snippet.
 ///
-/// @param parent_branches_already_open: Number of enclosing branches that are already open in the parent
+/// @param parent_branches_open: Number of enclosing branches that are already open in the parent
 ///   context due to min_binding_depth (e.g., a {@const} was emitted earlier in the same if-block).
 ///   Since the snippet IIFE is emitted inside the parent's still-open if-block, we skip re-emitting
 ///   these branches inside the IIFE to avoid TypeScript flagging redundant comparisons.
@@ -7190,7 +7314,7 @@ fn emitSnippetBodyExpressions(
     if_branches: []const IfBranch,
     each_body_ranges: []const EachBodyRange,
     has_expressions: *bool,
-    parent_branches_already_open: usize,
+    parent_branches_open: usize,
 ) !void {
     // Unified item type for all snippet body items - enables source-order emission.
     // Processing items in source order ensures bindings are in scope when expressions use them.
@@ -7375,7 +7499,8 @@ fn emitSnippetBodyExpressions(
 
     // Use NarrowingContext to keep if-blocks open across bindings and expressions.
     // This ensures {#each} bindings remain in scope for expressions that reference them.
-    var narrowing_ctx = NarrowingContext.init(allocator);
+    // Pass source and mappings so condition emissions include source mappings.
+    var narrowing_ctx = NarrowingContext.init(allocator, ast.source, mappings);
     defer narrowing_ctx.deinit();
     narrowing_ctx.has_expressions = true; // Already inside snippet IIFE
 
@@ -7389,15 +7514,34 @@ fn emitSnippetBodyExpressions(
         defer inner_enclosing.deinit(allocator);
 
         // Combine outer + inner branches for full context.
-        // Skip branches that are already open in the parent context.
-        // The snippet IIFE is emitted inside the parent's still-open if-block,
-        // so re-emitting those branches would cause TypeScript to flag redundant comparisons.
+        // The snippet IIFE creates a new function scope, which resets TypeScript's
+        // control flow narrowing. However, since the IIFE is textually inside any
+        // still-open parent branches, we skip re-emitting those.
         var combined_branches: std.ArrayList(IfBranch) = .empty;
         defer combined_branches.deinit(allocator);
 
-        // Skip the first `parent_branches_already_open` branches from outer_enclosing
-        if (parent_branches_already_open < outer_enclosing.items.len) {
-            try combined_branches.appendSlice(allocator, outer_enclosing.items[parent_branches_already_open..]);
+        // Skip branches that are already open in the parent scope.
+        // If we skip some but not all, and the next branch has prior_conditions
+        // from the skipped branches, we're in the middle of an if/else chain
+        // and should skip those too (same logic as in html_element handler).
+        var branches_to_skip = @min(parent_branches_open, outer_enclosing.items.len);
+        if (branches_to_skip > 0 and branches_to_skip < outer_enclosing.items.len) {
+            const skipped_branch = outer_enclosing.items[branches_to_skip - 1];
+            const next_branch = outer_enclosing.items[branches_to_skip];
+            for (next_branch.prior_conditions) |prior_cond| {
+                if (skipped_branch.condition) |skipped_cond| {
+                    if (std.mem.eql(u8, prior_cond, skipped_cond)) {
+                        // The next branch is part of the same if/else chain - skip it too
+                        branches_to_skip = outer_enclosing.items.len;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Add remaining outer branches (those not already established by parent scope)
+        if (branches_to_skip < outer_enclosing.items.len) {
+            try combined_branches.appendSlice(allocator, outer_enclosing.items[branches_to_skip..]);
         }
         try combined_branches.appendSlice(allocator, inner_enclosing.items);
 
