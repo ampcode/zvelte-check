@@ -101,6 +101,86 @@ const EachBodyRange = struct {
     body_end: u32,
 };
 
+/// Tracks call-site narrowing for snippets.
+/// Maps snippet names to the intersection of if-branch conditions at all @render call sites.
+/// If ALL call sites share a common narrowing condition, we apply it to the snippet body.
+const SnippetCallSiteNarrowing = struct {
+    /// Map from snippet name to list of enclosing branches at each call site.
+    /// Each inner list represents the enclosing branches for one @render call.
+    call_sites: std.StringHashMapUnmanaged(std.ArrayList(std.ArrayList(IfBranch))),
+
+    fn init() SnippetCallSiteNarrowing {
+        return .{ .call_sites = .empty };
+    }
+
+    fn deinit(self: *SnippetCallSiteNarrowing, allocator: std.mem.Allocator) void {
+        var iter = self.call_sites.iterator();
+        while (iter.next()) |entry| {
+            for (entry.value_ptr.items) |*site| {
+                site.deinit(allocator);
+            }
+            entry.value_ptr.deinit(allocator);
+        }
+        self.call_sites.deinit(allocator);
+    }
+
+    /// Records a @render call site with its enclosing if-branches.
+    fn addCallSite(
+        self: *SnippetCallSiteNarrowing,
+        allocator: std.mem.Allocator,
+        snippet_name: []const u8,
+        enclosing_branches: std.ArrayList(IfBranch),
+    ) !void {
+        const result = try self.call_sites.getOrPut(allocator, snippet_name);
+        if (!result.found_existing) {
+            result.value_ptr.* = .empty;
+        }
+        try result.value_ptr.append(allocator, enclosing_branches);
+    }
+
+    /// Computes the intersection of narrowing conditions across all call sites for a snippet.
+    /// Returns the if-branches that are common to ALL call sites (i.e., conditions that are
+    /// always true when the snippet is rendered).
+    fn getIntersectedNarrowing(
+        self: *const SnippetCallSiteNarrowing,
+        allocator: std.mem.Allocator,
+        snippet_name: []const u8,
+    ) !std.ArrayList(IfBranch) {
+        var result: std.ArrayList(IfBranch) = .empty;
+
+        const sites = self.call_sites.get(snippet_name) orelse return result;
+        if (sites.items.len == 0) return result;
+
+        // Start with all branches from the first call site
+        if (sites.items[0].items.len == 0) return result;
+
+        // For each branch in the first site, check if it (or an equivalent branch) exists in all other sites.
+        // Two branches are "equivalent" for narrowing if they have the same condition string.
+        outer: for (sites.items[0].items) |first_branch| {
+            const cond = first_branch.condition orelse continue; // Skip {:else} branches with no condition
+
+            // Check all other call sites have this condition
+            for (sites.items[1..]) |other_site| {
+                var found = false;
+                for (other_site.items) |other_branch| {
+                    if (other_branch.condition) |other_cond| {
+                        if (std.mem.eql(u8, cond, other_cond)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) continue :outer; // This condition isn't at all call sites
+            }
+
+            // This condition is at all call sites - include it in result
+            try result.append(allocator, first_branch);
+        }
+
+        return result;
+    }
+};
+
 /// Tracks the currently open if-block for narrowing context.
 /// When emitting multiple expressions from the same if-branch, we keep the if-block
 /// open so TypeScript can connect the narrowing context across expressions.
@@ -2252,6 +2332,29 @@ fn emitTemplateExpressions(
         }
     }
 
+    // Second pass: collect @render call sites with their enclosing if-branches.
+    // This allows us to propagate narrowing context from call sites to snippet bodies.
+    // If ALL call sites of a snippet share common narrowing conditions, those conditions
+    // should also apply to the snippet body.
+    var snippet_call_sites = SnippetCallSiteNarrowing.init();
+    defer snippet_call_sites.deinit(allocator);
+
+    for (ast.nodes.items) |node| {
+        if (node.kind == .render) {
+            // Skip render calls inside snippet bodies - they're handled in the snippet's scope
+            if (isInsideSnippetBody(node.start, snippet_body_ranges)) continue;
+
+            if (extractRenderExpression(ast.source, node.start, node.end)) |render_info| {
+                if (extractRenderSnippetName(render_info.expr)) |snippet_name| {
+                    // Find all if-branches enclosing this render call
+                    const enclosing = try findAllEnclosingIfBranches(allocator, node.start, if_branches);
+                    // Note: enclosing is owned by snippet_call_sites after this call
+                    try snippet_call_sites.addCallSite(allocator, snippet_name, enclosing);
+                }
+            }
+        }
+    }
+
     // Collect identifiers referenced in template expressions to emit void statements.
     // This marks variables as "used" so noUnusedLocals works correctly.
     // Value is the Svelte source offset where the identifier was first found.
@@ -2593,6 +2696,10 @@ fn emitTemplateExpressions(
 
                 // Emit the snippet body expressions in an IIFE with its own narrowing context.
                 // Pass the number of branches still open so it can skip re-emitting those.
+                // Also pass call-site narrowing so conditions from @render call sites can apply.
+                var call_site_narrowing = try snippet_call_sites.getIntersectedNarrowing(allocator, s.name);
+                defer call_site_narrowing.deinit(allocator);
+
                 try emitSnippetBodyExpressions(
                     allocator,
                     ast,
@@ -2604,6 +2711,7 @@ fn emitTemplateExpressions(
                     each_body_ranges,
                     &narrowing_ctx.has_expressions,
                     branches_still_open,
+                    call_site_narrowing.items,
                 );
 
                 _ = branches_before_close; // May be useful for debugging
@@ -7696,6 +7804,9 @@ fn componentHasNonSnippetChildren(source: []const u8, tag_name: []const u8, node
 ///   context due to min_binding_depth (e.g., a {@const} was emitted earlier in the same if-block).
 ///   Since the snippet IIFE is emitted inside the parent's still-open if-block, we skip re-emitting
 ///   these branches inside the IIFE to avoid TypeScript flagging redundant comparisons.
+/// - call_site_narrowing: If-branches common to ALL @render call sites for this snippet.
+///   These conditions are guaranteed to be true when the snippet body executes, so we emit them
+///   as guards around the snippet body to enable TypeScript narrowing inside the snippet.
 fn emitSnippetBodyExpressions(
     allocator: std.mem.Allocator,
     ast: *const Ast,
@@ -7707,6 +7818,7 @@ fn emitSnippetBodyExpressions(
     each_body_ranges: []const EachBodyRange,
     has_expressions: *bool,
     parent_branches_open: usize,
+    call_site_narrowing: []const IfBranch,
 ) !void {
     // Unified item type for all snippet body items - enables source-order emission.
     // Processing items in source order ensures bindings are in scope when expressions use them.
@@ -7905,12 +8017,17 @@ fn emitSnippetBodyExpressions(
         var inner_enclosing = try findAllEnclosingIfBranches(allocator, item_offset, snippet_branches.items);
         defer inner_enclosing.deinit(allocator);
 
-        // Combine outer + inner branches for full context.
+        // Combine call-site + outer + inner branches for full context.
         // The snippet IIFE creates a new function scope, which resets TypeScript's
         // control flow narrowing. However, since the IIFE is textually inside any
         // still-open parent branches, we skip re-emitting those.
         var combined_branches: std.ArrayList(IfBranch) = .empty;
         defer combined_branches.deinit(allocator);
+
+        // First add call-site narrowing - conditions common to ALL @render call sites.
+        // These are guaranteed to be true when the snippet executes, so we emit them
+        // first to enable TypeScript narrowing for variables like `value` in `{#if value}`.
+        try combined_branches.appendSlice(allocator, call_site_narrowing);
 
         // Skip branches that are already open in the parent scope.
         // If we skip some but not all, and the next branch has prior_conditions
@@ -8612,6 +8729,54 @@ fn extractRenderExpression(source: []const u8, start: u32, end: u32) ?ExprInfo {
     const expr = std.mem.trim(u8, content[expr_start..expr_end], " \t\n\r");
     if (expr.len == 0) return null;
     return .{ .expr = expr, .offset = @intCast(expr_start) };
+}
+
+/// Extracts the snippet name from a render expression.
+/// Examples: "showValue()" → "showValue", "children?.()" → "children", "foo.bar()" → null (not a simple snippet)
+fn extractRenderSnippetName(expr: []const u8) ?[]const u8 {
+    // Skip leading whitespace
+    var i: usize = 0;
+    while (i < expr.len and (expr[i] == ' ' or expr[i] == '\t' or expr[i] == '\n' or expr[i] == '\r')) {
+        i += 1;
+    }
+
+    // Extract identifier (snippet name)
+    const name_start = i;
+    while (i < expr.len) {
+        const c = expr[i];
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '$') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+
+    if (i == name_start) return null; // No identifier found
+
+    const name = expr[name_start..i];
+
+    // Check what follows the name:
+    // - "(" means it's a call: snippet()
+    // - "?." means it's optional chaining: snippet?.()
+    // - "." means it's a property access: foo.bar() - not a simple snippet
+    // - anything else is unexpected
+    while (i < expr.len and (expr[i] == ' ' or expr[i] == '\t')) {
+        i += 1;
+    }
+
+    if (i < expr.len) {
+        if (expr[i] == '(') {
+            // Direct call: showValue()
+            return name;
+        } else if (i + 1 < expr.len and expr[i] == '?' and expr[i + 1] == '.') {
+            // Optional chaining: children?.()
+            return name;
+        }
+        // Member access or other expression - not a simple snippet reference
+        return null;
+    }
+
+    return null; // No call parens found
 }
 
 /// Extracts expression from plain {expr} template syntax.
