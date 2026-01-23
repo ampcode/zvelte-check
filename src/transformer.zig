@@ -2842,6 +2842,20 @@ fn emitTemplateExpressions(
                 }
 
                 if (h.is_component) {
+                    // Extract and emit member access expressions from closure bodies BEFORE the component.
+                    // This enables TypeScript's type narrowing to apply to expressions used inside callbacks.
+                    // For example, in `{#if codeBlock}<Button onclick={() => codeBlock.textContent}/>{/if}`,
+                    // we emit `void (codeBlock.textContent);` before the component so narrowing applies.
+                    try emitClosureBodyExpressionsForAttrs(
+                        allocator,
+                        ast.source,
+                        output,
+                        mappings,
+                        elem_data.attrs_start,
+                        elem_data.attrs_end,
+                        ast.attributes.items,
+                    );
+
                     // Component: emit props validation
                     try emitComponentPropsValidation(
                         allocator,
@@ -3330,20 +3344,30 @@ fn emitComponentPropsValidation(
                 // Pure expression value: strip { } and emit the expression
                 const expr = std.mem.trim(u8, val[1 .. val.len - 1], " \t\n\r");
 
-                // Calculate the expression's offset in the Svelte source.
-                // The expression starts after the prop name, "=", and "{".
-                // Find the offset of the expression content within the value string.
-                const expr_start_in_val = @as(u32, @intCast(std.mem.indexOf(u8, val, expr) orelse 1));
-                // The svelte offset is: attr.start (start of name) + name.len + 1 (for =) + expr_start_in_val
-                const svelte_expr_offset = attr.start + @as(u32, @intCast(attr.name.len)) + 1 + expr_start_in_val;
+                // Check if this is a closure (arrow function or function expression).
+                // If so, emit a stub instead of the closure body to avoid TypeScript's
+                // closure narrowing issues. The closure body is already type-checked
+                // separately via emitClosureBodyExpressionsForAttrs.
+                if (exprIsClosureWithBody(expr)) {
+                    // Emit a type-compatible stub: `undefined as any`
+                    // This marks the prop as provided without re-checking the closure body
+                    try output.appendSlice(allocator, "undefined as any");
+                } else {
+                    // Calculate the expression's offset in the Svelte source.
+                    // The expression starts after the prop name, "=", and "{".
+                    // Find the offset of the expression content within the value string.
+                    const expr_start_in_val = @as(u32, @intCast(std.mem.indexOf(u8, val, expr) orelse 1));
+                    // The svelte offset is: attr.start (start of name) + name.len + 1 (for =) + expr_start_in_val
+                    const svelte_expr_offset = attr.start + @as(u32, @intCast(attr.name.len)) + 1 + expr_start_in_val;
 
-                // Add source mapping for the expression so errors point to the right location
-                try mappings.append(allocator, .{
-                    .svelte_offset = svelte_expr_offset,
-                    .ts_offset = @intCast(output.items.len),
-                    .len = @intCast(expr.len),
-                });
-                try output.appendSlice(allocator, expr);
+                    // Add source mapping for the expression so errors point to the right location
+                    try mappings.append(allocator, .{
+                        .svelte_offset = svelte_expr_offset,
+                        .ts_offset = @intCast(output.items.len),
+                        .len = @intCast(expr.len),
+                    });
+                    try output.appendSlice(allocator, expr);
+                }
             } else if (std.mem.indexOf(u8, val, "{") != null) {
                 // Mixed value with embedded expressions
                 try emitMixedAttributeValue(allocator, output, mappings, val, attr.start);
@@ -3484,6 +3508,63 @@ fn extractIdentifiersFromAttributeValue(
             // Skip static text (not inside {})
             i += 1;
         }
+    }
+}
+
+/// Checks if an expression contains a closure (arrow function or function expression) with a body.
+/// Returns true for patterns like `() => ...`, `(x) => ...`, `function() { ... }`, etc.
+/// Also returns true for ternaries containing closures like `cond ? () => ... : undefined`.
+/// Does NOT return true for simple function references like `handleClick`.
+fn exprIsClosureWithBody(expr: []const u8) bool {
+    // Simply check if the expression contains => or 'function' keyword
+    // This is a simpler heuristic that catches all closure patterns
+    return std.mem.indexOf(u8, expr, "=>") != null or
+        std.mem.indexOf(u8, expr, "function") != null;
+}
+
+/// Emits void expressions for member access chains found inside closure bodies in component attributes.
+/// This enables TypeScript's type narrowing to apply to expressions used inside callbacks.
+/// For example, in `{#if codeBlock}<Button onclick={() => codeBlock.textContent}/>{/if}`,
+/// we emit `void (codeBlock.textContent);` before the component so narrowing applies.
+fn emitClosureBodyExpressionsForAttrs(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    output: *std.ArrayList(u8),
+    mappings: *std.ArrayList(SourceMap.Mapping),
+    attrs_start: u32,
+    attrs_end: u32,
+    attributes: []const AttributeData,
+) !void {
+    _ = source;
+    var closure_exprs: std.ArrayList(ClosureBodyExpression) = .empty;
+    defer closure_exprs.deinit(allocator);
+
+    const attrs = attributes[attrs_start..attrs_end];
+    for (attrs) |attr| {
+        if (attr.value) |val| {
+            // Only process expression values that might contain closures
+            if (val.len > 2 and val[0] == '{' and val[val.len - 1] == '}') {
+                const inner = val[1 .. val.len - 1];
+                // Check if this contains an arrow function or function keyword
+                if (std.mem.indexOf(u8, inner, "=>") != null or std.mem.indexOf(u8, inner, "function") != null) {
+                    // Calculate the offset of the expression content
+                    const expr_offset = attr.start + @as(u32, @intCast(attr.name.len)) + 2; // +2 for ={
+                    try extractClosureBodyExpressions(allocator, inner, expr_offset, &closure_exprs);
+                }
+            }
+        }
+    }
+
+    // Emit void expressions for all extracted member access chains
+    for (closure_exprs.items) |expr_info| {
+        try output.appendSlice(allocator, "void (");
+        try mappings.append(allocator, .{
+            .svelte_offset = expr_info.offset,
+            .ts_offset = @intCast(output.items.len),
+            .len = @intCast(expr_info.expr.len),
+        });
+        try output.appendSlice(allocator, expr_info.expr);
+        try output.appendSlice(allocator, ");\n");
     }
 }
 
@@ -4489,6 +4570,324 @@ fn skipReturnTypeAnnotation(expr: []const u8, start: usize) usize {
         j += 1;
     }
     return j;
+}
+
+/// Represents a member access chain extracted from inside a closure body.
+/// For example, from `() => codeBlock.textContent`, we extract "codeBlock.textContent".
+const ClosureBodyExpression = struct {
+    expr: []const u8,
+    offset: u32,
+};
+
+/// Extracts member access expressions from inside closure bodies (arrow functions and regular functions).
+/// These expressions need to be emitted outside the closure for TypeScript's type narrowing to apply.
+///
+/// For example, from `onclick={() => codeBlock.textContent}`, this extracts "codeBlock.textContent".
+/// The caller should emit `void (codeBlock.textContent);` BEFORE the closure in the narrowing context.
+///
+/// This function only extracts member access chains (e.g., `a.b.c`) and function calls on members
+/// (e.g., `a.b()`), not simple identifiers (those don't benefit from narrowing).
+fn extractClosureBodyExpressions(
+    allocator: std.mem.Allocator,
+    expr: []const u8,
+    base_offset: u32,
+    results: *std.ArrayList(ClosureBodyExpression),
+) !void {
+    // First, collect arrow function parameters so we can exclude them
+    var arrow_params: std.StringHashMapUnmanaged(void) = .empty;
+    defer arrow_params.deinit(allocator);
+    var param_regions: std.ArrayList(ParamRegion) = .empty;
+    defer param_regions.deinit(allocator);
+    try collectArrowFunctionParamsAndRegions(allocator, expr, &arrow_params, &param_regions);
+
+    // Collect locally declared variables
+    var local_decls: std.StringHashMapUnmanaged(void) = .empty;
+    defer local_decls.deinit(allocator);
+    try collectLocalDeclarations(allocator, expr, &local_decls);
+
+    // Now scan for closure bodies and extract member access chains from them
+    try extractClosureBodyExpressionsWithContext(allocator, expr, base_offset, results, &arrow_params, &local_decls, param_regions.items);
+}
+
+/// Internal version with context for recursive calls.
+fn extractClosureBodyExpressionsWithContext(
+    allocator: std.mem.Allocator,
+    expr: []const u8,
+    base_offset: u32,
+    results: *std.ArrayList(ClosureBodyExpression),
+    arrow_params: *const std.StringHashMapUnmanaged(void),
+    local_decls: *const std.StringHashMapUnmanaged(void),
+    _: []const ParamRegion,
+) !void {
+    var i: usize = 0;
+    var func_depth: u32 = 0;
+    var saw_arrow = false;
+    var closure_start: ?usize = null; // Start of current closure body
+
+    while (i < expr.len) {
+        const c = expr[i];
+
+        // Skip string literals
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipStringLiteral(expr, i);
+            saw_arrow = false;
+            continue;
+        }
+
+        // Skip comments
+        if (i + 1 < expr.len and c == '/') {
+            if (expr[i + 1] == '/') {
+                while (i < expr.len and expr[i] != '\n') : (i += 1) {}
+                saw_arrow = false;
+                continue;
+            }
+            if (expr[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < expr.len and !(expr[i] == '*' and expr[i + 1] == '/')) : (i += 1) {}
+                if (i + 1 < expr.len) i += 2;
+                saw_arrow = false;
+                continue;
+            }
+            if (couldBeRegex(expr, i)) {
+                i = skipRegexLiteral(expr, i);
+                saw_arrow = false;
+                continue;
+            }
+        }
+
+        // Track arrow => which starts a function scope
+        if (c == '=' and i + 1 < expr.len and expr[i + 1] == '>') {
+            saw_arrow = true;
+            i += 2;
+            // Skip whitespace after =>
+            while (i < expr.len and std.ascii.isWhitespace(expr[i])) : (i += 1) {}
+            // If next char is NOT {, this is a single-expression arrow body - process it
+            if (i < expr.len and expr[i] != '{') {
+                closure_start = i;
+                // Find the end of the expression (until , or ) or ; at depth 0)
+                const expr_start = i;
+                var paren_depth: u32 = 0;
+                var brace_depth: u32 = 0;
+                var bracket_depth: u32 = 0;
+                while (i < expr.len) {
+                    const ec = expr[i];
+                    if (ec == '"' or ec == '\'' or ec == '`') {
+                        i = skipStringLiteral(expr, i);
+                        continue;
+                    }
+                    if (ec == '(') paren_depth += 1;
+                    if (ec == ')') {
+                        if (paren_depth == 0) break;
+                        paren_depth -= 1;
+                    }
+                    if (ec == '{') brace_depth += 1;
+                    if (ec == '}') {
+                        if (brace_depth == 0) break;
+                        brace_depth -= 1;
+                    }
+                    if (ec == '[') bracket_depth += 1;
+                    if (ec == ']') {
+                        if (bracket_depth == 0) break;
+                        bracket_depth -= 1;
+                    }
+                    if (paren_depth == 0 and brace_depth == 0 and bracket_depth == 0) {
+                        if (ec == ',' or ec == ';') break;
+                    }
+                    i += 1;
+                }
+                // Extract member access chains from this single-expression body
+                const body = expr[expr_start..i];
+                try extractMemberAccessChainsFromBody(allocator, body, base_offset + @as(u32, @intCast(expr_start)), results, arrow_params, local_decls);
+                saw_arrow = false;
+                closure_start = null;
+            }
+            continue;
+        }
+
+        // Track function body entry
+        if (c == '{') {
+            if (saw_arrow) {
+                func_depth += 1;
+                saw_arrow = false;
+                closure_start = i + 1; // Body starts after {
+            } else if (func_depth > 0) {
+                func_depth += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        if (c == '}') {
+            if (func_depth > 0) {
+                // If we're closing the outermost closure, extract from it
+                if (func_depth == 1 and closure_start != null) {
+                    const body = expr[closure_start.?..i];
+                    try extractMemberAccessChainsFromBody(allocator, body, base_offset + @as(u32, @intCast(closure_start.?)), results, arrow_params, local_decls);
+                    closure_start = null;
+                }
+                func_depth -= 1;
+            }
+            i += 1;
+            saw_arrow = false;
+            continue;
+        }
+
+        // Handle 'function' keyword
+        if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
+            const ident_start = i;
+            while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_' or expr[i] == '$')) : (i += 1) {}
+            const ident = expr[ident_start..i];
+
+            if (std.mem.eql(u8, ident, "function")) {
+                // Skip to opening paren of parameters
+                while (i < expr.len and expr[i] != '(') : (i += 1) {}
+                if (i < expr.len) {
+                    var paren_depth: u32 = 1;
+                    i += 1;
+                    while (i < expr.len and paren_depth > 0) {
+                        if (expr[i] == '(') paren_depth += 1;
+                        if (expr[i] == ')') paren_depth -= 1;
+                        i += 1;
+                    }
+                    while (i < expr.len and std.ascii.isWhitespace(expr[i])) : (i += 1) {}
+                    if (i < expr.len and expr[i] == '{') {
+                        func_depth += 1;
+                        closure_start = i + 1;
+                        i += 1;
+                    }
+                }
+            }
+            saw_arrow = false;
+            continue;
+        }
+
+        if (saw_arrow and !std.ascii.isWhitespace(c)) {
+            saw_arrow = false;
+        }
+
+        i += 1;
+    }
+}
+
+/// Extracts member access chains from a closure body.
+/// A member access chain is `identifier.property.property...` or `identifier.method()...`.
+/// We extract the longest chain starting from an identifier that would benefit from narrowing.
+fn extractMemberAccessChainsFromBody(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    body_offset: u32,
+    results: *std.ArrayList(ClosureBodyExpression),
+    arrow_params: *const std.StringHashMapUnmanaged(void),
+    local_decls: *const std.StringHashMapUnmanaged(void),
+) !void {
+    var i: usize = 0;
+    while (i < body.len) {
+        const c = body[i];
+
+        // Skip string literals
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipStringLiteral(body, i);
+            continue;
+        }
+
+        // Skip comments
+        if (i + 1 < body.len and c == '/') {
+            if (body[i + 1] == '/') {
+                while (i < body.len and body[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (body[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < body.len and !(body[i] == '*' and body[i + 1] == '/')) : (i += 1) {}
+                if (i + 1 < body.len) i += 2;
+                continue;
+            }
+        }
+
+        // Look for identifier start
+        if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
+            const ident_start = i;
+            while (i < body.len and (std.ascii.isAlphanumeric(body[i]) or body[i] == '_' or body[i] == '$')) : (i += 1) {}
+            const ident = body[ident_start..i];
+
+            // Skip keywords
+            if (isJavaScriptKeyword(ident)) continue;
+            // Skip arrow params and local decls
+            if (arrow_params.contains(ident)) continue;
+            if (local_decls.contains(ident)) continue;
+            // Skip if preceded by dot (this is already part of a chain)
+            if (ident_start > 0 and body[ident_start - 1] == '.') continue;
+
+            // Check if followed by member access
+            if (i < body.len and body[i] == '.') {
+                // This is a member access chain - extract it
+                const chain_start = ident_start;
+                // Find the end of the chain: identifier(.property | .method(...) | [index])*
+                while (i < body.len) {
+                    if (body[i] == '.') {
+                        i += 1;
+                        // Skip optional chaining ?.
+                        if (i < body.len and body[i] == '?') i += 1;
+                        // Skip whitespace
+                        while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+                        // Skip property name
+                        if (i < body.len and (std.ascii.isAlphabetic(body[i]) or body[i] == '_' or body[i] == '$')) {
+                            while (i < body.len and (std.ascii.isAlphanumeric(body[i]) or body[i] == '_' or body[i] == '$')) : (i += 1) {}
+                        } else {
+                            // Invalid member access, stop
+                            break;
+                        }
+                    } else if (body[i] == '(') {
+                        // Method call - extract member accesses from arguments, then skip
+                        const args_start = i + 1;
+                        var paren_depth: u32 = 1;
+                        i += 1;
+                        while (i < body.len and paren_depth > 0) {
+                            if (body[i] == '"' or body[i] == '\'' or body[i] == '`') {
+                                i = skipStringLiteral(body, i);
+                                continue;
+                            }
+                            if (body[i] == '(') paren_depth += 1;
+                            if (body[i] == ')') paren_depth -= 1;
+                            if (paren_depth > 0) i += 1;
+                        }
+                        const args_end = i;
+                        if (i < body.len) i += 1; // Skip closing )
+
+                        // Recursively extract from the arguments
+                        if (args_end > args_start) {
+                            const args = body[args_start..args_end];
+                            try extractMemberAccessChainsFromBody(allocator, args, body_offset + @as(u32, @intCast(args_start)), results, arrow_params, local_decls);
+                        }
+                    } else if (body[i] == '[') {
+                        // Index access - skip it, just record up to here
+                        break;
+                    } else if (body[i] == '?') {
+                        // Optional chaining before . or [
+                        if (i + 1 < body.len and (body[i + 1] == '.' or body[i + 1] == '[')) {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                const chain_end = i;
+                const chain = body[chain_start..chain_end];
+                // Only add if it's a real member access (contains .)
+                if (std.mem.indexOf(u8, chain, ".") != null) {
+                    try results.append(allocator, .{
+                        .expr = chain,
+                        .offset = body_offset + @as(u32, @intCast(chain_start)),
+                    });
+                }
+            }
+            continue;
+        }
+
+        i += 1;
+    }
 }
 
 /// Heuristic to determine if a `/` is the start of a regex literal.
@@ -7585,6 +7984,18 @@ fn emitSnippetBodyExpressions(
 
                 // Skip svelte: special elements
                 if (std.mem.startsWith(u8, tag_name, "svelte:")) continue;
+
+                // Extract and emit member access expressions from closure bodies BEFORE the component.
+                // This enables TypeScript's type narrowing to apply to expressions used inside callbacks.
+                try emitClosureBodyExpressionsForAttrs(
+                    allocator,
+                    ast.source,
+                    output,
+                    mappings,
+                    elem_data.attrs_start,
+                    elem_data.attrs_end,
+                    ast.attributes.items,
+                );
 
                 // Emit component props validation
                 try emitComponentPropsValidation(
