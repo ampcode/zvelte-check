@@ -699,6 +699,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         // We need to track where non-import code begins in the ORIGINAL source, not the transformed version.
         const raw_separated = try separateImports(allocator, raw_content);
         const first_non_import_offset = raw_separated.first_other_pos;
+        const first_import_offset = raw_separated.first_import_pos;
 
         if (instance_generics) |generics| {
             // For generic components, imports must be at module level (not inside __render).
@@ -708,11 +709,16 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             // Emit imports at module level with source mapping
             if (separated.imports.len > 0) {
                 try output.appendSlice(allocator, "// <script> imports (hoisted)\n");
-                // Add mapping for hoisted imports
+                // Add mapping for hoisted imports.
+                // Use raw_separated.imports.len for the Svelte range length.
+                // This ensures correct mapping even when transformations change content.
                 try mappings.append(allocator, .{
-                    .svelte_offset = script.content_start,
+                    .svelte_offset = script.content_start + @as(u32, @intCast(first_import_offset)),
                     .ts_offset = @intCast(output.items.len),
-                    .len = @intCast(separated.imports.len),
+                    // Use the raw (untransformed) imports length for correct source mapping.
+                    // This ensures errors map to the correct Svelte line even when
+                    // filterSvelteImports removes content.
+                    .len = @intCast(raw_separated.imports.len),
                 });
                 try output.appendSlice(allocator, separated.imports);
                 try output.appendSlice(allocator, "\n");
@@ -748,11 +754,13 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             // Emit imports at module level with source mapping
             if (separated.imports.len > 0) {
                 try output.appendSlice(allocator, "// <script> imports (hoisted)\n");
-                // Add mapping for hoisted imports
+                // Add mapping for hoisted imports.
+                // Use first_import_offset and raw_separated.imports.len for correct mapping
+                // since transformations may change content length.
                 try mappings.append(allocator, .{
-                    .svelte_offset = script.content_start,
+                    .svelte_offset = script.content_start + @as(u32, @intCast(first_import_offset)),
                     .ts_offset = @intCast(output.items.len),
-                    .len = @intCast(separated.imports.len),
+                    .len = @intCast(raw_separated.imports.len),
                 });
                 try output.appendSlice(allocator, separated.imports);
                 try output.appendSlice(allocator, "\n");
@@ -8912,8 +8920,10 @@ fn filterMixedImport(allocator: std.mem.Allocator, line: []const u8) !?[]const u
     defer new_line.deinit(allocator);
 
     if (filtered_specs.items.len == 0) {
-        // All specifiers were types - skip the entire import
-        return "";
+        // All specifiers were types - keep the original line to preserve byte offsets.
+        // Removing the line would break source map correspondence between the
+        // transformed and original content.
+        return null;
     }
 
     try new_line.appendSlice(allocator, line[0 .. brace_start + 1]);
@@ -9016,6 +9026,9 @@ const SeparatedCode = struct {
     /// Position in the original content where the first non-import/non-type line starts.
     /// Used for source mapping when imports are scattered throughout the file.
     first_other_pos: usize,
+    /// Position in the original content where the first import/type declaration starts.
+    /// Used for source mapping to correctly map import errors back to their original line.
+    first_import_pos: usize,
 };
 
 /// Separates import statements and type declarations from other code.
@@ -9043,6 +9056,10 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
     // Track position of first non-import line for source mapping
     var first_other_pos: ?usize = null;
 
+    // Track position of first content added to imports for source mapping.
+    // This includes leading blank lines that are kept with imports.
+    var first_import_pos: ?usize = null;
+
     var i: usize = 0;
     while (i < content.len) {
         // Skip leading whitespace on the line (but preserve it for output)
@@ -9058,6 +9075,9 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
                 if (after_import == ' ' or after_import == '\t' or after_import == '{' or after_import == '"' or after_import == '\'') {
                     // This is an import statement - find where it ends
                     const import_end = findImportEnd(content, i);
+
+                    // Track first import position for source mapping
+                    if (first_import_pos == null) first_import_pos = line_start;
 
                     // Include the full import (from line_start to include leading whitespace)
                     try imports.appendSlice(allocator, content[line_start..import_end]);
@@ -9078,6 +9098,9 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
                     // This is an interface declaration - find where it ends
                     const interface_end = findBraceBlockEnd(content, i);
 
+                    // Track first import position for source mapping
+                    if (first_import_pos == null) first_import_pos = line_start;
+
                     // Include the full interface (from line_start to include leading whitespace)
                     try imports.appendSlice(allocator, content[line_start..interface_end]);
                     if (interface_end < content.len and content[interface_end] == '\n') {
@@ -9094,6 +9117,9 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
             if (i + 12 <= content.len and std.mem.eql(u8, content[i .. i + 12], "export type ")) {
                 // This is an exported type alias - find where it ends
                 const type_end = findTypeAliasEnd(content, i + 7); // Skip "export " to find type end
+
+                // Track first import position for source mapping
+                if (first_import_pos == null) first_import_pos = line_start;
 
                 // Include the full type (from line_start to include leading whitespace)
                 try imports.appendSlice(allocator, content[line_start..type_end]);
@@ -9113,6 +9139,9 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
                     // This is a type alias - find where it ends (at semicolon or newline after =)
                     const type_end = findTypeAliasEnd(content, i);
 
+                    // Track first import position for source mapping
+                    if (first_import_pos == null) first_import_pos = line_start;
+
                     // Include the full type (from line_start to include leading whitespace)
                     try imports.appendSlice(allocator, content[line_start..type_end]);
                     if (type_end < content.len and content[type_end] == '\n') {
@@ -9126,9 +9155,27 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
             }
         }
 
-        // Not an import/interface/type (or inside template literal) - copy to 'other' until end of line
-        // Track template literal state as we copy
+        // Not an import/interface/type (or inside template literal).
+        // Find end of line first.
         const line_end = std.mem.indexOfScalarPos(u8, content, i, '\n') orelse content.len;
+
+        // Blank/whitespace-only lines between imports should stay with imports to preserve
+        // byte offsets for source mapping. Only switch to 'other' for actual code.
+        if (first_other_pos == null and i == line_end) {
+            // This is an empty/whitespace-only line and we haven't seen code yet.
+            // Keep it with imports to preserve byte alignment.
+            if (first_import_pos == null) first_import_pos = line_start;
+            try imports.appendSlice(allocator, content[line_start..line_end]);
+            if (line_end < content.len) {
+                try imports.append(allocator, '\n');
+                i = line_end + 1;
+            } else {
+                i = line_end;
+            }
+            continue;
+        }
+
+        // Track template literal state as we copy to 'other'
 
         // Scan this line for backticks to update template_depth.
         // We only track regular strings (', ") when at top level (template_depth == 0).
@@ -9197,6 +9244,7 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
         .imports = try imports.toOwnedSlice(allocator),
         .other = try other.toOwnedSlice(allocator),
         .first_other_pos = first_other_pos orelse 0,
+        .first_import_pos = first_import_pos orelse 0,
     };
 }
 
