@@ -8032,8 +8032,8 @@ fn emitSnippetBodyExpressions(
     }
 
     // Emit a self-invoking function that provides the snippet parameter scope.
-    // Format: ((param1: any, param2: any) => { void (expr1); void (expr2); })(undefined!, undefined!);
-    // Using `undefined!` as arguments satisfies TypeScript while making it clear these are placeholders.
+    // Format: ((param1: any, param2: any) => { void (expr1); void (expr2); })({} as any, {} as any);
+    // Using `{} as any` as arguments provides object types for rest spread patterns in destructuring.
     try output.appendSlice(allocator, "((");
 
     // Emit parameters with proper names and any type
@@ -8212,16 +8212,19 @@ fn emitSnippetBodyExpressions(
 
     try output.appendSlice(allocator, "})(");
 
-    // Emit undefined! for each parameter as placeholder arguments
+    // Emit {} as any for each parameter as placeholder arguments.
+    // We use {} as any instead of undefined! because parameters with rest spread patterns
+    // like { props: { triggerClass, ...triggerProps } } require an object type.
+    // TypeScript error: "Rest types may only be created from object types"
     if (range.params) |params| {
         const param_count = countParams(params);
         var i: usize = 0;
         while (i < param_count) : (i += 1) {
             if (i > 0) try output.appendSlice(allocator, ", ");
             if (is_typescript) {
-                try output.appendSlice(allocator, "undefined!");
+                try output.appendSlice(allocator, "{} as any");
             } else {
-                try output.appendSlice(allocator, "undefined");
+                try output.appendSlice(allocator, "{}");
             }
         }
     }
