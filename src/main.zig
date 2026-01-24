@@ -88,6 +88,9 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
     // Track which files are from the main workspace (for diagnostic filtering)
     var main_workspace_files: std.StringHashMapUnmanaged(void) = .empty;
 
+    // Track nested projects discovered when root tsconfig excludes all Svelte files
+    var nested_projects: []tsconfig.NestedProject = &.{};
+
     if (config) |cfg| {
         for (all_files) |file_path| {
             // Normalize path for pattern matching:
@@ -106,6 +109,31 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
             if (tsconfig.shouldInclude(cfg, normalized)) {
                 try files_list.append(allocator, file_path);
                 try main_workspace_files.put(allocator, file_path, {});
+            }
+        }
+
+        // If the root tsconfig excludes all Svelte files but there are Svelte files
+        // in the workspace, look for nested projects in excluded directories.
+        // This handles monorepo structures where e.g. app/ has its own tsconfig.
+        if (files_list.items.len == 0 and all_files.len > 0) {
+            nested_projects = try tsconfig.findNestedProjects(allocator, args.workspace, cfg);
+
+            for (nested_projects) |nested| {
+                // Check which files belong to this nested project
+                for (all_files) |file_path| {
+                    if (!std.mem.startsWith(u8, file_path, nested.path)) continue;
+
+                    // Get path relative to nested project root
+                    var relative_to_nested = file_path[nested.path.len..];
+                    if (relative_to_nested.len > 0 and relative_to_nested[0] == '/') {
+                        relative_to_nested = relative_to_nested[1..];
+                    }
+
+                    if (tsconfig.shouldInclude(nested.config, relative_to_nested)) {
+                        try files_list.append(allocator, file_path);
+                        try main_workspace_files.put(allocator, file_path, {});
+                    }
+                }
             }
         }
 
@@ -243,24 +271,63 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
             }
         }
 
-        const ts_diagnostics = tsgo.check(allocator, virtual_files.items, args.workspace, args.tsconfig) catch |err| {
-            if (err == tsgo.TsgoNotFoundError.TsgoNotFound) {
-                const stderr = std.fs.File.stderr();
-                try stderr.writeAll("error: tsgo not found\n\n");
-                try stderr.writeAll("tsgo is required for TypeScript checking. Install it with:\n");
-                try stderr.writeAll("  pnpm add -D @aspect-build/tsgo\n\n");
-                try stderr.writeAll("Or skip TypeScript checking with --no-tsconfig\n");
-                return 1;
-            }
-            return err;
-        };
+        // When checking nested projects, run tsgo against each nested project's directory
+        // and tsconfig instead of the root workspace.
+        if (nested_projects.len > 0) {
+            for (nested_projects) |nested| {
+                // Filter virtual files to only those in this nested project
+                var nested_virtual_files: std.ArrayList(transformer.VirtualFile) = .empty;
+                for (virtual_files.items) |vf| {
+                    if (std.mem.startsWith(u8, vf.original_path, nested.path)) {
+                        try nested_virtual_files.append(allocator, vf);
+                    }
+                }
 
-        for (ts_diagnostics) |d| {
-            // Skip TS errors for files with fatal Svelte errors
-            if (files_to_suppress_ts.contains(d.file_path)) continue;
-            // Only report diagnostics from the main workspace, not referenced projects
-            if (!main_workspace_files.contains(d.file_path)) continue;
-            try all_diagnostics.append(allocator, d);
+                const ts_diagnostics = tsgo.check(allocator, nested_virtual_files.items, nested.path, null) catch |err| {
+                    if (err == tsgo.TsgoNotFoundError.TsgoNotFound) {
+                        const stderr = std.fs.File.stderr();
+                        try stderr.writeAll("error: tsgo not found\n\n");
+                        try stderr.writeAll("tsgo is required for TypeScript checking. Install it with:\n");
+                        try stderr.writeAll("  pnpm add -D @aspect-build/tsgo\n\n");
+                        try stderr.writeAll("Or skip TypeScript checking with --no-tsconfig\n");
+                        return 1;
+                    }
+                    return err;
+                };
+
+                for (ts_diagnostics) |d| {
+                    if (files_to_suppress_ts.contains(d.file_path)) continue;
+                    if (main_workspace_files.contains(d.file_path)) {
+                        try all_diagnostics.append(allocator, d);
+                    }
+                }
+            }
+        } else {
+            const ts_diagnostics = tsgo.check(allocator, virtual_files.items, args.workspace, args.tsconfig) catch |err| {
+                if (err == tsgo.TsgoNotFoundError.TsgoNotFound) {
+                    const stderr = std.fs.File.stderr();
+                    try stderr.writeAll("error: tsgo not found\n\n");
+                    try stderr.writeAll("tsgo is required for TypeScript checking. Install it with:\n");
+                    try stderr.writeAll("  pnpm add -D @aspect-build/tsgo\n\n");
+                    try stderr.writeAll("Or skip TypeScript checking with --no-tsconfig\n");
+                    return 1;
+                }
+                return err;
+            };
+
+            for (ts_diagnostics) |d| {
+                // Skip TS errors for files with fatal Svelte errors
+                if (files_to_suppress_ts.contains(d.file_path)) continue;
+                // Only report diagnostics from the main workspace, not referenced projects.
+                // For .svelte files, check the main_workspace_files hashmap.
+                // For SvelteKit route .ts files, check if they're under the workspace path.
+                const is_main_workspace = if (std.mem.endsWith(u8, d.file_path, ".svelte"))
+                    main_workspace_files.contains(d.file_path)
+                else
+                    std.mem.startsWith(u8, d.file_path, args.workspace);
+                if (!is_main_workspace) continue;
+                try all_diagnostics.append(allocator, d);
+            }
         }
     }
 

@@ -32,6 +32,81 @@ pub fn load(allocator: std.mem.Allocator, workspace_path: []const u8, tsconfig_p
     return loadFromPath(allocator, full_path, workspace_path);
 }
 
+/// Represents a nested project with its own tsconfig.json.
+/// Used when the root tsconfig excludes directories that contain their own projects.
+pub const NestedProject = struct {
+    /// The directory containing the nested tsconfig.json (absolute path)
+    path: []const u8,
+    /// The parsed tsconfig
+    config: TsConfig,
+};
+
+/// Finds nested tsconfig.json files in subdirectories.
+/// This is used when the root tsconfig excludes all Svelte files but there are
+/// Svelte files in subdirectories with their own tsconfigs.
+pub fn findNestedProjects(
+    allocator: std.mem.Allocator,
+    workspace_path: []const u8,
+    root_config: TsConfig,
+) ![]NestedProject {
+    var projects: std.ArrayList(NestedProject) = .empty;
+    errdefer {
+        for (projects.items) |p| {
+            allocator.free(p.path);
+            var cfg = p.config;
+            cfg.deinit(allocator);
+        }
+        projects.deinit(allocator);
+    }
+
+    // Look for subdirectories that are excluded by the root config
+    // and have their own tsconfig.json
+    var dir = std.fs.cwd().openDir(workspace_path, .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) return projects.toOwnedSlice(allocator);
+        return err;
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        // Skip standard ignored directories
+        if (std.mem.eql(u8, entry.name, "node_modules")) continue;
+        if (std.mem.eql(u8, entry.name, ".git")) continue;
+        if (std.mem.eql(u8, entry.name, ".svelte-kit")) continue;
+
+        // Check if this directory is excluded by the root config.
+        // matchTsconfigPattern checks paths like "app/foo.ts", but here we have
+        // directory names like "app". A directory is excluded if:
+        // 1. The pattern equals the directory name (e.g., "app" excludes "app")
+        // 2. The pattern would match files in this directory (e.g., "app/**" matches "app/")
+        const is_excluded = for (root_config.exclude) |pattern| {
+            // Direct name match (most common case)
+            if (std.mem.eql(u8, pattern, entry.name)) break true;
+            // Pattern would match files in this directory
+            if (matchTsconfigPattern(pattern, entry.name)) break true;
+        } else false;
+
+        if (!is_excluded) continue;
+
+        // Check if there's a tsconfig.json in this subdirectory
+        const subdir_path = try std.fs.path.join(allocator, &.{ workspace_path, entry.name });
+        const tsconfig_path = try std.fs.path.join(allocator, &.{ subdir_path, "tsconfig.json" });
+        defer allocator.free(tsconfig_path);
+
+        if (try loadFromPath(allocator, tsconfig_path, subdir_path)) |nested_config| {
+            try projects.append(allocator, .{
+                .path = subdir_path,
+                .config = nested_config,
+            });
+        } else {
+            allocator.free(subdir_path);
+        }
+    }
+
+    return projects.toOwnedSlice(allocator);
+}
+
 const LoadError = std.fs.File.OpenError || std.fs.File.ReadError || std.mem.Allocator.Error;
 
 fn loadFromPath(allocator: std.mem.Allocator, config_path: []const u8, base_dir: []const u8) LoadError!?TsConfig {
