@@ -9390,7 +9390,7 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
 }
 
 /// Finds the end of a brace-delimited block (interface, object type, etc.).
-/// Handles nested braces and strings.
+/// Handles nested braces, strings, and comments.
 fn findBraceBlockEnd(content: []const u8, start: usize) usize {
     var i = start;
     var brace_depth: u32 = 0;
@@ -9410,6 +9410,27 @@ fn findBraceBlockEnd(content: []const u8, start: usize) usize {
                 in_string = 0;
             }
             i += 1;
+            continue;
+        }
+
+        // Skip single-line comments (// ...)
+        // Important: must check before string detection because comments can contain quotes
+        if (c == '/' and i + 1 < content.len and content[i + 1] == '/') {
+            // Skip to end of line
+            while (i < content.len and content[i] != '\n') : (i += 1) {}
+            continue;
+        }
+
+        // Skip multi-line comments (/* ... */)
+        if (c == '/' and i + 1 < content.len and content[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < content.len) {
+                if (content[i] == '*' and content[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
             continue;
         }
 
@@ -13772,4 +13793,83 @@ test "separateImports handles interface keyword inside template literal" {
     try std.testing.expect(std.mem.indexOf(u8, sep.imports, "interface ButtonProps") == null);
     // The interface should be in other (as part of the template literal)
     try std.testing.expect(std.mem.indexOf(u8, sep.other, "interface ButtonProps") != null);
+}
+
+test "separateImports does not split $effect block" {
+    // Regression test: $effect block spanning multiple lines should NOT be split.
+    // The entire $effect(() => { ... }) should be in 'other', not partially in 'imports'.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Match real file structure with tab indentation.
+    // Uses explicit tab characters since multiline strings convert tabs to spaces.
+    const content = "\timport type { EvalResult } from '../../../../src/types'\n" ++
+        "\timport ModelResultColumn from './ModelResultColumn.svelte'\n" ++
+        "\n" ++
+        "\tinterface DatasetItem {\n" ++
+        "\t\tid: number\n" ++
+        "\t\trepo_url: string\n" ++
+        "\t}\n" ++
+        "\n" ++
+        "\tlet { models, dataset }: { models: string[]; dataset: DatasetItem[] } = $props()\n" ++
+        "\tlet modelAId = $state('')\n" ++
+        "\n" ++
+        "\tfunction scrollToTask(index: number) {\n" ++
+        "\t\tconst el = document.getElementById(`task-btn-${index}`)\n" ++
+        "\t\tel?.scrollIntoView({ block: 'nearest' })\n" ++
+        "\t}\n" ++
+        "\n" ++
+        "\t$effect(() => {\n" ++
+        "\t\tif (models.length > 0) {\n" ++
+        "\t\t\t// do something\n" ++
+        "\t\t}\n" ++
+        "\t})\n" ++
+        "\n" ++
+        "\tasync function fetchResults(modelId: string) {\n" ++
+        "\t\treturn modelId\n" ++
+        "\t}\n";
+
+    const sep = try separateImports(allocator, content);
+
+    // Imports should contain only import and interface statements
+    try std.testing.expect(std.mem.indexOf(u8, sep.imports, "import type { EvalResult }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sep.imports, "import ModelResultColumn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sep.imports, "interface DatasetItem") != null);
+
+    // $effect should NOT be in imports
+    try std.testing.expect(std.mem.indexOf(u8, sep.imports, "$effect") == null);
+    // $effect should be in other
+    try std.testing.expect(std.mem.indexOf(u8, sep.other, "$effect") != null);
+    // The closing }) of $effect should also be in other
+    try std.testing.expect(std.mem.indexOf(u8, sep.other, "})") != null);
+    // fetchResults should be in other
+    try std.testing.expect(std.mem.indexOf(u8, sep.other, "async function fetchResults") != null);
+}
+
+test "separateImports with real file content" {
+    // Regression test for issue where comments containing quotes (e.g., "don't")
+    // caused findBraceBlockEnd to treat comment content as string content,
+    // resulting in interface blocks extending until the next quote in the file.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Read the test fixture file
+    const file_content = std.fs.cwd().readFileAlloc(allocator, "test-fixtures/effect-split-test.svelte", 100000) catch {
+        // Skip test if file doesn't exist
+        return;
+    };
+
+    // Extract script content (between <script lang="ts"> and </script>)
+    const script_start = (std.mem.indexOf(u8, file_content, "<script lang=\"ts\">") orelse return) + 18;
+    const script_end = std.mem.indexOfPos(u8, file_content, script_start, "</script>") orelse return;
+    const script_content = file_content[script_start..script_end];
+
+    const sep = try separateImports(allocator, script_content);
+
+    // Verify imports only contains imports and interface (~283 bytes), not the whole file
+    try std.testing.expect(sep.imports.len < 400);
+    try std.testing.expect(std.mem.indexOf(u8, sep.imports, "$effect") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sep.other, "$effect") != null);
 }
