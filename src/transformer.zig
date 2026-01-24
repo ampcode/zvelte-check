@@ -4739,7 +4739,11 @@ fn extractClosureBodyExpressionsWithContext(
             if (saw_arrow) {
                 func_depth += 1;
                 saw_arrow = false;
-                closure_start = i + 1; // Body starts after {
+                // Only set closure_start for the OUTERMOST closure (when entering func_depth 1).
+                // For nested closures, keep the outer closure_start so we process the full outer body.
+                if (func_depth == 1) {
+                    closure_start = i + 1; // Body starts after {
+                }
             } else if (func_depth > 0) {
                 func_depth += 1;
             }
@@ -4872,15 +4876,42 @@ fn extractMemberAccessChainsFromBody(
     body_offset: u32,
     results: *std.ArrayList(ClosureBodyExpression),
     arrow_params: *const std.StringHashMapUnmanaged(void),
-    local_decls: *const std.StringHashMapUnmanaged(void),
+    outer_local_decls: *const std.StringHashMapUnmanaged(void),
 ) !void {
+    // Collect local declarations from THIS body (the closure body).
+    // This ensures variables declared inside callbacks (e.g., `const input = e.currentTarget`)
+    // are recognized and not reported as "Cannot find name" errors.
+    var body_local_decls: std.StringHashMapUnmanaged(void) = .empty;
+    defer body_local_decls.deinit(allocator);
+    try collectLocalDeclarations(allocator, body, &body_local_decls);
+
+    // Build a merged set of all known local declarations for nested closures.
+    // This includes outer scope declarations and this body's declarations.
+    var merged_decls: std.StringHashMapUnmanaged(void) = .empty;
+    defer merged_decls.deinit(allocator);
+    // Add outer scope declarations
+    var outer_iter = outer_local_decls.iterator();
+    while (outer_iter.next()) |entry| {
+        try merged_decls.put(allocator, entry.key_ptr.*, {});
+    }
+    // Add this body's declarations
+    var body_iter = body_local_decls.iterator();
+    while (body_iter.next()) |entry| {
+        try merged_decls.put(allocator, entry.key_ptr.*, {});
+    }
+
     var i: usize = 0;
+    var func_depth: u32 = 0;
+    var saw_arrow = false;
+    var nested_closure_start: ?usize = null;
+
     while (i < body.len) {
         const c = body[i];
 
         // Skip string literals
         if (c == '"' or c == '\'' or c == '`') {
             i = skipStringLiteral(body, i);
+            saw_arrow = false;
             continue;
         }
 
@@ -4888,81 +4919,159 @@ fn extractMemberAccessChainsFromBody(
         if (i + 1 < body.len and c == '/') {
             if (body[i + 1] == '/') {
                 while (i < body.len and body[i] != '\n') : (i += 1) {}
+                saw_arrow = false;
                 continue;
             }
             if (body[i + 1] == '*') {
                 i += 2;
                 while (i + 1 < body.len and !(body[i] == '*' and body[i + 1] == '/')) : (i += 1) {}
                 if (i + 1 < body.len) i += 2;
+                saw_arrow = false;
                 continue;
             }
         }
 
-        // Look for identifier start
+        // Track arrow => which starts a function scope
+        if (c == '=' and i + 1 < body.len and body[i + 1] == '>') {
+            saw_arrow = true;
+            i += 2;
+            continue;
+        }
+
+        // Track function body entry for nested closures
+        if (c == '{') {
+            if (saw_arrow) {
+                func_depth += 1;
+                saw_arrow = false;
+                if (func_depth == 1) {
+                    nested_closure_start = i + 1; // Body starts after {
+                }
+            } else if (func_depth > 0) {
+                func_depth += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        if (c == '}') {
+            if (func_depth > 0) {
+                // If we're closing a nested closure, recursively process it
+                if (func_depth == 1 and nested_closure_start != null) {
+                    const nested_body = body[nested_closure_start.?..i];
+                    // Recursively process with merged declarations from this scope
+                    try extractMemberAccessChainsFromBody(
+                        allocator,
+                        nested_body,
+                        body_offset + @as(u32, @intCast(nested_closure_start.?)),
+                        results,
+                        arrow_params,
+                        &merged_decls,
+                    );
+                    nested_closure_start = null;
+                }
+                func_depth -= 1;
+            }
+            i += 1;
+            saw_arrow = false;
+            continue;
+        }
+
+        // Handle 'function' keyword for traditional function expressions
         if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
             const ident_start = i;
             while (i < body.len and (std.ascii.isAlphanumeric(body[i]) or body[i] == '_' or body[i] == '$')) : (i += 1) {}
             const ident = body[ident_start..i];
 
-            // Skip keywords
-            if (isJavaScriptKeyword(ident)) continue;
-            // Skip arrow params and local decls
-            if (arrow_params.contains(ident)) continue;
-            if (local_decls.contains(ident)) continue;
-            // Skip if preceded by dot (this is already part of a chain)
-            if (ident_start > 0 and body[ident_start - 1] == '.') continue;
-
-            // Check if followed by member access
-            if (i < body.len and body[i] == '.') {
-                // This is a member access chain - extract it
-                const chain_start = ident_start;
-                // Find the end of the chain: identifier(.property | .method(...) | [index])*
-                while (i < body.len) {
-                    if (body[i] == '.') {
+            if (std.mem.eql(u8, ident, "function")) {
+                // Skip to opening paren of parameters
+                while (i < body.len and body[i] != '(') : (i += 1) {}
+                if (i < body.len) {
+                    var paren_depth: u32 = 1;
+                    i += 1;
+                    while (i < body.len and paren_depth > 0) {
+                        if (body[i] == '(') paren_depth += 1;
+                        if (body[i] == ')') paren_depth -= 1;
                         i += 1;
-                        // Skip optional chaining ?.
-                        if (i < body.len and body[i] == '?') i += 1;
-                        // Skip whitespace
-                        while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
-                        // Skip property name
-                        if (i < body.len and (std.ascii.isAlphabetic(body[i]) or body[i] == '_' or body[i] == '$')) {
-                            while (i < body.len and (std.ascii.isAlphanumeric(body[i]) or body[i] == '_' or body[i] == '$')) : (i += 1) {}
-                        } else {
-                            // Invalid member access, stop
-                            break;
-                        }
-                    } else if (body[i] == '(') {
-                        // Method call - stop the chain here to avoid including call arguments.
-                        // The arguments may reference local variables from the closure that
-                        // don't exist at module scope, which would cause "Cannot find name" errors.
-                        // Just extracting the member access chain (e.g., `obj.method`) is enough
-                        // to establish narrowing for `obj`.
-                        break;
-                    } else if (body[i] == '[') {
-                        // Index access - skip it, just record up to here
-                        break;
-                    } else if (body[i] == '?') {
-                        // Optional chaining before . or [
-                        if (i + 1 < body.len and (body[i + 1] == '.' or body[i + 1] == '[')) {
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
+                    }
+                    while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+                    if (i < body.len and body[i] == '{') {
+                        func_depth += 1;
+                        nested_closure_start = i + 1;
+                        i += 1;
                     }
                 }
-                const chain_end = i;
-                const chain = body[chain_start..chain_end];
-                // Only add if it's a real member access (contains .)
-                if (std.mem.indexOf(u8, chain, ".") != null) {
-                    try results.append(allocator, .{
-                        .expr = chain,
-                        .offset = body_offset + @as(u32, @intCast(chain_start)),
-                    });
+                saw_arrow = false;
+                continue;
+            }
+
+            // Only process identifiers at the surface level (not inside nested closures)
+            if (func_depth == 0) {
+                // Skip keywords
+                if (isJavaScriptKeyword(ident)) continue;
+                // Skip arrow params and local decls (both outer scope and this body's declarations)
+                if (arrow_params.contains(ident)) continue;
+                if (outer_local_decls.contains(ident)) continue;
+                if (body_local_decls.contains(ident)) continue;
+                // Skip if preceded by dot (this is already part of a chain)
+                if (ident_start > 0 and body[ident_start - 1] == '.') continue;
+
+                // Check if followed by member access
+                if (i < body.len and body[i] == '.') {
+                    // This is a member access chain - extract it
+                    const chain_start = ident_start;
+                    // Find the end of the chain: identifier(.property | .method(...) | [index])*
+                    while (i < body.len) {
+                        if (body[i] == '.') {
+                            i += 1;
+                            // Skip optional chaining ?.
+                            if (i < body.len and body[i] == '?') i += 1;
+                            // Skip whitespace
+                            while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+                            // Skip property name
+                            if (i < body.len and (std.ascii.isAlphabetic(body[i]) or body[i] == '_' or body[i] == '$')) {
+                                while (i < body.len and (std.ascii.isAlphanumeric(body[i]) or body[i] == '_' or body[i] == '$')) : (i += 1) {}
+                            } else {
+                                // Invalid member access, stop
+                                break;
+                            }
+                        } else if (body[i] == '(') {
+                            // Method call - stop the chain here to avoid including call arguments.
+                            // The arguments may reference local variables from the closure that
+                            // don't exist at module scope, which would cause "Cannot find name" errors.
+                            // Just extracting the member access chain (e.g., `obj.method`) is enough
+                            // to establish narrowing for `obj`.
+                            break;
+                        } else if (body[i] == '[') {
+                            // Index access - skip it, just record up to here
+                            break;
+                        } else if (body[i] == '?') {
+                            // Optional chaining before . or [
+                            if (i + 1 < body.len and (body[i + 1] == '.' or body[i + 1] == '[')) {
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    const chain_end = i;
+                    const chain = body[chain_start..chain_end];
+                    // Only add if it's a real member access (contains .)
+                    if (std.mem.indexOf(u8, chain, ".") != null) {
+                        try results.append(allocator, .{
+                            .expr = chain,
+                            .offset = body_offset + @as(u32, @intCast(chain_start)),
+                        });
+                    }
                 }
             }
+            saw_arrow = false;
             continue;
+        }
+
+        if (saw_arrow and !std.ascii.isWhitespace(c)) {
+            saw_arrow = false;
         }
 
         i += 1;
