@@ -9949,11 +9949,14 @@ fn transformStateWithTypeAnnotation(allocator: std.mem.Allocator, content: []con
     return try result.toOwnedSlice(allocator);
 }
 
-/// Transforms store subscriptions by generating variable declarations.
+/// Transforms store subscriptions by generating variable declarations and transforming assignments.
 /// For each unique store usage like $serverStatus, generates:
 ///   let $serverStatus = __svelte_store_get(serverStatus);
 /// at the END of the content (after user declarations). The $storeName references
 /// are kept as-is and refer to the declared variable, enabling TypeScript narrowing.
+///
+/// Also transforms store assignments: `$store = value` becomes `store.set(value)`
+/// This is the Svelte 4 store assignment syntax.
 fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
     // Early exit: skip if no $ character (no stores or runes to process)
     if (std.mem.indexOfScalar(u8, content, '$') == null) return content;
@@ -9980,7 +9983,8 @@ fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8
     defer result.deinit(allocator);
     try result.ensureTotalCapacity(allocator, content.len + store_names.len * 60);
 
-    // First pass: insert const $storeName declarations after let storeName declarations.
+    // First pass: insert const $storeName declarations after let storeName declarations,
+    // and transform $store = value to store.set(value).
     // This enables TypeScript control flow narrowing inside callbacks like $derived.by().
     // Using 'const' tells TypeScript the value won't change, allowing narrowing to persist.
 
@@ -10086,6 +10090,72 @@ fn transformStoreSubscriptions(allocator: std.mem.Allocator, content: []const u8
 
             // Not a store declaration, copy what we've consumed
             try result.appendSlice(allocator, content[let_start..i]);
+            continue;
+        }
+
+        // Check for store assignment: $storeName = value
+        // Transform to: storeName.set(value)
+        if (content[i] == '$' and i + 1 < content.len and isIdentStartChar(content[i + 1])) {
+            const dollar_pos = i;
+            i += 1; // skip $
+            const name_start = i;
+            while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+            const name = content[name_start..i];
+
+            // Check if this is a store we're tracking
+            if (store_set.contains(name)) {
+                // Skip whitespace after store name
+                var j = i;
+                while (j < content.len and (content[j] == ' ' or content[j] == '\t')) : (j += 1) {}
+
+                // Check for assignment operator (= but not == or ===)
+                if (j < content.len and content[j] == '=' and
+                    (j + 1 >= content.len or content[j + 1] != '='))
+                {
+                    // This is a store assignment: $store = value
+                    // Transform to: store.set(value)
+                    i = j + 1; // skip '='
+
+                    // Skip whitespace after =
+                    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
+
+                    // Find the end of the value expression
+                    // Value ends at ; or newline (when not in parens/braces/brackets)
+                    const value_start = i;
+                    var depth: u32 = 0;
+                    while (i < content.len) {
+                        const c = content[i];
+                        if (c == '(' or c == '{' or c == '[') depth += 1;
+                        if (c == ')' or c == '}' or c == ']') {
+                            if (depth > 0) depth -= 1;
+                        }
+                        // Skip strings within the value
+                        if (c == '"' or c == '\'' or c == '`') {
+                            i = skipStringForReactive(content, i);
+                            continue;
+                        }
+                        if (depth == 0) {
+                            if (c == ';' or c == '\n') {
+                                break;
+                            }
+                            // Also break on } at depth 0 if it's a block end
+                            if (c == '}') break;
+                        }
+                        i += 1;
+                    }
+                    const value = std.mem.trimRight(u8, content[value_start..i], " \t");
+
+                    // Emit: storeName.set(value)
+                    try result.appendSlice(allocator, name);
+                    try result.appendSlice(allocator, ".set(");
+                    try result.appendSlice(allocator, value);
+                    try result.appendSlice(allocator, ")");
+                    continue;
+                }
+            }
+
+            // Not a store assignment, emit the $name as-is
+            try result.appendSlice(allocator, content[dollar_pos..i]);
             continue;
         }
 
@@ -11367,12 +11437,14 @@ test "transform store subscription mixed runes and stores" {
 test "transform store subscription assignment" {
     const allocator = std.testing.allocator;
 
+    // Test store assignment transformation: $count = 5 → count.set(5)
     const input = "$count = 5;";
     const result = try transformStoreSubscriptions(allocator, input);
     defer allocator.free(result);
 
-    // Store assignment preserved as-is (becomes variable assignment after hoisting)
-    try std.testing.expect(std.mem.startsWith(u8, result, "$count = 5;"));
+    // Store assignment is transformed to store.set() call
+    try std.testing.expect(std.mem.startsWith(u8, result, "count.set(5)"));
+    // Should still emit var declaration for store reads
     try std.testing.expect(std.mem.indexOf(u8, result, "var $count = __svelte_store_get(count);") != null);
 }
 
