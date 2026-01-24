@@ -9200,6 +9200,25 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
                 }
             }
 
+            // Check if this line starts with 'export interface' (exported interface)
+            if (i + 17 <= content.len and std.mem.eql(u8, content[i .. i + 17], "export interface ")) {
+                // This is an exported interface - find where it ends
+                const interface_end = findBraceBlockEnd(content, i + 7); // Skip "export " to find interface body
+
+                // Track first import position for source mapping
+                if (first_import_pos == null) first_import_pos = line_start;
+
+                // Include the full interface (from line_start to include leading whitespace)
+                try imports.appendSlice(allocator, content[line_start..interface_end]);
+                if (interface_end < content.len and content[interface_end] == '\n') {
+                    try imports.append(allocator, '\n');
+                    i = interface_end + 1;
+                } else {
+                    i = interface_end;
+                }
+                continue;
+            }
+
             // Check if this line starts with 'interface'
             if (i + 9 <= content.len and std.mem.eql(u8, content[i .. i + 9], "interface")) {
                 const after_interface = if (i + 9 < content.len) content[i + 9] else 0;
