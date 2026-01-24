@@ -4703,9 +4703,23 @@ fn extractClosureBodyExpressionsWithContext(
                     }
                     i += 1;
                 }
-                // Extract member access chains from this single-expression body
+                // Extract expressions from this single-expression body.
+                // For ternary expressions, emit the whole expression to preserve TypeScript's
+                // control flow narrowing within branches. For simple member access chains,
+                // extract them individually.
                 const body = expr[expr_start..i];
-                try extractMemberAccessChainsFromBody(allocator, body, base_offset + @as(u32, @intCast(expr_start)), results, arrow_params, local_decls);
+                const trimmed_body = std.mem.trim(u8, body, " \t\n\r");
+                if (containsTernaryOperator(trimmed_body)) {
+                    // Emit the whole ternary expression so TypeScript can narrow within branches.
+                    // This fixes false positives like "possibly undefined" in truthy branch of:
+                    // () => obj?.data ? { id: obj.data.id } : undefined
+                    try results.append(allocator, .{
+                        .expr = trimmed_body,
+                        .offset = base_offset + @as(u32, @intCast(expr_start)) + @as(u32, @intCast(@intFromPtr(trimmed_body.ptr) - @intFromPtr(body.ptr))),
+                    });
+                } else {
+                    try extractMemberAccessChainsFromBody(allocator, body, base_offset + @as(u32, @intCast(expr_start)), results, arrow_params, local_decls);
+                }
                 saw_arrow = false;
                 closure_start = null;
             }
@@ -4775,6 +4789,70 @@ fn extractClosureBodyExpressionsWithContext(
 
         i += 1;
     }
+}
+
+/// Checks if an expression contains a ternary operator at the top level.
+/// This is used to decide whether to emit the whole expression (for narrowing) or extract member chains.
+/// Skips `?` that are part of optional chaining (`?.`) or nullish coalescing (`??`).
+fn containsTernaryOperator(expr: []const u8) bool {
+    var i: usize = 0;
+    var depth: u32 = 0; // Track () {} [] depth
+
+    while (i < expr.len) {
+        const c = expr[i];
+
+        // Skip string literals
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipStringLiteral(expr, i);
+            continue;
+        }
+
+        // Skip comments
+        if (i + 1 < expr.len and c == '/') {
+            if (expr[i + 1] == '/') {
+                while (i < expr.len and expr[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (expr[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < expr.len and !(expr[i] == '*' and expr[i + 1] == '/')) : (i += 1) {}
+                if (i + 1 < expr.len) i += 2;
+                continue;
+            }
+        }
+
+        // Track nesting depth
+        if (c == '(' or c == '{' or c == '[') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == ')' or c == '}' or c == ']') {
+            if (depth > 0) depth -= 1;
+            i += 1;
+            continue;
+        }
+
+        // Look for ? at depth 0
+        if (c == '?' and depth == 0) {
+            // Skip ?. (optional chaining)
+            if (i + 1 < expr.len and expr[i + 1] == '.') {
+                i += 2;
+                continue;
+            }
+            // Skip ?? (nullish coalescing)
+            if (i + 1 < expr.len and expr[i + 1] == '?') {
+                i += 2;
+                continue;
+            }
+            // This is a ternary operator
+            return true;
+        }
+
+        i += 1;
+    }
+
+    return false;
 }
 
 /// Extracts member access chains from a closure body.
