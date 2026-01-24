@@ -1,11 +1,16 @@
-//! Unused CSS selector diagnostics for Svelte components
+//! CSS diagnostics for Svelte components
 //!
-//! Detects CSS selectors that are declared but never used in markup:
-//! - Parses CSS from style blocks to extract class/id names
-//! - Collects used classes/IDs from class attributes and class: directives
-//! - Compares declared vs used, emitting warnings for unused local selectors
-//! - Skips :global() selectors (intentionally used outside component)
-//! - Handles dynamic classes conservatively (marks as maybe-used)
+//! Detects CSS issues:
+//! 1. Unused selectors - declared but never used in markup
+//!    - Parses CSS from style blocks to extract class/id names
+//!    - Collects used classes/IDs from class attributes and class: directives
+//!    - Compares declared vs used, emitting warnings for unused local selectors
+//!    - Skips :global() selectors (intentionally used outside component)
+//!    - Handles dynamic classes conservatively (marks as maybe-used)
+//!
+//! 2. Vendor prefix compatibility - warns when vendor-prefixed properties
+//!    are used without their standard counterparts (e.g., -webkit-line-clamp
+//!    without line-clamp)
 
 const std = @import("std");
 const Ast = @import("../svelte_parser.zig").Ast;
@@ -35,6 +40,9 @@ pub fn runDiagnostics(
     for (ast.styles.items) |style| {
         const css_content = ast.source[style.content_start..style.content_end];
         try parseSelectors(allocator, css_content, style.content_start, &declared_classes, &declared_ids);
+
+        // Check vendor prefix compatibility within each style block
+        try checkVendorPrefixes(allocator, ast, css_content, style.content_start, diagnostics);
     }
 
     // Step 2: Collect used classes/IDs from markup
@@ -308,6 +316,176 @@ fn computeLineCol(source: []const u8, pos: u32) struct { line: u32, col: u32 } {
     return .{ .line = line, .col = col };
 }
 
+/// Vendor-prefixed properties that require their standard counterpart for compatibility.
+/// Format: .{ prefixed_property, standard_property }
+const VendorPrefixRule = struct {
+    prefixed: []const u8,
+    standard: []const u8,
+};
+
+const VENDOR_PREFIX_RULES = [_]VendorPrefixRule{
+    // Only include properties that have good standard support and svelte-check warns about.
+    // Properties like -webkit-box-orient are intentionally excluded because the standard
+    // property (box-orient) is deprecated and has no browser support.
+    .{ .prefixed = "-webkit-line-clamp", .standard = "line-clamp" },
+};
+
+/// Check for vendor-prefixed properties without their standard counterparts
+fn checkVendorPrefixes(
+    allocator: std.mem.Allocator,
+    ast: *const Ast,
+    css: []const u8,
+    base_offset: u32,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    var i: usize = 0;
+
+    while (i < css.len) {
+        // Skip comments
+        if (i + 1 < css.len and css[i] == '/' and css[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < css.len) {
+                if (css[i] == '*' and css[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip string literals
+        if (css[i] == '"' or css[i] == '\'') {
+            const quote = css[i];
+            i += 1;
+            while (i < css.len) {
+                if (css[i] == '\\' and i + 1 < css.len) {
+                    i += 2;
+                } else if (css[i] == quote) {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Find rule blocks
+        if (css[i] == '{') {
+            const block_start = i + 1;
+            var depth: u32 = 1;
+            i += 1;
+
+            // Find the end of this block
+            while (i < css.len and depth > 0) {
+                if (css[i] == '{') {
+                    depth += 1;
+                } else if (css[i] == '}') {
+                    depth -= 1;
+                }
+                if (depth > 0) i += 1;
+            }
+
+            const block_end = i;
+            const block_content = css[block_start..block_end];
+
+            // Check each vendor prefix rule
+            for (VENDOR_PREFIX_RULES) |rule| {
+                if (findProperty(block_content, rule.prefixed)) |prop_offset| {
+                    // Check if standard property is also present
+                    if (findProperty(block_content, rule.standard) == null) {
+                        const abs_offset = base_offset + @as(u32, @intCast(block_start)) + prop_offset;
+                        const loc = computeLineCol(ast.source, abs_offset);
+
+                        const message = try std.fmt.allocPrint(
+                            allocator,
+                            "Also define the standard property '{s}' for compatibility",
+                            .{rule.standard},
+                        );
+
+                        try diagnostics.append(allocator, .{
+                            .source = .css,
+                            .severity = .warning,
+                            .code = null,
+                            .message = message,
+                            .file_path = ast.file_path,
+                            .start_line = loc.line,
+                            .start_col = loc.col,
+                            .end_line = loc.line,
+                            .end_col = loc.col + @as(u32, @intCast(rule.prefixed.len)),
+                        });
+                    }
+                }
+            }
+
+            if (i < css.len) i += 1; // Skip closing }
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Find a CSS property in a block, returning offset from block start if found.
+/// Handles property names at start of lines or after semicolons/whitespace.
+fn findProperty(block: []const u8, property: []const u8) ?u32 {
+    var i: usize = 0;
+    var at_property_start = true;
+
+    while (i < block.len) {
+        // Skip whitespace
+        if (block[i] == ' ' or block[i] == '\t' or block[i] == '\n' or block[i] == '\r') {
+            if (block[i] == '\n') at_property_start = true;
+            i += 1;
+            continue;
+        }
+
+        // Skip comments
+        if (i + 1 < block.len and block[i] == '/' and block[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < block.len) {
+                if (block[i] == '*' and block[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // After semicolon, we're at the start of a new property
+        if (block[i] == ';') {
+            at_property_start = true;
+            i += 1;
+            continue;
+        }
+
+        // Check for property name at valid position
+        if (at_property_start and i + property.len <= block.len) {
+            if (std.mem.eql(u8, block[i..][0..property.len], property)) {
+                // Verify it's followed by : or whitespace then :
+                var j = i + property.len;
+                while (j < block.len and (block[j] == ' ' or block[j] == '\t')) {
+                    j += 1;
+                }
+                if (j < block.len and block[j] == ':') {
+                    return @intCast(i);
+                }
+            }
+        }
+
+        // Move past this property name to the next semicolon or end
+        while (i < block.len and block[i] != ';' and block[i] != '\n') {
+            i += 1;
+        }
+        at_property_start = (i < block.len and block[i] == ';');
+        if (i < block.len) i += 1;
+    }
+
+    return null;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -512,5 +690,62 @@ test "css: url and import paths ignored" {
     try runDiagnostics(allocator, &ast, &diagnostics);
 
     // Should not warn about .googleapis, .com, .css, .png from URLs/paths
+    try std.testing.expect(diagnostics.items.len == 0);
+}
+
+test "css: vendor prefix without standard warns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<div class="clamp">content</div>
+        \\<style>
+        \\.clamp {
+        \\  display: -webkit-box;
+        \\  -webkit-line-clamp: 3;
+        \\  -webkit-box-orient: vertical;
+        \\  overflow: hidden;
+        \\}
+        \\</style>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should warn about missing standard line-clamp property
+    try std.testing.expect(diagnostics.items.len == 1);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "line-clamp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "Also define") != null);
+}
+
+test "css: vendor prefix with standard no warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<div class="clamp">content</div>
+        \\<style>
+        \\.clamp {
+        \\  display: -webkit-box;
+        \\  -webkit-line-clamp: 3;
+        \\  line-clamp: 3;
+        \\  -webkit-box-orient: vertical;
+        \\  overflow: hidden;
+        \\}
+        \\</style>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should not warn - both prefixed and standard are present
     try std.testing.expect(diagnostics.items.len == 0);
 }
