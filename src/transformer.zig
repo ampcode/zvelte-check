@@ -9261,24 +9261,34 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
             }
 
             // Check if this line starts with 'type' (type alias)
+            // TypeScript type alias syntax: `type Name = ...`
+            // Must have an identifier after 'type', not just `type = value` (which is an assignment)
             if (i + 4 <= content.len and std.mem.eql(u8, content[i .. i + 4], "type")) {
                 const after_type = if (i + 4 < content.len) content[i + 4] else 0;
                 if (after_type == ' ' or after_type == '\t') {
-                    // This is a type alias - find where it ends (at semicolon or newline after =)
-                    const type_end = findTypeAliasEnd(content, i);
+                    // Check that there's an identifier name after 'type', not just '='
+                    // Skip whitespace after 'type' to find the next token
+                    var name_start = i + 5;
+                    while (name_start < content.len and (content[name_start] == ' ' or content[name_start] == '\t')) : (name_start += 1) {}
+                    // If the next char is '=' or we hit end of line, this is NOT a type alias
+                    // (it's a variable named 'type' being assigned, e.g., `type = 'button'`)
+                    if (name_start < content.len and content[name_start] != '=' and content[name_start] != '\n') {
+                        // This is a type alias - find where it ends (at semicolon or newline after =)
+                        const type_end = findTypeAliasEnd(content, i);
 
-                    // Track first import position for source mapping
-                    if (first_import_pos == null) first_import_pos = line_start;
+                        // Track first import position for source mapping
+                        if (first_import_pos == null) first_import_pos = line_start;
 
-                    // Include the full type (from line_start to include leading whitespace)
-                    try imports.appendSlice(allocator, content[line_start..type_end]);
-                    if (type_end < content.len and content[type_end] == '\n') {
-                        try imports.append(allocator, '\n');
-                        i = type_end + 1;
-                    } else {
-                        i = type_end;
+                        // Include the full type (from line_start to include leading whitespace)
+                        try imports.appendSlice(allocator, content[line_start..type_end]);
+                        if (type_end < content.len and content[type_end] == '\n') {
+                            try imports.append(allocator, '\n');
+                            i = type_end + 1;
+                        } else {
+                            i = type_end;
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
         }
