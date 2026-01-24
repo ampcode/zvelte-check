@@ -4900,6 +4900,17 @@ fn extractMemberAccessChainsFromBody(
         try merged_decls.put(allocator, entry.key_ptr.*, {});
     }
 
+    // Track if-statement guards to avoid extracting member accesses that are already narrowed.
+    // When we see `if (identifier)`, store the identifier and track brace depth.
+    // While inside that if-block, skip extracting member accesses on that identifier.
+    // This prevents false positives like "searchInputRef is possibly null" when the code
+    // already has `if (searchInputRef) searchInputRef.value = ''`.
+    var if_guard_identifiers: std.ArrayList([]const u8) = .empty;
+    defer if_guard_identifiers.deinit(allocator);
+    var if_guard_depths: std.ArrayList(u32) = .empty;
+    defer if_guard_depths.deinit(allocator);
+    var if_depth: u32 = 0;
+
     var i: usize = 0;
     var func_depth: u32 = 0;
     var saw_arrow = false;
@@ -4970,6 +4981,18 @@ fn extractMemberAccessChainsFromBody(
                     nested_closure_start = null;
                 }
                 func_depth -= 1;
+            } else if (if_depth > 0) {
+                // Closing an if-block - remove guards at this depth
+                while (if_guard_depths.items.len > 0) {
+                    const last_depth = if_guard_depths.items[if_guard_depths.items.len - 1];
+                    if (last_depth < 1000 and last_depth == if_depth) {
+                        _ = if_guard_depths.pop();
+                        _ = if_guard_identifiers.pop();
+                    } else {
+                        break;
+                    }
+                }
+                if_depth -= 1;
             }
             i += 1;
             saw_arrow = false;
@@ -5004,6 +5027,53 @@ fn extractMemberAccessChainsFromBody(
                 continue;
             }
 
+            // Detect if-statement and parse its condition to track guarded identifiers.
+            // Pattern: `if (identifier)` or `if (identifier != null)` etc.
+            // When we see such a pattern, we track the identifier and don't extract
+            // member accesses on it while inside the if-block.
+            if (std.mem.eql(u8, ident, "if") and func_depth == 0) {
+                // Skip whitespace
+                while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+                if (i < body.len and body[i] == '(') {
+                    // Find the matching )
+                    const cond_start = i + 1;
+                    var paren_depth_cond: u32 = 1;
+                    i += 1;
+                    while (i < body.len and paren_depth_cond > 0) {
+                        if (body[i] == '(') paren_depth_cond += 1;
+                        if (body[i] == ')') paren_depth_cond -= 1;
+                        if (paren_depth_cond > 0) i += 1;
+                    }
+                    const cond_end = i;
+                    if (i < body.len) i += 1; // Skip )
+
+                    // Parse the condition for a simple identifier truthy check
+                    const condition = std.mem.trim(u8, body[cond_start..cond_end], " \t\n\r");
+                    if (extractIfGuardIdentifier(condition)) |guarded_ident| {
+                        // Skip whitespace after condition
+                        while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+
+                        // Check if followed by { (block) or directly by statement
+                        if (i < body.len and body[i] == '{') {
+                            // Block form: if (x) { ... }
+                            if_depth += 1;
+                            try if_guard_identifiers.append(allocator, guarded_ident);
+                            try if_guard_depths.append(allocator, if_depth);
+                            i += 1;
+                        } else {
+                            // Statement form: if (x) x.value = ...
+                            // The guard applies to the rest of the line (until ; or })
+                            // For simplicity, just add the guard at a special depth that
+                            // we'll handle when we see the identifier
+                            try if_guard_identifiers.append(allocator, guarded_ident);
+                            try if_guard_depths.append(allocator, if_depth + 1000); // Marker for statement form
+                        }
+                    }
+                }
+                saw_arrow = false;
+                continue;
+            }
+
             // Only process identifiers at the surface level (not inside nested closures)
             if (func_depth == 0) {
                 // Skip keywords
@@ -5014,6 +5084,23 @@ fn extractMemberAccessChainsFromBody(
                 if (body_local_decls.contains(ident)) continue;
                 // Skip if preceded by dot (this is already part of a chain)
                 if (ident_start > 0 and body[ident_start - 1] == '.') continue;
+
+                // Skip if this identifier is guarded by an if-statement
+                const is_guarded = blk: {
+                    for (if_guard_identifiers.items, 0..) |guard_ident, idx| {
+                        const guard_depth = if_guard_depths.items[idx];
+                        // Check if we're inside this guard's scope
+                        // For block form: guard_depth <= if_depth
+                        // For statement form (depth >= 1000): always applies until line ends
+                        if (guard_depth >= 1000 or guard_depth <= if_depth) {
+                            if (std.mem.eql(u8, ident, guard_ident)) {
+                                break :blk true;
+                            }
+                        }
+                    }
+                    break :blk false;
+                };
+                if (is_guarded) continue;
 
                 // Check if followed by member access
                 if (i < body.len and body[i] == '.') {
@@ -5074,8 +5161,74 @@ fn extractMemberAccessChainsFromBody(
             saw_arrow = false;
         }
 
+        // Clear statement-form if-guards on semicolon (end of statement)
+        if (c == ';' and func_depth == 0) {
+            while (if_guard_depths.items.len > 0 and
+                if_guard_depths.items[if_guard_depths.items.len - 1] >= 1000)
+            {
+                _ = if_guard_depths.pop();
+                _ = if_guard_identifiers.pop();
+            }
+        }
+
         i += 1;
     }
+}
+
+/// Extracts an identifier from an if-condition if it's a simple truthy check.
+/// Returns the identifier if the condition is:
+/// - Just an identifier: `if (x)`
+/// - Negated null check: `if (x != null)` or `if (x !== null)`
+/// - Negated undefined check: `if (x != undefined)` or `if (x !== undefined)`
+/// Returns null for complex conditions that don't represent a simple nullability guard.
+fn extractIfGuardIdentifier(condition: []const u8) ?[]const u8 {
+    // Skip leading whitespace
+    var i: usize = 0;
+    while (i < condition.len and std.ascii.isWhitespace(condition[i])) : (i += 1) {}
+
+    // Must start with an identifier character
+    if (i >= condition.len) return null;
+    const c = condition[i];
+    if (!std.ascii.isAlphabetic(c) and c != '_' and c != '$') return null;
+
+    // Extract the identifier
+    const ident_start = i;
+    while (i < condition.len and (std.ascii.isAlphanumeric(condition[i]) or condition[i] == '_' or condition[i] == '$')) : (i += 1) {}
+    const ident = condition[ident_start..i];
+
+    // Skip trailing whitespace
+    while (i < condition.len and std.ascii.isWhitespace(condition[i])) : (i += 1) {}
+
+    // If that's the whole condition, it's a simple truthy check
+    if (i >= condition.len) return ident;
+
+    // Check for `!= null`, `!== null`, `!= undefined`, `!== undefined`
+    if (i + 1 < condition.len and condition[i] == '!' and condition[i + 1] == '=') {
+        i += 2;
+        if (i < condition.len and condition[i] == '=') i += 1; // Skip third = in !==
+        while (i < condition.len and std.ascii.isWhitespace(condition[i])) : (i += 1) {}
+
+        // Check for null or undefined
+        const rest = condition[i..];
+        const is_null_check = std.mem.startsWith(u8, rest, "null") and
+            (rest.len == 4 or !std.ascii.isAlphanumeric(rest[4]));
+        const is_undefined_check = std.mem.startsWith(u8, rest, "undefined") and
+            (rest.len == 9 or !std.ascii.isAlphanumeric(rest[9]));
+
+        if (is_null_check or is_undefined_check) {
+            // Skip past the keyword
+            if (is_null_check) {
+                i += 4;
+            } else {
+                i += 9;
+            }
+            while (i < condition.len and std.ascii.isWhitespace(condition[i])) : (i += 1) {}
+            if (i >= condition.len) return ident;
+        }
+    }
+
+    // Complex condition - don't extract
+    return null;
 }
 
 /// Heuristic to determine if a `/` is the start of a regex literal.
