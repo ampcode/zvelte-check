@@ -974,6 +974,59 @@ fn parseTsgoOutput(
     }
 }
 
+/// Checks if a type string represents a top-level union type.
+/// Returns true if '|' appears at depth 0 (outside all brackets).
+/// E.g., "A | B" -> true, "{ x: A | B }" -> false, "{ x: A } | B" -> true
+fn isTopLevelUnionType(type_content: []const u8) bool {
+    var brace_depth: u32 = 0; // { }
+    var paren_depth: u32 = 0; // ( )
+    var angle_depth: u32 = 0; // < >
+    var bracket_depth: u32 = 0; // [ ]
+    var i: usize = 0;
+
+    while (i < type_content.len) {
+        const c = type_content[i];
+
+        // Track bracket depths
+        if (c == '{') brace_depth += 1;
+        if (c == '}') {
+            if (brace_depth > 0) brace_depth -= 1;
+        }
+        if (c == '(') paren_depth += 1;
+        if (c == ')') {
+            if (paren_depth > 0) paren_depth -= 1;
+        }
+        if (c == '<') angle_depth += 1;
+        if (c == '>') {
+            if (angle_depth > 0) angle_depth -= 1;
+        }
+        if (c == '[') bracket_depth += 1;
+        if (c == ']') {
+            if (bracket_depth > 0) bracket_depth -= 1;
+        }
+
+        // Check for ' | ' at depth 0
+        const total_depth = brace_depth + paren_depth + angle_depth + bracket_depth;
+        if (total_depth == 0 and c == '|') {
+            // Check for ' | ' pattern (space-pipe-space)
+            if (i > 0 and i + 1 < type_content.len and
+                type_content[i - 1] == ' ' and type_content[i + 1] == ' ')
+            {
+                return true;
+            }
+        }
+
+        // Stop at the closing quote of the type (end of type content)
+        if (c == '\'' and total_depth == 0 and i > 0) {
+            break;
+        }
+
+        i += 1;
+    }
+
+    return false;
+}
+
 /// Returns true if the error should be skipped.
 /// Some errors are Svelte-specific false positives (only skipped for .svelte files).
 /// Others are general false positives from our code generation.
@@ -1135,20 +1188,22 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
         // Examples (all involve unions, which contain '|'):
         // - "Property 'brand' does not exist on type '{ brand: string } | undefined'"
         // - "Property 'paidData' does not exist on type 'FreeProps | PaidProps'"
-        // Only skip when the type involves a union - simple types like '{}' are real errors.
+        // Only skip when the type involves a TOP-LEVEL union - NOT unions nested inside object types.
+        // E.g., "Property 'error' does not exist on type '{ show: (options: string | ToastOptions) => ... }'"
+        // has '|' inside a function parameter type, which is NOT a top-level union and should be reported.
         if (std.mem.indexOf(u8, message, "does not exist on type '") != null) {
             // Extract the type from the message and check if it's a union type
             // Real errors like "...does not exist on type '{}'." should NOT be skipped
             const type_start = std.mem.indexOf(u8, message, "does not exist on type '");
             if (type_start) |start| {
                 const type_content = message[start + "does not exist on type '".len ..];
-                // Skip if the type contains '|' (union type from narrowing)
-                if (std.mem.indexOf(u8, type_content, " | ") != null) {
-                    return true;
-                }
                 // Skip if the type is '$$Props' - our generated type may be incomplete
                 // (e.g., when using JSDoc instead of TypeScript type annotations)
                 if (std.mem.startsWith(u8, type_content, "$$Props'.")) {
+                    return true;
+                }
+                // Check for top-level union: '|' must appear at depth 0 (outside all brackets)
+                if (isTopLevelUnionType(type_content)) {
                     return true;
                 }
             }

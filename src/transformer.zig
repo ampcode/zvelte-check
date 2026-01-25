@@ -1619,16 +1619,39 @@ fn extractPropsRune(allocator: std.mem.Allocator, content: []const u8, props: *s
 
     // Otherwise, look for destructuring pattern before $props
     // Find the start of the let statement (may span multiple lines for multi-line destructuring)
+    // Track brace/bracket depth to correctly handle semicolons inside type annotations
+    // like `{ id: string; name: string }` which appear between let and $props.
     var let_pos: ?usize = null;
     var search_pos: usize = props_call;
+    var brace_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
+    var angle_depth: u32 = 0;
     while (search_pos > 0) {
         search_pos -= 1;
+        const c = content[search_pos];
+
+        // Track bracket depths (in reverse order, so closing brackets increase depth)
+        if (c == '}') brace_depth += 1;
+        if (c == '{') {
+            if (brace_depth > 0) brace_depth -= 1;
+        }
+        if (c == ']') bracket_depth += 1;
+        if (c == '[') {
+            if (bracket_depth > 0) bracket_depth -= 1;
+        }
+        if (c == '>') angle_depth += 1;
+        if (c == '<') {
+            if (angle_depth > 0) angle_depth -= 1;
+        }
+
         if (search_pos + 3 <= content.len and startsWithKeyword(content[search_pos..], "let")) {
             let_pos = search_pos;
             break;
         }
-        // Only break on semicolon (newlines are fine for multi-line destructuring)
-        if (content[search_pos] == ';') break;
+        // Only break on semicolon at depth 0 (outside any brackets)
+        // Semicolons inside type annotations like `{ id: string; name: string }` should be skipped
+        const total_depth = brace_depth + bracket_depth + angle_depth;
+        if (c == ';' and total_depth == 0) break;
     }
 
     if (let_pos == null) return null;
@@ -1685,11 +1708,11 @@ fn extractPropsRune(allocator: std.mem.Allocator, content: []const u8, props: *s
                 i = skipWhitespace(content, i);
                 // Skip generic type parameter <...> if present (e.g., $bindable<T>(...))
                 if (i < content.len and content[i] == '<') {
-                    var angle_depth: u32 = 1;
+                    var bindable_angle_depth: u32 = 1;
                     i += 1;
-                    while (i < content.len and angle_depth > 0) {
-                        if (content[i] == '<') angle_depth += 1;
-                        if (content[i] == '>') angle_depth -= 1;
+                    while (i < content.len and bindable_angle_depth > 0) {
+                        if (content[i] == '<') bindable_angle_depth += 1;
+                        if (content[i] == '>') bindable_angle_depth -= 1;
                         i += 1;
                     }
                     i = skipWhitespace(content, i);
