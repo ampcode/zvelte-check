@@ -6973,6 +6973,29 @@ fn findIfBranches(
 
     var i: usize = 0;
     while (i < source.len) {
+        // Skip script blocks entirely - {#if} blocks only appear in templates, not scripts.
+        // This avoids false matches from backticks in regex patterns like /`pattern`/g.
+        if (i + 7 <= source.len and std.mem.eql(u8, source[i .. i + 7], "<script")) {
+            // Find the closing </script>
+            const script_end = std.mem.indexOf(u8, source[i + 7 ..], "</script>") orelse {
+                i = source.len;
+                continue;
+            };
+            i += 7 + script_end + 9; // 9 = len("</script>")
+            continue;
+        }
+
+        // Skip style blocks - they don't contain Svelte blocks either.
+        if (i + 6 <= source.len and std.mem.eql(u8, source[i .. i + 6], "<style")) {
+            // Find the closing </style>
+            const style_end = std.mem.indexOf(u8, source[i + 6 ..], "</style>") orelse {
+                i = source.len;
+                continue;
+            };
+            i += 6 + style_end + 8; // 8 = len("</style>")
+            continue;
+        }
+
         // Only skip template literals (backticks) because they can contain ${...} expressions
         // which might have braces that look like {#if}. We DON'T skip single/double quotes
         // because in Svelte templates, quotes in text content (like "it's") are not JS strings.
@@ -14025,4 +14048,113 @@ test "separateImports with real file content" {
     try std.testing.expect(sep.imports.len < 400);
     try std.testing.expect(std.mem.indexOf(u8, sep.imports, "$effect") == null);
     try std.testing.expect(std.mem.indexOf(u8, sep.other, "$effect") != null);
+}
+
+test "@render inside if-guard preserves narrowing" {
+    // Regression test for task 2291: {@render children()} inside {#if children}
+    // should have narrowing applied so children is Snippet, not Snippet | undefined.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\<script lang="ts">
+        \\  let { children }: { children?: import('svelte').Snippet } = $props()
+        \\</script>
+        \\{#if children}
+        \\  {@render children()}
+        \\{/if}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // The {@render children()} should be inside an if(children) block for narrowing
+    // Look for: if (children) { ... void (children()); ... }
+    const has_narrowing = std.mem.indexOf(u8, virtual.content, "if (children)") != null;
+    try std.testing.expect(has_narrowing);
+
+    // Make sure the children() call appears AFTER the if (children) check
+    const if_pos = std.mem.indexOf(u8, virtual.content, "if (children)") orelse unreachable;
+    const children_call_pos = std.mem.indexOf(u8, virtual.content, "children()") orelse {
+        std.debug.print("children() call not found in output\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(children_call_pos > if_pos);
+}
+
+test "@render inside if-guard with nested each and inner if preserves narrowing" {
+    // Regression test for task 2291: exact config-item.svelte pattern
+    // {#if options} containing {#each} with inner {#if} followed by {#if children}
+    // This tests that findIfBranches correctly skips script blocks to avoid
+    // false matches from backticks in regex patterns like /`pattern`/g.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Read the actual test fixture file
+    const file_content = std.fs.cwd().readFileAlloc(allocator, "test-fixtures/config-item.svelte", 100000) catch {
+        return; // Skip if file not found
+    };
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, file_content, "config-item.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // The {@render children()} should be inside an if(children) block for narrowing
+    try std.testing.expect(std.mem.indexOf(u8, virtual.content, "if (children)") != null);
+
+    // Make sure children() call appears AFTER the if (children) check
+    const if_pos = std.mem.indexOf(u8, virtual.content, "if (children)") orelse unreachable;
+    const children_call_pos = std.mem.indexOf(u8, virtual.content, "children()") orelse unreachable;
+    try std.testing.expect(children_call_pos > if_pos);
+}
+
+test "@render inside if-guard with preceding each block preserves narrowing" {
+    // Regression test for task 2291: {@render children()} inside {#if children}
+    // after a preceding {#each} block should still have narrowing applied.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // This simulates the config-item.svelte pattern where {#if children} comes after {#if options} + {#each}
+    const source =
+        \\<script lang="ts">
+        \\  let { items, children }: { items?: string[], children?: import('svelte').Snippet } = $props()
+        \\</script>
+        \\{#if items}
+        \\  {#each items as item}
+        \\    <span>{item}</span>
+        \\  {/each}
+        \\{/if}
+        \\{#if children}
+        \\  {@render children()}
+        \\{/if}
+    ;
+
+    const Parser = @import("svelte_parser.zig").Parser;
+    var parser = Parser.init(allocator, source, "Test.svelte");
+    const ast = try parser.parse();
+
+    const virtual = try transform(allocator, ast);
+
+    // The {@render children()} should be inside an if(children) block for narrowing
+    const has_narrowing = std.mem.indexOf(u8, virtual.content, "if (children)") != null;
+    try std.testing.expect(has_narrowing);
+
+    // Make sure children() call appears AFTER the if (children) check
+    const if_pos = std.mem.indexOf(u8, virtual.content, "if (children)") orelse {
+        std.debug.print("if (children) not found\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    const children_call_pos = std.mem.indexOf(u8, virtual.content, "children()") orelse {
+        std.debug.print("children() call not found in output\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(children_call_pos > if_pos);
 }
