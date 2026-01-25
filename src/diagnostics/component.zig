@@ -1327,6 +1327,8 @@ fn extractReactiveVariables(
 }
 
 /// Extract simple identifiers from a destructuring pattern like { a, b, c: d }
+/// Note: Rest patterns (...rest) are NOT extracted - they create plain objects
+/// from $props(), not reactive state that loses reactivity when captured.
 fn extractDestructuredNames(
     allocator: std.mem.Allocator,
     pattern: []const u8,
@@ -1340,6 +1342,17 @@ fn extractDestructuredNames(
         // Skip braces and whitespace
         if (c == '{' or c == '}' or std.ascii.isWhitespace(c) or c == ',') {
             i += 1;
+            continue;
+        }
+
+        // Skip rest patterns (...identifier) - these create plain objects from $props(),
+        // not reactive state. Accessing props.foo is valid and doesn't lose reactivity.
+        if (c == '.' and i + 2 < pattern.len and pattern[i + 1] == '.' and pattern[i + 2] == '.') {
+            i += 3;
+            // Skip whitespace after ...
+            while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
+            // Skip the identifier itself
+            while (i < pattern.len and isIdentChar(pattern[i])) : (i += 1) {}
             continue;
         }
 
@@ -2723,6 +2736,30 @@ test "state_referenced_locally: props with renamed destructuring" {
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings("state_referenced_locally", diagnostics.items[0].code.?);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "pageData") != null);
+}
+
+test "state_referenced_locally: rest pattern from $props is not reactive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let { foo, ...props } = $props()
+        \\const handler = props.handleClick
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Rest pattern (...props) from $props() creates a plain object, not reactive state.
+    // Accessing props.handleClick is valid and doesn't lose reactivity.
+    // Only 'foo' should be tracked as reactive, but we're not referencing it.
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
 test "state_referenced_locally: multiline $derived.by is valid" {
