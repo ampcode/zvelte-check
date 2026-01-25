@@ -1590,6 +1590,11 @@ fn findStateReferencedLocally(
 
                 // Check if RHS contains a reactive variable reference
                 if (findReactiveReference(rhs, reactive_vars)) |ref_info| {
+                    // Check for svelte-ignore comment on preceding lines
+                    if (hasSvelteIgnore(content, decl_start, "state_referenced_locally")) {
+                        continue;
+                    }
+
                     const ref_pos = rhs_start + ref_info.offset;
                     const loc = computeLineCol(source, base_offset + @as(u32, @intCast(ref_pos)));
                     try diagnostics.append(allocator, .{
@@ -1618,6 +1623,77 @@ fn findStateReferencedLocally(
 
         i += 1;
     }
+}
+
+/// Check if there's a svelte-ignore comment for the given code on the preceding line(s).
+/// Scans backward from `pos` to find `// svelte-ignore code` or `/* svelte-ignore code */` comments.
+fn hasSvelteIgnore(content: []const u8, pos: usize, code: []const u8) bool {
+    // Find the start of the current line
+    var line_start = pos;
+    while (line_start > 0 and content[line_start - 1] != '\n') {
+        line_start -= 1;
+    }
+
+    // Scan backward through preceding lines looking for svelte-ignore comments
+    // Stop at blank lines or non-comment content
+    var scan_pos = line_start;
+    while (scan_pos > 0) {
+        // Find start of preceding line
+        const prev_line_end = scan_pos - 1; // Skip the \n
+        var prev_line_start = prev_line_end;
+        while (prev_line_start > 0 and content[prev_line_start - 1] != '\n') {
+            prev_line_start -= 1;
+        }
+
+        const line = std.mem.trim(u8, content[prev_line_start..prev_line_end], " \t\r");
+
+        // Empty line stops the search
+        if (line.len == 0) break;
+
+        // Check for single-line comment: // svelte-ignore code
+        if (std.mem.startsWith(u8, line, "//")) {
+            const comment_content = std.mem.trimLeft(u8, line[2..], " \t");
+            if (commentContainsSvelteIgnore(comment_content, code)) {
+                return true;
+            }
+        }
+
+        // Check for block comment: /* svelte-ignore code */
+        if (std.mem.startsWith(u8, line, "/*") and std.mem.endsWith(u8, line, "*/")) {
+            const comment_content = std.mem.trimLeft(u8, line[2 .. line.len - 2], " \t");
+            if (commentContainsSvelteIgnore(comment_content, code)) {
+                return true;
+            }
+        }
+
+        // If the line is not a comment, stop searching
+        if (!std.mem.startsWith(u8, line, "//") and !std.mem.startsWith(u8, line, "/*")) {
+            break;
+        }
+
+        scan_pos = prev_line_start;
+    }
+
+    return false;
+}
+
+/// Check if a comment body contains `svelte-ignore <code>`.
+fn commentContainsSvelteIgnore(comment: []const u8, target_code: []const u8) bool {
+    const prefix = "svelte-ignore";
+    if (!std.mem.startsWith(u8, comment, prefix)) return false;
+
+    const rest = comment[prefix.len..];
+    if (rest.len == 0) return false;
+    if (!std.ascii.isWhitespace(rest[0])) return false;
+
+    // Parse space-separated codes
+    var iter = std.mem.tokenizeAny(u8, rest, " \t");
+    while (iter.next()) |ignored_code| {
+        if (std.mem.eql(u8, ignored_code, target_code)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 const RefInfo = struct {
@@ -2729,4 +2805,77 @@ test "state_referenced_locally: props with object type annotation" {
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings("state_referenced_locally", diagnostics.items[0].code.?);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "flag") != null);
+}
+
+test "state_referenced_locally: svelte-ignore suppresses warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let count = $state(0)
+        \\
+        \\// svelte-ignore state_referenced_locally
+        \\const captured = count
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should have no warnings - suppressed by svelte-ignore
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "state_referenced_locally: svelte-ignore with wrong code does not suppress" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let count = $state(0)
+        \\
+        \\// svelte-ignore other_code
+        \\const captured = count
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should warn - wrong ignore code
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("state_referenced_locally", diagnostics.items[0].code.?);
+}
+
+test "state_referenced_locally: block comment svelte-ignore suppresses warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source =
+        \\<script lang="ts">
+        \\let count = $state(0)
+        \\
+        \\/* svelte-ignore state_referenced_locally */
+        \\const captured = count
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should have no warnings - suppressed by svelte-ignore
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
