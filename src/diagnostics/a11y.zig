@@ -684,11 +684,18 @@ fn isNativeInteractiveElement(tag: []const u8) bool {
 }
 
 fn isInteractiveRole(role: []const u8) bool {
+    // Widget roles that are interactive and require focusability
+    // Includes both simple widget roles and composite widget roles
     const interactive_roles = [_][]const u8{
+        // Simple widget roles
         "button",           "checkbox",      "link",       "menuitem",
         "menuitemcheckbox", "menuitemradio", "option",     "radio",
         "searchbox",        "slider",        "spinbutton", "switch",
-        "tab",              "textbox",       "treeitem",
+        "tab",              "textbox",       "treeitem",   "scrollbar",
+        // Composite widget roles (containers that manage focus)
+        "combobox",         "grid",          "listbox",    "menu",
+        "menubar",          "radiogroup",    "tablist",    "tree",
+        "treegrid",
     };
     for (interactive_roles) |r| {
         if (std.mem.eql(u8, role, r)) return true;
@@ -1904,4 +1911,76 @@ test "issue #15: spread attributes prevent false positives" {
             try std.testing.expect(!std.mem.eql(u8, code, "a11y_missing_attribute"));
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Issue #16: listbox role requires focus support
+// ----------------------------------------------------------------------------
+// Elements with role="listbox" must be focusable (have tabindex).
+
+test "issue #16: listbox role without tabindex warns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<div role=\"listbox\">Options</div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    var found = false;
+    for (diagnostics.items) |d| {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y_interactive_supports_focus")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "issue #16: listbox role with tabindex is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<div role=\"listbox\" tabindex=\"0\">Options</div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // Should not warn when tabindex is present
+    for (diagnostics.items) |d| {
+        if (d.code) |code| {
+            try std.testing.expect(!std.mem.eql(u8, code, "a11y_interactive_supports_focus"));
+        }
+    }
+}
+
+test "issue #16: grid role without tabindex warns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    const source = "<div role=\"grid\">Grid</div>";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    var found = false;
+    for (diagnostics.items) |d| {
+        if (d.code != null and std.mem.eql(u8, d.code.?, "a11y_interactive_supports_focus")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }
