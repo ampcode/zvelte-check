@@ -23,6 +23,7 @@ pub const source_map = @import("source_map.zig");
 pub const output = @import("output.zig");
 pub const Diagnostic = @import("diagnostic.zig").Diagnostic;
 pub const sveltekit = @import("sveltekit.zig");
+pub const sveltekit_routes = @import("sveltekit_routes.zig");
 
 /// Result of processing a single file
 const FileResult = struct {

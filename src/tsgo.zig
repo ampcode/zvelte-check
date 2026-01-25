@@ -10,6 +10,7 @@ const VirtualFile = @import("transformer.zig").VirtualFile;
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
 const SourceMap = @import("source_map.zig").SourceMap;
 const LineTable = @import("source_map.zig").LineTable;
+const sveltekit_routes = @import("sveltekit_routes.zig");
 
 const stub_dir = ".zvelte-check";
 const generated_tsconfig = stub_dir ++ "/tsconfig.json";
@@ -124,6 +125,13 @@ fn findTsgoBinary(allocator: std.mem.Allocator, workspace_path: []const u8) ![]c
     return "tsgo";
 }
 
+/// Represents a transformed SvelteKit route file (.ts)
+const TransformedRouteFile = struct {
+    original_path: []const u8, // Original .ts file path
+    transformed_path: []const u8, // Path where transformed content is written
+    content: []const u8, // Transformed content
+};
+
 pub fn check(
     allocator: std.mem.Allocator,
     virtual_files: []const VirtualFile,
@@ -148,6 +156,17 @@ pub fn check(
     }
     errdefer cleanupWrittenFiles(written_files.items);
 
+    // Track transformed route files
+    var transformed_routes: std.ArrayList(TransformedRouteFile) = .empty;
+    defer {
+        for (transformed_routes.items) |tf| {
+            allocator.free(tf.content);
+            allocator.free(tf.transformed_path);
+            allocator.free(tf.original_path);
+        }
+        transformed_routes.deinit(allocator);
+    }
+
     // Write transformed .svelte.ts files alongside original .svelte files.
     // This allows TypeScript to find them via normal module resolution, even for
     // imports from referenced monorepo packages.
@@ -162,11 +181,14 @@ pub fn check(
         try file.writeAll(vf.content);
     }
 
+    // Find and transform SvelteKit route .ts files
+    try findAndTransformRouteFiles(allocator, workspace_dir, workspace_path, &transformed_routes, &written_files);
+
     // Write SvelteKit ambient type stubs
     try writeSvelteKitStubs(workspace_dir);
 
     // Generate tsconfig that extends project config and includes only our files
-    try writeGeneratedTsconfig(workspace_dir, tsconfig_path, virtual_files);
+    try writeGeneratedTsconfig(workspace_dir, tsconfig_path, virtual_files, transformed_routes.items);
 
     // Find tsgo binary: walk up from workspace looking for node_modules/.bin, then PATH
     const tsgo_path = try findTsgoBinary(allocator, workspace_path);
@@ -213,7 +235,15 @@ pub fn check(
     const stdout = stdout_buf.items;
     const stderr = stderr_buf.items;
 
-    // Clean up generated files
+    // Restore original route files that were temporarily transformed
+    for (transformed_routes.items) |tf| {
+        // tf.content now contains the ORIGINAL content that we saved before transformation
+        const file = std.fs.cwd().createFile(tf.original_path, .{}) catch continue;
+        defer file.close();
+        file.writeAll(tf.content) catch {};
+    }
+
+    // Clean up generated .svelte.ts files
     cleanupWrittenFiles(written_files.items);
     cleanupStubDir(workspace_dir);
 
@@ -277,6 +307,17 @@ fn stripWorkspacePrefix(path: []const u8, workspace_path: []const u8) []const u8
     return if (skip_len < path.len) path[skip_len..] else path;
 }
 
+/// Extracts the workspace path from a stub directory path.
+/// Stub path is like /path/to/workspace/.zvelte-check/src/routes/+page.server.ts
+/// Returns /path/to/workspace
+fn getWorkspaceFromStubDir(stub_path: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, stub_path, stub_dir)) |idx| {
+        // Return everything before /.zvelte-check
+        if (idx > 0) return stub_path[0 .. idx - 1];
+    }
+    return stub_path;
+}
+
 /// Cleans up the stub directory containing tsconfig and stubs.d.ts.
 fn cleanupStubDir(workspace_dir: std.fs.Dir) void {
     workspace_dir.deleteTree(stub_dir) catch {};
@@ -311,6 +352,7 @@ fn writeGeneratedTsconfig(
     workspace_dir: std.fs.Dir,
     tsconfig_path: ?[]const u8,
     virtual_files: []const VirtualFile,
+    transformed_routes: []const TransformedRouteFile,
 ) !void {
     const file = try workspace_dir.createFile(generated_tsconfig, .{});
     defer file.close();
@@ -368,13 +410,109 @@ fn writeGeneratedTsconfig(
         try w.writeAll("\"");
     }
 
+    // Include transformed route files
+    for (transformed_routes) |tf| {
+        try w.writeAll(",\n    \"");
+        try w.writeAll(tf.transformed_path);
+        try w.writeAll("\"");
+    }
+
     try w.writeAll("\n  ],\n");
 
     // Exclude node_modules
-    try w.writeAll("  \"exclude\": [\"../node_modules\"]");
+    // Note: we don't need to exclude transformed route files anymore since we overwrite them in-place
+    try w.writeAll("  \"exclude\": [\"../node_modules\"]\n");
     try w.writeAll("}\n");
 
     try w.flush();
+}
+
+/// Finds and transforms SvelteKit route .ts files in the workspace.
+/// Transformed files are written to the stub directory and tracked for cleanup.
+fn findAndTransformRouteFiles(
+    allocator: std.mem.Allocator,
+    workspace_dir: std.fs.Dir,
+    workspace_path: []const u8,
+    transformed_routes: *std.ArrayList(TransformedRouteFile),
+    written_files: *std.ArrayList([]const u8),
+) !void {
+    // Walk src/routes directory looking for SvelteKit route files
+    const src_routes_path = "src/routes";
+    var routes_dir = workspace_dir.openDir(src_routes_path, .{ .iterate = true }) catch return;
+    defer routes_dir.close();
+
+    try walkRouteDirectory(allocator, routes_dir, workspace_dir, workspace_path, src_routes_path, transformed_routes, written_files);
+}
+
+/// Recursively walks a directory looking for SvelteKit route .ts files
+fn walkRouteDirectory(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    workspace_dir: std.fs.Dir,
+    workspace_path: []const u8,
+    current_path: []const u8,
+    transformed_routes: *std.ArrayList(TransformedRouteFile),
+    written_files: *std.ArrayList([]const u8),
+) !void {
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                // Skip node_modules etc.
+                if (std.mem.eql(u8, entry.name, "node_modules")) continue;
+                if (std.mem.eql(u8, entry.name, ".git")) continue;
+
+                const subdir_path = try std.fs.path.join(allocator, &.{ current_path, entry.name });
+                defer allocator.free(subdir_path);
+
+                var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
+                defer subdir.close();
+
+                try walkRouteDirectory(allocator, subdir, workspace_dir, workspace_path, subdir_path, transformed_routes, written_files);
+            },
+            .file => {
+                // Check if this is a SvelteKit route file that needs transformation
+                const kind = sveltekit_routes.getRouteFileKind(entry.name);
+                if (kind == .none) continue;
+
+                // Read the file
+                const file_path = try std.fs.path.join(allocator, &.{ current_path, entry.name });
+                defer allocator.free(file_path);
+
+                const source = workspace_dir.readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch |err| {
+                    std.log.debug("Failed to read route file {s}: {}", .{ file_path, err });
+                    continue;
+                };
+
+                // Full path for diagnostics (absolute path)
+                const full_path = try std.fs.path.join(allocator, &.{ workspace_path, file_path });
+                defer allocator.free(full_path);
+
+                // Transform the file
+                const transformed = try sveltekit_routes.transformRouteFile(allocator, source, entry.name);
+                if (transformed) |content| {
+                    defer allocator.free(content); // Free the transformed content after writing
+
+                    // Write transformed file IN-PLACE (overwrite original temporarily)
+                    // This ensures TypeScript sees the transformed version since we include ../src/**/*.ts
+                    const file = try workspace_dir.createFile(file_path, .{});
+                    defer file.close();
+                    try file.writeAll(content);
+
+                    // Track transformed route info (for restoring originals)
+                    // Note: we keep source in memory so we can restore it later
+                    try transformed_routes.append(allocator, .{
+                        .original_path = try allocator.dupe(u8, full_path),
+                        .transformed_path = try allocator.dupe(u8, full_path), // Same as original
+                        .content = source, // Keep original content for restoration (don't free)
+                    });
+                } else {
+                    allocator.free(source);
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 /// Writes SvelteKit virtual module type stubs to the workspace.
@@ -1612,7 +1750,8 @@ test "writeGeneratedTsconfig generates valid config" {
     }};
 
     // Test with no project tsconfig (empty string as workspace path since paths are already relative)
-    try writeGeneratedTsconfig(workspace_dir, null, &virtual_files);
+    const empty_routes: []const TransformedRouteFile = &.{};
+    try writeGeneratedTsconfig(workspace_dir, null, &virtual_files, empty_routes);
 
     // Read generated config
     const content = try workspace_dir.readFileAlloc(allocator, generated_tsconfig, 10 * 1024);
@@ -1654,7 +1793,8 @@ test "writeGeneratedTsconfig extends project config when available" {
     }};
 
     // Test with project tsconfig auto-detection (empty string as workspace path since paths are already relative)
-    try writeGeneratedTsconfig(workspace_dir, null, &virtual_files);
+    const empty_routes: []const TransformedRouteFile = &.{};
+    try writeGeneratedTsconfig(workspace_dir, null, &virtual_files, empty_routes);
 
     // Read generated config
     const content = try workspace_dir.readFileAlloc(allocator, generated_tsconfig, 10 * 1024);
