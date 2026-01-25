@@ -1540,10 +1540,8 @@ fn findStateReferencedLocally(
                 i += 1;
                 i = skipWhitespace(content, i);
 
-                // Skip if RHS is a reactive rune ($state, $derived, $props)
-                // These are declarations, not captures
-                if (startsWithKeyword(content[i..], "$state") or
-                    startsWithKeyword(content[i..], "$derived") or
+                // $derived and $props preserve reactivity - skip them entirely
+                if (startsWithKeyword(content[i..], "$derived") or
                     startsWithKeyword(content[i..], "$props"))
                 {
                     // Skip to end of statement, properly handling multiline expressions
@@ -1562,6 +1560,83 @@ fn findStateReferencedLocally(
                         if (sc == '(') skip_paren_depth += 1;
                         if (sc == ')' and skip_paren_depth > 0) skip_paren_depth -= 1;
                         // Only stop at statement end when not inside nested constructs
+                        if (skip_brace_depth == 0 and skip_paren_depth == 0 and (sc == ';' or sc == '\n')) break;
+                        i += 1;
+                    }
+                    continue;
+                }
+
+                // $state(initialValue) captures the initial value - check for reactive refs
+                // Also handle $state.raw(initialValue)
+                if (startsWithKeyword(content[i..], "$state")) {
+                    var state_i = i + 6; // skip "$state"
+                    // Skip .raw if present
+                    if (state_i < content.len and content[state_i] == '.') {
+                        state_i += 1;
+                        if (state_i + 3 <= content.len and std.mem.eql(u8, content[state_i..][0..3], "raw")) {
+                            state_i += 3;
+                        } else {
+                            // $state.snapshot() - skip, doesn't capture
+                            i = decl_start + 1;
+                            continue;
+                        }
+                    }
+                    state_i = skipWhitespace(content, state_i);
+
+                    if (state_i < content.len and content[state_i] == '(') {
+                        // Extract arguments to $state()
+                        const args_start = state_i + 1;
+                        var args_paren: u32 = 1;
+                        var args_i = args_start;
+                        while (args_i < content.len and args_paren > 0) {
+                            const ac = content[args_i];
+                            if (ac == '"' or ac == '\'' or ac == '`') {
+                                args_i = skipString(content, args_i);
+                                continue;
+                            }
+                            if (ac == '(') args_paren += 1;
+                            if (ac == ')') args_paren -= 1;
+                            args_i += 1;
+                        }
+                        const args_end = if (args_paren == 0) args_i - 1 else args_i;
+                        const args = content[args_start..args_end];
+
+                        // Check if args contain reactive variable reference
+                        if (findReactiveReference(args, reactive_vars)) |ref_info| {
+                            if (!hasSvelteIgnore(content, decl_start, "state_referenced_locally")) {
+                                const ref_pos = args_start + ref_info.offset;
+                                const loc = computeLineCol(source, base_offset + @as(u32, @intCast(ref_pos)));
+                                try diagnostics.append(allocator, .{
+                                    .source = .svelte,
+                                    .severity = .warning,
+                                    .code = "state_referenced_locally",
+                                    .message = try std.fmt.allocPrint(
+                                        allocator,
+                                        "This reference only captures the initial value of `{s}`. Did you mean to reference it inside a closure instead?\nhttps://svelte.dev/e/state_referenced_locally",
+                                        .{ref_info.name},
+                                    ),
+                                    .file_path = file_path,
+                                    .start_line = loc.line,
+                                    .start_col = loc.col,
+                                    .end_line = loc.line,
+                                    .end_col = loc.col + @as(u32, @intCast(ref_info.name.len)),
+                                });
+                            }
+                        }
+                    }
+                    // Skip to end of statement
+                    var skip_brace_depth: u32 = 0;
+                    var skip_paren_depth: u32 = 0;
+                    while (i < content.len) {
+                        const sc = content[i];
+                        if (sc == '"' or sc == '\'' or sc == '`') {
+                            i = skipString(content, i);
+                            continue;
+                        }
+                        if (sc == '{') skip_brace_depth += 1;
+                        if (sc == '}' and skip_brace_depth > 0) skip_brace_depth -= 1;
+                        if (sc == '(') skip_paren_depth += 1;
+                        if (sc == ')' and skip_paren_depth > 0) skip_paren_depth -= 1;
                         if (skip_brace_depth == 0 and skip_paren_depth == 0 and (sc == ';' or sc == '\n')) break;
                         i += 1;
                     }
