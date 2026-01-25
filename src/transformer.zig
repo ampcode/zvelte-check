@@ -8079,6 +8079,11 @@ fn emitSnippetBodyExpressions(
     has_expressions: *bool,
     parent_branches_open: usize,
 ) !void {
+    // parent_branches_open is no longer used since we don't apply outer enclosing branches
+    // to snippet bodies. Snippets are functions that can be called at any time, so the
+    // enclosing if conditions at the definition site don't apply at call time.
+    _ = parent_branches_open;
+
     // Unified item type for all snippet body items - enables source-order emission.
     // Processing items in source order ensures bindings are in scope when expressions use them.
     const ComponentInfo = struct { data_index: u32, node_start: u32, has_children: bool };
@@ -8219,13 +8224,10 @@ fn emitSnippetBodyExpressions(
 
     try output.appendSlice(allocator, ") => {\n");
 
-    // Find if branches that ENCLOSE the snippet definition itself.
-    // These outer conditions must be applied to all expressions inside the snippet
-    // for proper discriminated union narrowing.
-    // emitIfConditionOpenersIndented handles {:else if} branches correctly by emitting
-    // proper if/else if chains like `if (prior) {} else if (cond) { ... }`.
-    var outer_enclosing = try findAllEnclosingIfBranches(allocator, range.snippet_start, if_branches);
-    defer outer_enclosing.deinit(allocator);
+    // Note: We intentionally do NOT apply outer enclosing if branches to snippet bodies.
+    // Snippets are functions that can be called at any time by the parent component.
+    // Even though a snippet may be defined inside {#if condition}, the parent can
+    // call the snippet when the condition is false. This matches svelte-check behavior.
 
     // Filter if_branches to only those entirely within this snippet's body range.
     // We only want branches where both body_start and body_end are within the snippet.
@@ -8276,40 +8278,11 @@ fn emitSnippetBodyExpressions(
         var inner_enclosing = try findAllEnclosingIfBranches(allocator, item_offset, snippet_branches.items);
         defer inner_enclosing.deinit(allocator);
 
-        // Combine outer + inner branches for full context.
-        // The snippet IIFE creates a new function scope, which resets TypeScript's
-        // control flow narrowing. However, since the IIFE is textually inside any
-        // still-open parent branches, we skip re-emitting those.
-        var combined_branches: std.ArrayList(IfBranch) = .empty;
-        defer combined_branches.deinit(allocator);
-
-        // Skip branches that are already open in the parent scope.
-        // If we skip some but not all, and the next branch has prior_conditions
-        // from the skipped branches, we're in the middle of an if/else chain
-        // and should skip those too (same logic as in html_element handler).
-        var branches_to_skip = @min(parent_branches_open, outer_enclosing.items.len);
-        if (branches_to_skip > 0 and branches_to_skip < outer_enclosing.items.len) {
-            const skipped_branch = outer_enclosing.items[branches_to_skip - 1];
-            const next_branch = outer_enclosing.items[branches_to_skip];
-            for (next_branch.prior_conditions) |prior_cond| {
-                if (skipped_branch.condition) |skipped_cond| {
-                    if (std.mem.eql(u8, prior_cond, skipped_cond)) {
-                        // The next branch is part of the same if/else chain - skip it too
-                        branches_to_skip = outer_enclosing.items.len;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Add remaining outer branches (those not already established by parent scope)
-        if (branches_to_skip < outer_enclosing.items.len) {
-            try combined_branches.appendSlice(allocator, outer_enclosing.items[branches_to_skip..]);
-        }
-        try combined_branches.appendSlice(allocator, inner_enclosing.items);
-
-        // Use NarrowingContext to manage scope
-        try narrowing_ctx.ensureOpen(output, combined_branches.items);
+        // Only use inner branches - DO NOT include outer enclosing branches.
+        // Snippets are functions that can be called at any time by the parent component.
+        // Use NarrowingContext to manage scope - only with inner branches.
+        // See note above about not applying outer enclosing branches.
+        try narrowing_ctx.ensureOpen(output, inner_enclosing.items);
 
         switch (item) {
             .each_binding => |binding| {

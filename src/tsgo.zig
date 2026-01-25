@@ -1110,20 +1110,10 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Object is possibly 'null'" and "is possibly 'undefined'" errors for template code.
-        // These are false positives from generated template bindings where we lose type narrowing:
-        // 1. Nested {#if} blocks where inner blocks can't access outer narrowing
-        // 2. Template attribute expressions (e.g., onclick={handler} where handler is narrowed)
-        // 3. Complex discriminated unions (task 1532)
-        //
-        // Script code should still report these errors - they're legitimate type errors there.
-        if (!is_from_script) {
-            if (std.mem.indexOf(u8, message, "is possibly 'null'") != null or
-                std.mem.indexOf(u8, message, "is possibly 'undefined'") != null)
-            {
-                return true;
-            }
-        }
+        // NOTE: Previously we filtered "is possibly 'null'" and "is possibly 'undefined'" errors
+        // for template code. This was because snippets incorrectly applied outer narrowing.
+        // Now that snippets no longer apply outer enclosing if-conditions, we report these errors.
+        // These are real null-safety errors that svelte-check correctly reports.
 
         // Skip "Cannot use namespace 'X' as a type" errors
         // False positives from libraries like bits-ui
@@ -1225,12 +1215,10 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Type 'X | undefined' is not assignable to type 'X'" errors from template narrowing.
-        // Inside {#if x} blocks, Svelte narrows x to non-undefined, but our transformer emits
-        // bindings at module scope without that narrowing context.
-        if (std.mem.indexOf(u8, message, "| undefined' is not assignable to type") != null) {
-            return true;
-        }
+        // NOTE: Previously we filtered "| undefined' is not assignable to type" errors, but this
+        // caused false negatives for null-safety errors that svelte-check correctly reports.
+        // The original filter was added because snippet bodies incorrectly applied outer narrowing.
+        // Now that snippets no longer apply outer enclosing if-conditions, we report these errors.
 
         // Skip "Property X does not exist on type 'string'" errors.
         // False positives from {#each} loop variable shadowing: when multiple {#each} loops
