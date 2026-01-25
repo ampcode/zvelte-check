@@ -1267,20 +1267,12 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Parameter 'X' implicitly has an 'any' type" errors for callback parameters.
-        // When $props() returns any (e.g., SvelteKit pages without explicit types), expressions
-        // like `data.entitlements.toSorted((a, b) => ...)` have callback parameters that can't
-        // be inferred. This is a cascade error - the root cause is the untyped $props().
-        // svelte-check integrates with SvelteKit's generated types to avoid this; we filter it.
-        // Filter for all Svelte files because:
-        // 1. Template callbacks are always false positives due to missing type context
-        // 2. Script callbacks with true implicit any should type the parameters explicitly
-        // 3. svelte-check doesn't report these errors for SvelteKit pages
-        if (std.mem.startsWith(u8, message, "Parameter '") and
-            std.mem.indexOf(u8, message, "' implicitly has an 'any' type") != null)
-        {
-            return true;
-        }
+        // NOTE: We used to skip "Parameter 'X' implicitly has an 'any' type" errors for
+        // callback parameters, thinking they were cascade errors from untyped $props().
+        // However, svelte-check DOES report these errors (verified with apply_patch-tool-use.svelte
+        // which has `files.reduce((sum, file) => ...)` where `files` is `any[]`).
+        // These are legitimate type errors that users should fix by adding explicit type annotations
+        // to callback parameters. See comment at end of shouldSkipError for more context.
 
         // Skip "Element implicitly has an 'any' type because expression of type 'any'" errors.
         // When $props() returns any (e.g., SvelteKit pages without explicit types), expressions
