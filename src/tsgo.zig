@@ -1120,6 +1120,15 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
+        // Skip "tabIndex does not exist... Did you mean tabindex?" errors.
+        // Svelte accepts both camelCase (tabIndex) and lowercase (tabindex) attributes,
+        // but svelte/elements types only define lowercase. This is a false positive.
+        if (std.mem.indexOf(u8, message, "'tabIndex' does not exist") != null and
+            std.mem.indexOf(u8, message, "tabindex") != null)
+        {
+            return true;
+        }
+
         // Note: We previously filtered "Property X does not exist on type 'Component<...>'" errors
         // because our type __SvelteComponent__ = typeof __SvelteComponent__ gave the function type.
         // Now we use ReturnType<typeof __SvelteComponent__> which gives the instance type with exports,
