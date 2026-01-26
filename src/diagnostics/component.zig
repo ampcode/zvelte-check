@@ -1233,8 +1233,191 @@ fn checkStateReferencedLocally(
 
     if (reactive_vars.count() == 0) return;
 
-    // Step 2: Find top-level const/let declarations that reference these reactive vars
-    try findStateReferencedLocally(allocator, script_content, script.content_start, ast.source, ast.file_path, &reactive_vars, diagnostics);
+    // Step 2: Find $effect blocks that sync state from props (e.g., `$effect(() => { stateVar = propVar })`)
+    // This is a valid pattern where initial capture is intentional.
+    var synced_pairs: std.ArrayList(SyncPair) = .empty;
+    defer synced_pairs.deinit(allocator);
+    try findEffectSyncPairs(allocator, script_content, &synced_pairs);
+
+    // Step 3: Find top-level const/let declarations that reference these reactive vars
+    try findStateReferencedLocally(allocator, script_content, script.content_start, ast.source, ast.file_path, &reactive_vars, &synced_pairs, diagnostics);
+}
+
+/// Represents a state variable being synced from a prop in an $effect.
+const SyncPair = struct {
+    state_var: []const u8,
+    prop_var: []const u8,
+};
+
+/// Finds `$effect(() => { stateVar = propVar ... })` patterns where state is synced from props.
+fn findEffectSyncPairs(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    pairs: *std.ArrayList(SyncPair),
+) !void {
+    var i: usize = 0;
+
+    while (i < content.len) {
+        const c = content[i];
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(content, i);
+            continue;
+        }
+
+        // Skip comments
+        if (c == '/' and i + 1 < content.len) {
+            if (content[i + 1] == '/') {
+                while (i < content.len and content[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (content[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < content.len) {
+                    if (content[i] == '*' and content[i + 1] == '/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // Look for $effect keyword
+        if (startsWithKeyword(content[i..], "$effect")) {
+            const effect_start = i;
+            i += 7; // skip "$effect"
+
+            // Skip .pre if present
+            if (i < content.len and content[i] == '.') {
+                i += 1;
+                while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+            }
+            i = skipWhitespace(content, i);
+
+            // Expect (
+            if (i >= content.len or content[i] != '(') {
+                i = effect_start + 1;
+                continue;
+            }
+            i += 1;
+            i = skipWhitespace(content, i);
+
+            // Expect () => or function
+            // Skip arrow function params: () =>
+            if (i < content.len and content[i] == '(') {
+                var param_depth: u32 = 1;
+                i += 1;
+                while (i < content.len and param_depth > 0) : (i += 1) {
+                    if (content[i] == '(') param_depth += 1;
+                    if (content[i] == ')') param_depth -= 1;
+                }
+                i = skipWhitespace(content, i);
+
+                // Expect =>
+                if (i + 1 < content.len and content[i] == '=' and content[i + 1] == '>') {
+                    i += 2;
+                    i = skipWhitespace(content, i);
+                }
+            }
+
+            // Find the effect body (could be { ... } or a single expression)
+            if (i >= content.len) continue;
+
+            var body_start: usize = i;
+            var body_end: usize = i;
+
+            if (content[i] == '{') {
+                // Block body - find matching }
+                var body_depth: u32 = 1;
+                i += 1;
+                body_start = i;
+                while (i < content.len and body_depth > 0) {
+                    const bc = content[i];
+                    if (bc == '"' or bc == '\'' or bc == '`') {
+                        i = skipString(content, i);
+                        continue;
+                    }
+                    if (bc == '{') body_depth += 1;
+                    if (bc == '}') body_depth -= 1;
+                    if (body_depth > 0) i += 1;
+                }
+                body_end = i;
+            }
+
+            // Extract assignments from effect body: stateVar = propVar
+            const body = content[body_start..body_end];
+            try extractAssignmentPairs(allocator, body, pairs);
+
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Extract `stateVar = propVar` patterns from effect body.
+fn extractAssignmentPairs(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    pairs: *std.ArrayList(SyncPair),
+) !void {
+    var i: usize = 0;
+
+    while (i < body.len) {
+        const c = body[i];
+
+        // Skip strings
+        if (c == '"' or c == '\'' or c == '`') {
+            i = skipString(body, i);
+            continue;
+        }
+
+        // Look for identifier followed by = (but not == or =>)
+        if (isIdentStart(c)) {
+            const lhs_start = i;
+            while (i < body.len and isIdentChar(body[i])) : (i += 1) {}
+            const lhs = body[lhs_start..i];
+
+            i = skipWhitespace(body, i);
+
+            // Check for = but not == or =>
+            if (i < body.len and body[i] == '=' and
+                (i + 1 >= body.len or (body[i + 1] != '=' and body[i + 1] != '>')))
+            {
+                i += 1;
+                i = skipWhitespace(body, i);
+
+                // Extract RHS identifier
+                if (i < body.len and isIdentStart(body[i])) {
+                    const rhs_start = i;
+                    while (i < body.len and isIdentChar(body[i])) : (i += 1) {}
+                    const rhs = body[rhs_start..i];
+
+                    // Record this as a sync pair
+                    try pairs.append(allocator, .{
+                        .state_var = lhs,
+                        .prop_var = rhs,
+                    });
+                }
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Check if a (stateVar, propVar) pair is synced in an $effect.
+fn isSyncedInEffect(state_var: []const u8, prop_var: []const u8, synced_pairs: *const std.ArrayList(SyncPair)) bool {
+    for (synced_pairs.items) |pair| {
+        if (std.mem.eql(u8, pair.state_var, state_var) and std.mem.eql(u8, pair.prop_var, prop_var)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Extracts variable names that are declared as reactive (from $props, $state, $derived).
@@ -1366,6 +1549,8 @@ fn extractReactiveVariables(
 /// Extract simple identifiers from a destructuring pattern like { a, b, c: d }
 /// Note: Rest patterns (...rest) are NOT extracted - they create plain objects
 /// from $props(), not reactive state that loses reactivity when captured.
+/// Note: $bindable() props are also NOT extracted - they are two-way reactive
+/// and capturing them in $state is a valid pattern.
 fn extractDestructuredNames(
     allocator: std.mem.Allocator,
     pattern: []const u8,
@@ -1411,21 +1596,32 @@ fn extractDestructuredNames(
                     const local_start = i;
                     while (i < pattern.len and isIdentChar(pattern[i])) : (i += 1) {}
                     const local_name = pattern[local_start..i];
-                    try names.put(allocator, local_name, {});
 
                     // Skip whitespace and check for default value after rename
                     while (i < pattern.len and std.ascii.isWhitespace(pattern[i])) : (i += 1) {}
                     if (i < pattern.len and pattern[i] == '=') {
+                        // Check if default is $bindable() - skip these props
+                        const default_start = skipWhitespace(pattern, i + 1);
+                        if (!startsWithKeyword(pattern[default_start..], "$bindable")) {
+                            try names.put(allocator, local_name, {});
+                        }
                         i = skipDefaultValue(pattern, i + 1);
+                    } else {
+                        try names.put(allocator, local_name, {});
                     }
                 }
             } else {
-                // Simple identifier
-                try names.put(allocator, ident, {});
-
-                // Skip default value if present (e.g., `foo = null`)
+                // Check for default value (e.g., `foo = null` or `foo = $bindable()`)
                 if (i < pattern.len and pattern[i] == '=') {
+                    // Check if default is $bindable() - skip these props
+                    const default_start = skipWhitespace(pattern, i + 1);
+                    if (!startsWithKeyword(pattern[default_start..], "$bindable")) {
+                        try names.put(allocator, ident, {});
+                    }
                     i = skipDefaultValue(pattern, i + 1);
+                } else {
+                    // Simple identifier with no default
+                    try names.put(allocator, ident, {});
                 }
             }
             continue;
@@ -1490,6 +1686,7 @@ fn findStateReferencedLocally(
     source: []const u8,
     file_path: []const u8,
     reactive_vars: *std.StringHashMapUnmanaged(void),
+    synced_pairs: *const std.ArrayList(SyncPair),
     diagnostics: *std.ArrayList(Diagnostic),
 ) !void {
     var i: usize = 0;
@@ -1640,7 +1837,20 @@ fn findStateReferencedLocally(
 
                         // Check if args contain reactive variable reference
                         if (findReactiveReference(args, reactive_vars)) |ref_info| {
-                            if (!hasSvelteIgnore(content, decl_start, "state_referenced_locally")) {
+                            // Extract LHS variable name for simple identifiers (not destructuring)
+                            const lhs_name: ?[]const u8 = if (content[lhs_start] != '{')
+                                content[lhs_start..lhs_end]
+                            else
+                                null;
+
+                            // Skip warning if this state var is synced from the prop in an $effect
+                            // Pattern: let stateVar = $state(prop); $effect(() => { stateVar = prop; })
+                            const is_synced = if (lhs_name) |name|
+                                isSyncedInEffect(name, ref_info.name, synced_pairs)
+                            else
+                                false;
+
+                            if (!is_synced and !hasSvelteIgnore(content, decl_start, "state_referenced_locally")) {
                                 const ref_pos = args_start + ref_info.offset;
                                 const loc = computeLineCol(source, base_offset + @as(u32, @intCast(ref_pos)));
                                 try diagnostics.append(allocator, .{
@@ -1739,9 +1949,6 @@ fn findStateReferencedLocally(
                     });
                 }
 
-                // Collect LHS names to avoid re-warning on same statement
-                _ = lhs_start;
-                _ = lhs_end;
                 continue;
             }
         }
