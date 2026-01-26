@@ -2428,10 +2428,11 @@ fn emitTemplateExpressions(
 
             .const_tag => {
                 if (extractConstBinding(ast.source, node.start, node.end)) |binding| {
-                    // Always add binding name to template_bindings to prevent `void` emission.
-                    // This is important for snippet-local bindings - they're not in scope at
-                    // module level, so `void IconComponent;` would fail.
-                    try template_bindings.put(allocator, binding.name, {});
+                    // Add all binding names to template_bindings to prevent `void` emission.
+                    // The name may be a destructuring pattern like "{ brand, last4 }", so we
+                    // must extract all individual names. This is important because @const bindings
+                    // inside {#if} blocks are scoped, so `void brand;` at module level would fail.
+                    try extractBindingNames(allocator, binding.name, &template_bindings);
 
                     // For const tags inside snippet bodies, only register the binding name.
                     // The actual declaration is handled by emitSnippetBodyExpressions.
@@ -9379,6 +9380,11 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
     // Track template literal nesting depth (backticks can nest via ${...})
     var template_depth: u32 = 0;
 
+    // Track brace depth for function/arrow bodies. Type declarations inside
+    // function bodies (e.g., `$derived.by(() => { type Member = ... })`)
+    // should NOT be hoisted to module level.
+    var brace_depth: u32 = 0;
+
     // Track position of first non-import line for source mapping
     var first_other_pos: ?usize = null;
 
@@ -9392,8 +9398,8 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
         const line_start = i;
         while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
 
-        // Only check for import/interface/type at top level (not inside template literals)
-        if (template_depth == 0) {
+        // Only check for import/interface/type at top level (not inside template literals or function bodies)
+        if (template_depth == 0 and brace_depth == 0) {
             // Check if this line starts with 'import'
             if (i + 6 <= content.len and std.mem.eql(u8, content[i .. i + 6], "import")) {
                 // Verify it's actually an import keyword (not identifier like 'importFoo')
@@ -9530,9 +9536,9 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
             continue;
         }
 
-        // Track template literal state as we copy to 'other'
+        // Track template literal and brace depth as we copy to 'other'
 
-        // Scan this line for backticks to update template_depth.
+        // Scan this line for backticks/braces to update template_depth and brace_depth.
         // We only track regular strings (', ") when at top level (template_depth == 0).
         // Inside template literals, single/double quotes are just content - they don't
         // start strings that would contain backticks.
@@ -9572,6 +9578,15 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
                 } else {
                     // Opening a new template literal
                     template_depth += 1;
+                }
+            }
+
+            // Track brace depth for function/arrow bodies (only outside strings/templates)
+            if (in_string == 0 and template_depth == 0) {
+                if (c == '{') {
+                    brace_depth += 1;
+                } else if (c == '}' and brace_depth > 0) {
+                    brace_depth -= 1;
                 }
             }
         }
