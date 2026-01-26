@@ -396,9 +396,12 @@ fn writeGeneratedTsconfig(
     // which may be in referenced projects outside the workspace.
     try w.writeAll("  \"include\": [\n");
     try w.writeAll("    \"stubs.d.ts\",\n");
-    // Note: We don't explicitly include .svelte-kit/non-ambient.d.ts because the project's
-    // tsconfig may not include it (e.g., when include is overridden). This matches svelte-check's
-    // behavior where route type resolution depends on the project's path mappings.
+    // Include SvelteKit generated type declarations for $app/types and route types.
+    // The parent tsconfig's include is overridden by ours, so we must explicitly include
+    // these files to resolve AppTypes.RouteId for route type-checking.
+    try w.writeAll("    \"../.svelte-kit/ambient.d.ts\",\n");
+    try w.writeAll("    \"../.svelte-kit/non-ambient.d.ts\",\n");
+    try w.writeAll("    \"../.svelte-kit/types/**/$types.d.ts\",\n");
     // Include common source directories - these are relative to the .zvelte-check dir
     try w.writeAll("    \"../src/**/*.ts\",\n");
     try w.writeAll("    \"../src/**/*.js\"");
