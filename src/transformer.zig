@@ -390,7 +390,10 @@ const NarrowingContext = struct {
         try self.ensureOpen(output, enclosing.items);
 
         // Emit the const binding
-        try output.appendSlice(self.allocator, "var ");
+        // Use `const` instead of `var` to enable TypeScript's control-flow narrowing
+        // inside closures. TypeScript only narrows immutable bindings (const) in closures
+        // because mutable bindings (let/var) could be reassigned between narrowing and use.
+        try output.appendSlice(self.allocator, "const ");
         try output.appendSlice(self.allocator, binding.name);
         try output.appendSlice(self.allocator, " = ");
         try output.appendSlice(self.allocator, binding.expr);
@@ -8353,7 +8356,9 @@ fn emitSnippetBodyExpressions(
             },
             .const_binding => |const_info| {
                 // Emit the const binding declaration
-                try output.appendSlice(allocator, "var ");
+                // Use `const` instead of `var` to enable TypeScript's control-flow narrowing
+                // inside closures. TypeScript only narrows immutable bindings in closures.
+                try output.appendSlice(allocator, "const ");
                 try output.appendSlice(allocator, const_info.binding.name);
                 try output.appendSlice(allocator, " = ");
                 try output.appendSlice(allocator, const_info.binding.expr);
@@ -13654,7 +13659,8 @@ test "@const declarations emitted before usages in each blocks" {
     const virtual = try transform(allocator, ast);
 
     // The const declaration MUST appear before its usage
-    const const_decl = "var name = item.name;";
+    // Uses `const` (not `var`) to enable TypeScript's closure narrowing
+    const const_decl = "const name = item.name;";
     const void_usage = "void (name);";
 
     const decl_pos = std.mem.indexOf(u8, virtual.content, const_decl);
