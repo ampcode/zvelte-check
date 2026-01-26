@@ -531,7 +531,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         // SvelteKit route type imports are NOT auto-generated
         // User code imports from './$types' which resolves via SvelteKit's generated types
         // in .svelte-kit/types/ (requires SvelteKit to be built/dev'd first)
-        _ = route_info;
+        // Note: route_info is used in transformRouteProps for $props() type annotations
         try output.appendSlice(allocator, "\n");
 
         // Svelte 5 rune type declarations
@@ -603,8 +603,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
             \\
         );
     } else {
-        // For JavaScript files, we still need to mark route_info as used
-        _ = route_info;
+        // For JavaScript files, route_info is still used in transformRouteProps
     }
 
     // Emit forward declarations for template snippets (hoisting).
@@ -695,7 +694,8 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         const filtered = try filterSvelteImports(allocator, raw_content);
         const reactive_transformed = try transformReactiveStatements(allocator, filtered);
         const state_transformed = try transformStateWithTypeAnnotation(allocator, reactive_transformed);
-        const store_transformed = try transformStoreSubscriptions(allocator, state_transformed);
+        const route_props_transformed = try transformRouteProps(allocator, state_transformed, route_info);
+        const store_transformed = try transformStoreSubscriptions(allocator, route_props_transformed);
 
         // Find where the first non-import line starts in the RAW content.
         // This is needed for source mapping because imports can be scattered throughout the file.
@@ -10591,6 +10591,197 @@ fn isIdentStartChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
 }
 
+/// Transforms $props() calls in SvelteKit route files to add type annotations.
+/// Pattern: `let { data } = $props()` → `let { data }: { data: import('./$types.js').PageData } = $props()`
+/// This enables proper type inference for the `data` prop in +page.svelte and +layout.svelte files.
+fn transformRouteProps(allocator: std.mem.Allocator, content: []const u8, route_info: sveltekit.RouteInfo) ![]const u8 {
+    // Only transform for route files that have a data type
+    const data_type = route_info.dataTypeName() orelse return content;
+
+    // Look for pattern: let { data ... } = $props()
+    // We need to find $props() calls that destructure `data` and add type annotation
+    const props_pattern = "$props()";
+    var pos: usize = 0;
+
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+    try result.ensureTotalCapacity(allocator, content.len + 100);
+
+    while (pos < content.len) {
+        // Find next $props() call
+        const props_idx = std.mem.indexOfPos(u8, content, pos, props_pattern) orelse {
+            // No more $props() calls, append rest
+            try result.appendSlice(allocator, content[pos..]);
+            break;
+        };
+
+        // Look backwards from $props() to find the pattern `let { ... } = `
+        // Start by finding '='
+        var eq_pos: ?usize = null;
+        var scan = props_idx;
+        while (scan > pos) {
+            scan -= 1;
+            const c = content[scan];
+            if (c == '=') {
+                // Check not == or !=
+                if (scan > 0 and (content[scan - 1] == '=' or content[scan - 1] == '!')) {
+                    continue;
+                }
+                eq_pos = scan;
+                break;
+            }
+            // Stop at statement boundaries (but not braces - they may be part of type annotation)
+            if (c == ';' or c == '\n') {
+                // Check if newline is just whitespace continuation
+                if (c == '\n') continue;
+                break;
+            }
+        }
+
+        if (eq_pos == null) {
+            // No assignment found, copy through $props()
+            try result.appendSlice(allocator, content[pos .. props_idx + props_pattern.len]);
+            pos = props_idx + props_pattern.len;
+            continue;
+        }
+
+        // Look backwards from '=' to find the destructuring pattern '}'
+        // This requires skipping over any existing type annotation like `: { data: PageData }`
+        // Pattern without annotation: `let { data } = $props()`
+        // Pattern with annotation: `let { data }: { data: PageData } = $props()`
+        scan = eq_pos.?;
+
+        // Skip whitespace before '='
+        while (scan > pos and (content[scan - 1] == ' ' or content[scan - 1] == '\t' or content[scan - 1] == '\n')) {
+            scan -= 1;
+        }
+
+        // Check if there's a '}' before the '=' (possibly from type annotation or destructuring)
+        if (scan == pos or content[scan - 1] != '}') {
+            // No destructuring pattern, copy through $props()
+            try result.appendSlice(allocator, content[pos .. props_idx + props_pattern.len]);
+            pos = props_idx + props_pattern.len;
+            continue;
+        }
+
+        // Find the matching '{' for this '}'
+        const first_brace_end = scan - 1;
+        var brace_depth: u32 = 1;
+        scan = first_brace_end;
+        while (scan > pos) {
+            scan -= 1;
+            const c = content[scan];
+            if (c == '}') {
+                brace_depth += 1;
+            } else if (c == '{') {
+                brace_depth -= 1;
+                if (brace_depth == 0) {
+                    break;
+                }
+            }
+        }
+
+        if (brace_depth != 0) {
+            // Unmatched braces, copy through $props()
+            try result.appendSlice(allocator, content[pos .. props_idx + props_pattern.len]);
+            pos = props_idx + props_pattern.len;
+            continue;
+        }
+
+        const first_brace_start = scan;
+
+        // Check if there's a ':' before this '{' - if so, this is a type annotation
+        // and we need to find the actual destructuring pattern before it
+        var destructuring_start = first_brace_start;
+        var destructuring_end = first_brace_end;
+
+        // Skip whitespace before '{'
+        var check = first_brace_start;
+        while (check > pos and (content[check - 1] == ' ' or content[check - 1] == '\t' or content[check - 1] == '\n')) {
+            check -= 1;
+        }
+
+        if (check > pos and content[check - 1] == ':') {
+            // This is a type annotation! Look for the actual destructuring pattern before ':'
+            check -= 1; // Skip ':'
+
+            // Skip whitespace before ':'
+            while (check > pos and (content[check - 1] == ' ' or content[check - 1] == '\t' or content[check - 1] == '\n')) {
+                check -= 1;
+            }
+
+            // Now we should find '}' of the destructuring pattern
+            if (check > pos and content[check - 1] == '}') {
+                destructuring_end = check - 1;
+
+                // Find matching '{' for destructuring
+                brace_depth = 1;
+                scan = destructuring_end;
+                while (scan > pos) {
+                    scan -= 1;
+                    const c = content[scan];
+                    if (c == '}') {
+                        brace_depth += 1;
+                    } else if (c == '{') {
+                        brace_depth -= 1;
+                        if (brace_depth == 0) {
+                            destructuring_start = scan;
+                            break;
+                        }
+                    }
+                }
+
+                if (brace_depth != 0) {
+                    // Unmatched braces, copy through $props()
+                    try result.appendSlice(allocator, content[pos .. props_idx + props_pattern.len]);
+                    pos = props_idx + props_pattern.len;
+                    continue;
+                }
+
+                // There's already a type annotation, skip adding another one
+                try result.appendSlice(allocator, content[pos .. props_idx + props_pattern.len]);
+                pos = props_idx + props_pattern.len;
+                continue;
+            } else {
+                // ':' but no '}' before it - might be a simple type annotation like `: SomeType`
+                // In this case, there's already a type annotation, skip
+                try result.appendSlice(allocator, content[pos .. props_idx + props_pattern.len]);
+                pos = props_idx + props_pattern.len;
+                continue;
+            }
+        }
+
+        // No type annotation, destructuring_start/destructuring_end point to the pattern
+        // Check if `data` is in the destructuring pattern
+        const pattern = content[destructuring_start .. destructuring_end + 1];
+        const has_data = std.mem.indexOf(u8, pattern, "data") != null;
+
+        if (!has_data) {
+            // No `data` prop, copy through $props()
+            try result.appendSlice(allocator, content[pos .. props_idx + props_pattern.len]);
+            pos = props_idx + props_pattern.len;
+            continue;
+        }
+
+        // Found `let { ... data ... } = $props()` pattern without type annotation
+        // Inject type annotation after closing brace: `let { data }: { data: PageData } = $props()`
+        // Copy up to and including '}'
+        try result.appendSlice(allocator, content[pos .. destructuring_end + 1]);
+
+        // Insert type annotation
+        try result.appendSlice(allocator, ": { data: import('./$types.js').");
+        try result.appendSlice(allocator, data_type);
+        try result.appendSlice(allocator, " }");
+
+        // Copy from after '}' through $props()
+        try result.appendSlice(allocator, content[destructuring_end + 1 .. props_idx + props_pattern.len]);
+
+        pos = props_idx + props_pattern.len;
+    }
+
+    return try result.toOwnedSlice(allocator);
+}
+
 /// Emits type imports for SvelteKit route files
 fn emitRouteTypeImports(allocator: std.mem.Allocator, output: *std.ArrayList(u8), route_info: sveltekit.RouteInfo) !void {
     // Build the list of types to import from ./$types
@@ -11621,6 +11812,80 @@ test "transform non-route component has no sveltekit imports" {
 
     // Regular components should not have $types import
     try std.testing.expect(std.mem.indexOf(u8, virtual.content, "from \"./$types\"") == null);
+}
+
+test "transformRouteProps adds PageData type for +page.svelte" {
+    const allocator = std.testing.allocator;
+
+    const input = "let { data } = $props()";
+    const route_info = sveltekit.detectRoute("src/routes/+page.svelte");
+    try std.testing.expectEqual(sveltekit.RouteKind.page, route_info.kind);
+
+    const result = try transformRouteProps(allocator, input, route_info);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings(
+        "let { data }: { data: import('./$types.js').PageData } = $props()",
+        result,
+    );
+}
+
+test "transformRouteProps adds LayoutData type for +layout.svelte" {
+    const allocator = std.testing.allocator;
+
+    const input = "let { data, children } = $props()";
+    const route_info = sveltekit.detectRoute("src/routes/+layout.svelte");
+    try std.testing.expectEqual(sveltekit.RouteKind.layout, route_info.kind);
+
+    const result = try transformRouteProps(allocator, input, route_info);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings(
+        "let { data, children }: { data: import('./$types.js').LayoutData } = $props()",
+        result,
+    );
+}
+
+test "transformRouteProps preserves existing type annotation" {
+    const allocator = std.testing.allocator;
+
+    const input = "let { data }: { data: PageData } = $props()";
+    const route_info = sveltekit.detectRoute("src/routes/+page.svelte");
+
+    const result = try transformRouteProps(allocator, input, route_info);
+    defer allocator.free(result);
+
+    // Should not add duplicate type annotation
+    try std.testing.expectEqualStrings(
+        "let { data }: { data: PageData } = $props()",
+        result,
+    );
+}
+
+test "transformRouteProps ignores non-route files" {
+    const allocator = std.testing.allocator;
+
+    const input = "let { data } = $props()";
+    const route_info = sveltekit.detectRoute("src/lib/Component.svelte");
+    try std.testing.expectEqual(sveltekit.RouteKind.none, route_info.kind);
+
+    const result = try transformRouteProps(allocator, input, route_info);
+
+    // For non-route files, input is returned unchanged (same pointer)
+    try std.testing.expectEqual(input.ptr, result.ptr);
+}
+
+test "transformRouteProps ignores props without data" {
+    const allocator = std.testing.allocator;
+
+    const input = "let { name, count } = $props()";
+    const route_info = sveltekit.detectRoute("src/routes/+page.svelte");
+
+    const result = try transformRouteProps(allocator, input, route_info);
+    defer allocator.free(result);
+
+    // No `data` in destructuring, should not add type annotation
+    try std.testing.expectEqualStrings("let { name, count } = $props()", result);
 }
 
 test "transform store subscription basic" {
