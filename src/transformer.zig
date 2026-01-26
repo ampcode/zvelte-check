@@ -9514,12 +9514,12 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
         // Find end of line first.
         const line_end = std.mem.indexOfScalarPos(u8, content, i, '\n') orelse content.len;
 
-        // Blank/whitespace-only lines between imports should stay with imports to preserve
+        // Blank/whitespace-only lines BETWEEN imports should stay with imports to preserve
         // byte offsets for source mapping. Only switch to 'other' for actual code.
-        if (first_other_pos == null and i == line_end) {
-            // This is an empty/whitespace-only line and we haven't seen code yet.
+        // But blank lines BEFORE any import should go to 'other', not 'imports'.
+        if (first_import_pos != null and first_other_pos == null and i == line_end) {
+            // This is an empty/whitespace-only line AFTER at least one import.
             // Keep it with imports to preserve byte alignment.
-            if (first_import_pos == null) first_import_pos = line_start;
             try imports.appendSlice(allocator, content[line_start..line_end]);
             if (line_end < content.len) {
                 try imports.append(allocator, '\n');
