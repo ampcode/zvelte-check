@@ -2610,20 +2610,19 @@ fn emitTemplateExpressions(
     for (template_items.items) |item| {
         switch (item) {
             .snippet => |s| {
-                // Track how many branches are open before closing.
-                // The snippet IIFE will be textually inside these still-open branches,
-                // so we should NOT re-emit those conditions inside the IIFE (TypeScript
-                // already has the narrowing from the outer scope).
-                const branches_before_close = narrowing_ctx.enclosing_branches.items.len;
+                // Find enclosing branches for the snippet's definition position.
+                // This ensures the snippet IIFE is emitted inside the correct if-block
+                // context, allowing TypeScript to apply type narrowing from enclosing
+                // conditions (e.g., `serverStatus !== 'pending'` before `'error' in serverStatus`).
+                var snippet_enclosing = try findAllEnclosingIfBranches(allocator, s.range.snippet_start, if_branches);
+                defer snippet_enclosing.deinit(allocator);
 
-                // Close any open narrowing context before emitting snippet body.
-                // Note: close() respects min_binding_depth, so some branches may remain open.
-                try narrowing_ctx.close(output);
-
-                const branches_still_open = narrowing_ctx.enclosing_branches.items.len;
+                // Transition to the snippet's enclosing context (opens/closes if-blocks as needed)
+                try narrowing_ctx.ensureOpen(output, snippet_enclosing.items);
 
                 // Emit the snippet body expressions in an IIFE with its own narrowing context.
-                // Pass the number of branches still open so it can skip re-emitting those.
+                // The IIFE is now textually inside the enclosing if-blocks, so TypeScript
+                // knows the narrowed types apply to expressions inside the snippet body.
                 try emitSnippetBodyExpressions(
                     allocator,
                     ast,
@@ -2634,10 +2633,8 @@ fn emitTemplateExpressions(
                     if_branches,
                     each_body_ranges,
                     &narrowing_ctx.has_expressions,
-                    branches_still_open,
+                    snippet_enclosing.items.len,
                 );
-
-                _ = branches_before_close; // May be useful for debugging
             },
 
             .expression => |e| {
