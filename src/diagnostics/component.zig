@@ -671,9 +671,8 @@ fn checkSlotDeprecation(
     ast: *const Ast,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !void {
-    // Only warn for Svelte 5 components that use runes.
-    // Svelte 4 components using `export let` should use <slot> - it's not deprecated for them.
-    if (!componentUsesRunes(ast)) return;
+    // Always warn about <slot> - it's deprecated in Svelte 5 projects.
+    // Users can suppress with <!-- svelte-ignore slot_element_deprecated -->
 
     // Track ignore codes from consecutive preceding comments
     var accumulated_ignore_codes: std.ArrayList([]const u8) = .empty;
@@ -2234,13 +2233,13 @@ test "slot-element-deprecated: warns on <slot> in Svelte 5 component" {
     try std.testing.expectEqual(Severity.warning, diagnostics.items[0].severity);
 }
 
-test "slot-element-deprecated: no warning on <slot> in Svelte 4 component" {
+test "slot-element-deprecated: warns on <slot> even without runes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     const Parser = @import("../svelte_parser.zig").Parser;
-    // Svelte 4 component (uses export let, no runes) should NOT warn about <slot>
+    // Component without runes should still warn about <slot> in Svelte 5 projects
     // Use x in template to avoid unused-export-let warning
     const source = "<script>export let x;</script>\n<p>{x}</p>\n<slot />";
     var parser = Parser.init(allocator, source, "test.svelte");
@@ -2249,7 +2248,8 @@ test "slot-element-deprecated: no warning on <slot> in Svelte 4 component" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     try runDiagnostics(allocator, &ast, &diagnostics);
 
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("slot_element_deprecated", diagnostics.items[0].code.?);
 }
 
 test "slot-element-deprecated: warns on <slot> with props in Svelte 5 component" {
@@ -2301,6 +2301,24 @@ test "slot-element-deprecated: regular elements not affected" {
     try runDiagnostics(allocator, &ast, &diagnostics);
 
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "slot-element-deprecated: warns on bare <slot> with no script" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    // Layout-style component with just <slot /> and no runes - should still warn
+    const source = "<slot />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("slot_element_deprecated", diagnostics.items[0].code.?);
 }
 
 // ============================================================================
