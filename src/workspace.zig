@@ -19,7 +19,14 @@ pub fn scan(
     };
     defer dir.close();
 
-    try walkDir(allocator, dir, workspace_path, ignore_patterns, &files);
+    // Resolve to absolute path for consistent file references.
+    // This ensures virtual_path in transformer output is absolute, which is
+    // required for tsconfig includes that may reference files from the
+    // .zvelte-check subdirectory.
+    const abs_path = try std.fs.cwd().realpathAlloc(allocator, workspace_path);
+    defer allocator.free(abs_path);
+
+    try walkDir(allocator, dir, abs_path, ignore_patterns, &files);
 
     return files.toOwnedSlice(allocator);
 }
