@@ -84,6 +84,10 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
     // 2. Scan workspace and filter by tsconfig patterns
     const all_files = try workspace.scan(allocator, args.workspace, args.ignore);
 
+    // Resolve workspace to absolute path for prefix stripping.
+    // workspace.scan returns absolute paths, so we need absolute workspace path to match.
+    const abs_workspace = try std.fs.cwd().realpathAlloc(allocator, args.workspace);
+
     // Filter files by tsconfig include/exclude patterns
     var files_list: std.ArrayList([]const u8) = .empty;
     // Track which files are from the main workspace (for diagnostic filtering)
@@ -96,9 +100,9 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
         for (all_files) |file_path| {
             // Normalize path for pattern matching:
             // 1. Strip workspace prefix to get relative path
-            // 2. Strip ./ prefix if present
-            const relative = if (std.mem.startsWith(u8, file_path, args.workspace))
-                file_path[args.workspace.len..]
+            // 2. Strip leading / if present
+            const relative = if (std.mem.startsWith(u8, file_path, abs_workspace))
+                file_path[abs_workspace.len..]
             else
                 file_path;
             const normalized = if (std.mem.startsWith(u8, relative, "/"))
