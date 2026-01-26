@@ -572,6 +572,38 @@ fn isInsideString(text: []const u8, target_pos: usize) bool {
     return false;
 }
 
+/// Detects if a component uses Svelte 5 runes ($props, $state, $derived, $effect, etc.).
+/// Returns true if any rune is found in any script block.
+/// Used to distinguish Svelte 5 components (where <slot> is deprecated) from
+/// Svelte 4 components (where <slot> is the correct approach).
+fn componentUsesRunes(ast: *const Ast) bool {
+    // Check all scripts for rune usage
+    for (ast.scripts.items) |script| {
+        const content = ast.source[script.content_start..script.content_end];
+        // Check for common runes that indicate Svelte 5 usage
+        // We look for the pattern `$rune(` to avoid matching `$` in template strings
+        const runes_to_check = [_][]const u8{
+            "$props(",
+            "$state(",
+            "$state.raw(",
+            "$derived(",
+            "$derived.by(",
+            "$effect(",
+            "$effect.pre(",
+            "$bindable(",
+        };
+        for (runes_to_check) |rune| {
+            if (std.mem.indexOf(u8, content, rune)) |pos| {
+                // Make sure it's not inside a string literal
+                if (!isInsideString(content, pos)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 fn checkUnusedExportLet(
     allocator: std.mem.Allocator,
     ast: *const Ast,
@@ -632,11 +664,17 @@ fn checkUnusedExportLet(
 
 /// Warns when <slot> elements are used - deprecated in Svelte 5.
 /// Users should use {@render ...} tags instead.
+/// Only warns for Svelte 5 components (those using runes like $props, $state, etc.).
+/// Svelte 4 components (using export let) should continue to use <slot>.
 fn checkSlotDeprecation(
     allocator: std.mem.Allocator,
     ast: *const Ast,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !void {
+    // Only warn for Svelte 5 components that use runes.
+    // Svelte 4 components using `export let` should use <slot> - it's not deprecated for them.
+    if (!componentUsesRunes(ast)) return;
+
     // Track ignore codes from consecutive preceding comments
     var accumulated_ignore_codes: std.ArrayList([]const u8) = .empty;
 
@@ -2177,13 +2215,14 @@ test "invalid-rune-usage: variable referencing state is valid" {
 // slot-element-deprecated tests
 // ============================================================================
 
-test "slot-element-deprecated: warns on <slot>" {
+test "slot-element-deprecated: warns on <slot> in Svelte 5 component" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     const Parser = @import("../svelte_parser.zig").Parser;
-    const source = "<slot />";
+    // Svelte 5 component (uses $props rune) should warn about <slot>
+    const source = "<script>let { x } = $props();</script>\n<slot />";
     var parser = Parser.init(allocator, source, "test.svelte");
     const ast = try parser.parse();
 
@@ -2195,13 +2234,32 @@ test "slot-element-deprecated: warns on <slot>" {
     try std.testing.expectEqual(Severity.warning, diagnostics.items[0].severity);
 }
 
-test "slot-element-deprecated: warns on <slot> with props" {
+test "slot-element-deprecated: no warning on <slot> in Svelte 4 component" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     const Parser = @import("../svelte_parser.zig").Parser;
-    const source = "<slot {x} {y} />";
+    // Svelte 4 component (uses export let, no runes) should NOT warn about <slot>
+    // Use x in template to avoid unused-export-let warning
+    const source = "<script>export let x;</script>\n<p>{x}</p>\n<slot />";
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "slot-element-deprecated: warns on <slot> with props in Svelte 5 component" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    // Svelte 5 component (uses $state rune) should warn about <slot>
+    const source = "<script>let count = $state(0);</script>\n<slot {count} />";
     var parser = Parser.init(allocator, source, "test.svelte");
     const ast = try parser.parse();
 
@@ -2218,7 +2276,8 @@ test "slot-element-deprecated: respects svelte-ignore" {
     const allocator = arena.allocator();
 
     const Parser = @import("../svelte_parser.zig").Parser;
-    const source = "<!-- svelte-ignore slot_element_deprecated -->\n<slot />";
+    // Svelte 5 component with svelte-ignore should not warn
+    const source = "<script>let { x } = $props();</script>\n<!-- svelte-ignore slot_element_deprecated -->\n<slot />";
     var parser = Parser.init(allocator, source, "test.svelte");
     const ast = try parser.parse();
 
