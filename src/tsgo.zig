@@ -1047,16 +1047,21 @@ fn shouldSkipError(message: []const u8, is_svelte_file: bool, is_test_file: bool
             return true;
         }
 
-        // Skip "Cannot redeclare block-scoped variable" errors
-        // False positives from snippet parameters shadowing outer variables
+        // Skip "Cannot redeclare block-scoped variable" errors.
+        // False positives from:
+        // - Snippet parameters shadowing outer variables
+        // - Multiple {#each} blocks using the same loop variable name at module scope
+        // - Script variables conflicting with template {@const} bindings
+        // svelte-check doesn't report these because svelte2tsx handles scoping differently.
         if (std.mem.indexOf(u8, message, "Cannot redeclare block-scoped variable") != null) {
             return true;
         }
 
-        // Skip "Duplicate identifier" errors
+        // Skip "Duplicate identifier" errors.
         // False positives from type shadowing between module and instance scripts.
         // In Svelte, <script module> and <script> have separate scopes, but our
         // transformer emits both at module level in TypeScript.
+        // svelte-check doesn't report these because svelte2tsx handles scoping differently.
         if (std.mem.indexOf(u8, message, "Duplicate identifier") != null) {
             return true;
         }
