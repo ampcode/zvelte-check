@@ -396,9 +396,9 @@ fn writeGeneratedTsconfig(
     // which may be in referenced projects outside the workspace.
     try w.writeAll("  \"include\": [\n");
     try w.writeAll("    \"stubs.d.ts\",\n");
-    // Include SvelteKit generated types (contains AppTypes with route literals)
-    try w.writeAll("    \"../.svelte-kit/ambient.d.ts\",\n");
-    try w.writeAll("    \"../.svelte-kit/non-ambient.d.ts\",\n");
+    // Note: We don't explicitly include .svelte-kit/non-ambient.d.ts because the project's
+    // tsconfig may not include it (e.g., when include is overridden). This matches svelte-check's
+    // behavior where route type resolution depends on the project's path mappings.
     // Include common source directories - these are relative to the .zvelte-check dir
     try w.writeAll("    \"../src/**/*.ts\",\n");
     try w.writeAll("    \"../src/**/*.js\"");
@@ -665,38 +665,9 @@ fn writeSvelteKitStubs(workspace_dir: std.fs.Dir) !void {
         \\  export default component;
         \\}
         \\
-        \\declare module "$app/types" {
-        \\  // Re-export common SvelteKit types
-        \\  export type Navigation = {
-        \\    from: { url: URL; params: Record<string, string>; route: { id: string | null } } | null;
-        \\    to: { url: URL; params: Record<string, string>; route: { id: string | null } } | null;
-        \\    type: 'load' | 'unload' | 'link' | 'goto' | 'popstate';
-        \\    willUnload: boolean;
-        \\    delta?: number;
-        \\    complete: Promise<void>;
-        \\  };
-        \\  export type Page<Data = Record<string, any>> = {
-        \\    url: URL;
-        \\    params: Record<string, string>;
-        \\    route: { id: string | null };
-        \\    status: number;
-        \\    error: Error | null;
-        \\    data: Data;
-        \\    state: Record<string, any>;
-        \\    form: any;
-        \\  };
-        \\  // SvelteKit AppTypes interface for route type resolution
-        \\  // RouteId/RouteParams are generated per-project with all route strings
-        \\  // We use string to avoid never when Extract<> is applied
-        \\  export interface AppTypes {
-        \\    RouteId(): string;
-        \\    RouteParams(): Record<string, Record<string, string>>;
-        \\    LayoutParams(): Record<string, Record<string, string>>;
-        \\    Pathname(): string;
-        \\    ResolvedPathname(): string;
-        \\    Asset(): string;
-        \\  }
-        \\}
+        \\// Note: $app/types is provided by @sveltejs/kit and project-specific
+        \\// non-ambient.d.ts, so we don't redeclare it here to avoid overriding
+        \\// the project's RouteId literals with our fallback `string` type.
         \\
         \\// SvelteKit $env/* virtual module types
         \\declare module "$env/static/private" {
