@@ -1820,6 +1820,21 @@ fn findReactiveReference(text: []const u8, reactive_vars: *std.StringHashMapUnma
             while (i < text.len and isIdentChar(text[i])) : (i += 1) {}
             const ident = text[start..i];
 
+            // Skip whitespace after identifier
+            var after = i;
+            while (after < text.len and (text[after] == ' ' or text[after] == '\t' or text[after] == '\n' or text[after] == '\r')) {
+                after += 1;
+            }
+
+            // Check if this is an object property key (identifier followed by `:`)
+            // Object property keys are NOT variable references: `{ showAbove: true }`
+            // But shorthand properties ARE references: `{ showAbove }`
+            if (after < text.len and text[after] == ':') {
+                // This is a property key, not a reference - skip it
+                i = after + 1;
+                continue;
+            }
+
             // Check if this is a reactive variable
             if (reactive_vars.contains(ident)) {
                 return .{ .name = ident, .offset = start };
@@ -2990,4 +3005,53 @@ test "state_referenced_locally: block comment svelte-ignore suppresses warning" 
 
     // Should have no warnings - suppressed by svelte-ignore
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "state_referenced_locally: object property key is not a reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    // Regression: { showAbove: true } was incorrectly flagged because `showAbove`
+    // is also a $state variable name. But in `showAbove: true` it's a property key.
+    const source =
+        \\<script lang="ts">
+        \\let showAbove = $state(true)
+        \\let menuPosition = $state({ bottom: 0, left: 0, showAbove: true })
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // { showAbove: true } uses property name, not variable reference - no warning
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "state_referenced_locally: object shorthand property IS a reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Parser = @import("../svelte_parser.zig").Parser;
+    // Shorthand { showAbove } means { showAbove: showAbove }, which DOES capture value
+    const source =
+        \\<script lang="ts">
+        \\let showAbove = $state(true)
+        \\let menuPosition = $state({ bottom: 0, showAbove })
+        \\</script>
+    ;
+    var parser = Parser.init(allocator, source, "test.svelte");
+    const ast = try parser.parse();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runDiagnostics(allocator, &ast, &diagnostics);
+
+    // { showAbove } is shorthand, captures the value - should warn
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("state_referenced_locally", diagnostics.items[0].code.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "showAbove") != null);
 }
