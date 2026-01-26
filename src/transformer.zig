@@ -7838,11 +7838,14 @@ fn getComponentChildSnippetNames(
     const content = source[content_start..content_end];
 
     // Extract snippet names from direct child {#snippet name(...)} blocks.
-    // Track both snippet nesting and component element nesting.
-    // Only extract snippets at element_depth == 0 (not inside child components).
+    // Track snippet, component element, and logic block nesting.
+    // Only extract snippets at depth 0 for all counters (direct children only).
+    // Snippets inside {#if}, {#each}, {#await} blocks are locally scoped and
+    // should NOT be treated as props passed to the parent component.
     var i: usize = 0;
     var snippet_depth: usize = 0;
     var element_depth: usize = 0;
+    var block_depth: usize = 0; // Tracks {#if}, {#each}, {#await} blocks
     var content_in_string: u8 = 0;
 
     while (i < content.len) {
@@ -7862,8 +7865,8 @@ fn getComponentChildSnippetNames(
             continue;
         }
 
-        // Check for {#snippet at top level only (no nested components or snippets)
-        if (snippet_depth == 0 and element_depth == 0 and i + 10 < content.len and std.mem.startsWith(u8, content[i..], "{#snippet ")) {
+        // Check for {#snippet at top level only (no nested components, snippets, or logic blocks)
+        if (snippet_depth == 0 and element_depth == 0 and block_depth == 0 and i + 10 < content.len and std.mem.startsWith(u8, content[i..], "{#snippet ")) {
             i += 10;
             // Skip whitespace
             while (i < content.len and std.ascii.isWhitespace(content[i])) : (i += 1) {}
@@ -7889,6 +7892,53 @@ fn getComponentChildSnippetNames(
             snippet_depth -= 1;
             i += 10;
             continue;
+        }
+
+        // Track logic block nesting: {#if}, {#each}, {#await}
+        // These create local scopes, so snippets inside them are not component props.
+        if (snippet_depth == 0) {
+            if (i + 4 < content.len and std.mem.startsWith(u8, content[i..], "{#if")) {
+                const after = content[i + 4];
+                if (std.ascii.isWhitespace(after) or after == '}') {
+                    block_depth += 1;
+                    i += 4;
+                    continue;
+                }
+            }
+            if (i + 6 < content.len and std.mem.startsWith(u8, content[i..], "{#each")) {
+                const after = content[i + 6];
+                if (std.ascii.isWhitespace(after)) {
+                    block_depth += 1;
+                    i += 6;
+                    continue;
+                }
+            }
+            if (i + 7 < content.len and std.mem.startsWith(u8, content[i..], "{#await")) {
+                const after = content[i + 7];
+                if (std.ascii.isWhitespace(after)) {
+                    block_depth += 1;
+                    i += 7;
+                    continue;
+                }
+            }
+            // Closing tags for logic blocks
+            if (block_depth > 0) {
+                if (i + 5 <= content.len and std.mem.startsWith(u8, content[i..], "{/if}")) {
+                    block_depth -= 1;
+                    i += 5;
+                    continue;
+                }
+                if (i + 7 <= content.len and std.mem.startsWith(u8, content[i..], "{/each}")) {
+                    block_depth -= 1;
+                    i += 7;
+                    continue;
+                }
+                if (i + 8 <= content.len and std.mem.startsWith(u8, content[i..], "{/await}")) {
+                    block_depth -= 1;
+                    i += 8;
+                    continue;
+                }
+            }
         }
 
         // Track component element nesting via opening tags: <PascalCase or <namespace.Component
