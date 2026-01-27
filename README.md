@@ -13,9 +13,9 @@ A fast diagnostic tool for Svelte projects.
 TypeScript checking requires [tsgo](https://github.com/microsoft/typescript-go):
 
 ```bash
-npm install -D @aspect-build/tsgo
+npm install -D @typescript/native-preview
 # or
-bun add -D @aspect-build/tsgo
+bun add -D @typescript/native-preview
 ```
 
 ## Installation
