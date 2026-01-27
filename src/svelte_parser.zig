@@ -588,48 +588,6 @@ pub const Parser = struct {
                 if (self.current.kind == .colon) {
                     const first_ident = self.source[attr_start..attr_name_end];
                     if (std.mem.eql(u8, first_ident, "class")) {
-                        // class: directive - scan for full Tailwind/CSS class name FIRST
-                        // before checking for identifier token, because the lexer can't
-                        // parse class names with special characters like dots or brackets.
-                        // This must come before the generic identifier check below.
-                    } else if (self.peek().kind == .identifier) {
-                        self.advance(); // consume :
-                        attr_name_end = self.current.end;
-                        self.advance(); // consume modifier name
-                        // Handle |modifier options (e.g., in:fly|global, transition:fade|local)
-                        while (self.current.kind == .pipe and self.peek().kind == .identifier) {
-                            self.advance(); // consume |
-                            attr_name_end = self.current.end;
-                            self.advance(); // consume modifier option name
-                        }
-                    }
-                    if (std.mem.eql(u8, first_ident, "style")) {
-                        // style: directive - check for CSS custom property (--name)
-                        // The lexer can't parse -- as part of an identifier, so we scan manually.
-                        // After the colon, check if the source has -- indicating a CSS custom property.
-                        const colon_pos = self.current.start;
-                        // Look past the colon for --
-                        if (colon_pos + 2 < self.source.len and
-                            self.source[colon_pos + 1] == '-' and
-                            self.source[colon_pos + 2] == '-')
-                        {
-                            var css_prop_end: usize = colon_pos + 3;
-                            // CSS custom properties: -- followed by alphanumeric, -, _
-                            while (css_prop_end < self.source.len) {
-                                const c = self.source[css_prop_end];
-                                if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') {
-                                    css_prop_end += 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                            attr_name_end = @intCast(css_prop_end);
-                            self.lexer.pos = @intCast(css_prop_end);
-                            self.advance();
-                        } else {
-                            self.advance(); // just consume the colon
-                        }
-                    } else if (std.mem.eql(u8, first_ident, "class")) {
                         // class: directive - scan for full Tailwind/CSS class name
                         // The lexer can't parse class names with special characters like:
                         // - Tailwind's ! important modifier: class:!hidden
@@ -669,6 +627,48 @@ pub const Parser = struct {
                             self.advance();
                         } else {
                             self.advance(); // just consume the colon
+                        }
+                    } else if (std.mem.eql(u8, first_ident, "style")) {
+                        // style: directive - handles both regular properties and CSS custom properties.
+                        // Examples: style:color, style:font-size, style:--custom-var
+                        // The lexer can't parse -- as part of an identifier, so we scan manually for those.
+                        const colon_pos = self.current.start;
+                        // Look past the colon for --
+                        if (colon_pos + 2 < self.source.len and
+                            self.source[colon_pos + 1] == '-' and
+                            self.source[colon_pos + 2] == '-')
+                        {
+                            var css_prop_end: usize = colon_pos + 3;
+                            // CSS custom properties: -- followed by alphanumeric, -, _
+                            while (css_prop_end < self.source.len) {
+                                const c = self.source[css_prop_end];
+                                if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') {
+                                    css_prop_end += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            attr_name_end = @intCast(css_prop_end);
+                            self.lexer.pos = @intCast(css_prop_end);
+                            self.advance();
+                        } else if (self.peek().kind == .identifier) {
+                            // Regular CSS property: style:color, style:background, etc.
+                            self.advance(); // consume :
+                            attr_name_end = self.current.end;
+                            self.advance(); // consume property name
+                        } else {
+                            self.advance(); // just consume the colon
+                        }
+                    } else if (self.peek().kind == .identifier) {
+                        // Generic directive handling for on:, bind:, use:, transition:, etc.
+                        self.advance(); // consume :
+                        attr_name_end = self.current.end;
+                        self.advance(); // consume modifier name
+                        // Handle |modifier options (e.g., in:fly|global, transition:fade|local)
+                        while (self.current.kind == .pipe and self.peek().kind == .identifier) {
+                            self.advance(); // consume |
+                            attr_name_end = self.current.end;
+                            self.advance(); // consume modifier option name
                         }
                     }
                 }

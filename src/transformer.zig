@@ -5908,6 +5908,11 @@ fn isValidatableHtmlAttr(name: []const u8) bool {
     if (std.mem.eql(u8, name, "slot")) return false;
     // Skip this attribute (for svelte:component)
     if (std.mem.eql(u8, name, "this")) return false;
+    // Skip custom event handlers from Svelte actions (e.g., onclick-outside, on-custom-event).
+    // These are dispatched by `use:` actions and have the form `on<event-name>`.
+    // We detect them by looking for `on` prefix followed by a hyphen in the name,
+    // which distinguishes them from standard DOM events (onclick, oninput, etc.).
+    if (std.mem.startsWith(u8, name, "on") and std.mem.indexOf(u8, name, "-") != null) return false;
     return true;
 }
 
