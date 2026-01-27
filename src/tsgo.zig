@@ -899,13 +899,6 @@ fn parseTsgoOutput(
 
         // Determine if this is a Svelte file (for Svelte-specific filtering)
         const is_svelte_file = std.mem.endsWith(u8, original_path, ".svelte");
-        const is_sveltekit_route_file = isSvelteKitRouteFile(original_path);
-
-        // Skip diagnostics from non-.svelte files UNLESS they are SvelteKit route files.
-        // svelte-check reports errors from .svelte files AND from SvelteKit route files
-        // (+page.ts, +page.server.ts, +layout.ts, +layout.server.ts, +server.ts).
-        // Other .ts files are included in the tsconfig only for type resolution.
-        if (!is_svelte_file and !is_sveltekit_route_file) continue;
 
         const is_test_file = isTestFile(original_path);
         // Check if this is a TypeScript Svelte file (has lang="ts" in script tag)
@@ -1571,42 +1564,6 @@ fn isTestFile(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".test.js") or
         std.mem.endsWith(u8, path, ".spec.ts") or
         std.mem.endsWith(u8, path, ".spec.js");
-}
-
-/// Returns true if the path is a SvelteKit route file.
-/// These files are checked alongside .svelte files by svelte-check.
-fn isSvelteKitRouteFile(path: []const u8) bool {
-    // Extract filename from path
-    const filename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx|
-        path[idx + 1 ..]
-    else if (std.mem.lastIndexOfScalar(u8, path, '\\')) |idx|
-        path[idx + 1 ..]
-    else
-        path;
-
-    // SvelteKit route files: +page.ts, +page.server.ts, +layout.ts, +layout.server.ts, +server.ts
-    return std.mem.eql(u8, filename, "+page.ts") or
-        std.mem.eql(u8, filename, "+page.server.ts") or
-        std.mem.eql(u8, filename, "+layout.ts") or
-        std.mem.eql(u8, filename, "+layout.server.ts") or
-        std.mem.eql(u8, filename, "+server.ts");
-}
-
-test "isSvelteKitRouteFile identifies SvelteKit route files" {
-    // Positive cases - should match
-    try std.testing.expect(isSvelteKitRouteFile("src/routes/+page.ts"));
-    try std.testing.expect(isSvelteKitRouteFile("src/routes/+page.server.ts"));
-    try std.testing.expect(isSvelteKitRouteFile("src/routes/admin/+layout.ts"));
-    try std.testing.expect(isSvelteKitRouteFile("src/routes/admin/+layout.server.ts"));
-    try std.testing.expect(isSvelteKitRouteFile("src/routes/api/+server.ts"));
-    try std.testing.expect(isSvelteKitRouteFile("+page.ts")); // Just filename
-
-    // Negative cases - should NOT match
-    try std.testing.expect(!isSvelteKitRouteFile("src/lib/utils.ts"));
-    try std.testing.expect(!isSvelteKitRouteFile("src/routes/page.ts")); // Missing +
-    try std.testing.expect(!isSvelteKitRouteFile("src/routes/+page.svelte")); // Wrong extension
-    try std.testing.expect(!isSvelteKitRouteFile("src/hooks.server.ts")); // hooks.server.ts is not a route file
-    try std.testing.expect(!isSvelteKitRouteFile("src/routes/settings.remote.ts")); // *.remote.ts is not a route file
 }
 
 test "parse tsgo output with stub directory paths" {

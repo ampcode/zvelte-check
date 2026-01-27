@@ -308,7 +308,7 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
                 }
             }
         } else {
-            const ts_diagnostics = tsgo.check(allocator, virtual_files.items, args.workspace, args.tsconfig) catch |err| {
+            const ts_diagnostics = tsgo.check(allocator, virtual_files.items, abs_workspace, args.tsconfig) catch |err| {
                 if (err == tsgo.TsgoNotFoundError.TsgoNotFound) {
                     const stderr = std.fs.File.stderr();
                     try stderr.writeAll("error: tsgo not found\n\n");
@@ -325,11 +325,12 @@ fn run(backing_allocator: std.mem.Allocator, allocator: std.mem.Allocator, args:
                 if (files_to_suppress_ts.contains(d.file_path)) continue;
                 // Only report diagnostics from the main workspace, not referenced projects.
                 // For .svelte files, check the main_workspace_files hashmap.
-                // For SvelteKit route .ts files, check if they're under the workspace path.
-                const is_main_workspace = if (std.mem.endsWith(u8, d.file_path, ".svelte"))
+                // For other files (.ts/.js), check if they're under the workspace path.
+                const is_svelte = std.mem.endsWith(u8, d.file_path, ".svelte");
+                const is_main_workspace = if (is_svelte)
                     main_workspace_files.contains(d.file_path)
                 else
-                    std.mem.startsWith(u8, d.file_path, args.workspace);
+                    std.mem.startsWith(u8, d.file_path, abs_workspace);
                 if (!is_main_workspace) continue;
                 try all_diagnostics.append(allocator, d);
             }
