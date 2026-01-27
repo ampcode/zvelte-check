@@ -694,7 +694,7 @@ pub fn transform(allocator: std.mem.Allocator, ast: Ast) !VirtualFile {
         const filtered = try filterSvelteImports(allocator, raw_content);
         const reactive_transformed = try transformReactiveStatements(allocator, filtered);
         const state_transformed = try transformStateWithTypeAnnotation(allocator, reactive_transformed);
-        const route_props_transformed = try transformRouteProps(allocator, state_transformed, route_info);
+        const route_props_transformed = try transformRouteProps(allocator, state_transformed, route_info, is_typescript);
         const store_transformed = try transformStoreSubscriptions(allocator, route_props_transformed);
 
         // Find where the first non-import line starts in the RAW content.
@@ -9469,18 +9469,22 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
                 // This is an exported type alias - find where it ends
                 const type_end = findTypeAliasEnd(content, i + 7); // Skip "export " to find type end
 
-                // Track first import position for source mapping
-                if (first_import_pos == null) first_import_pos = line_start;
+                // Don't hoist types containing `typeof` - they reference local runtime values
+                // that won't be in scope at module level
+                if (!typeAliasContainsTypeof(content, i, type_end)) {
+                    // Track first import position for source mapping
+                    if (first_import_pos == null) first_import_pos = line_start;
 
-                // Include the full type (from line_start to include leading whitespace)
-                try imports.appendSlice(allocator, content[line_start..type_end]);
-                if (type_end < content.len and content[type_end] == '\n') {
-                    try imports.append(allocator, '\n');
-                    i = type_end + 1;
-                } else {
-                    i = type_end;
+                    // Include the full type (from line_start to include leading whitespace)
+                    try imports.appendSlice(allocator, content[line_start..type_end]);
+                    if (type_end < content.len and content[type_end] == '\n') {
+                        try imports.append(allocator, '\n');
+                        i = type_end + 1;
+                    } else {
+                        i = type_end;
+                    }
+                    continue;
                 }
-                continue;
             }
 
             // Check if this line starts with 'type' (type alias)
@@ -9499,18 +9503,22 @@ fn separateImports(allocator: std.mem.Allocator, content: []const u8) !Separated
                         // This is a type alias - find where it ends (at semicolon or newline after =)
                         const type_end = findTypeAliasEnd(content, i);
 
-                        // Track first import position for source mapping
-                        if (first_import_pos == null) first_import_pos = line_start;
+                        // Don't hoist types containing `typeof` - they reference local runtime values
+                        // that won't be in scope at module level
+                        if (!typeAliasContainsTypeof(content, i, type_end)) {
+                            // Track first import position for source mapping
+                            if (first_import_pos == null) first_import_pos = line_start;
 
-                        // Include the full type (from line_start to include leading whitespace)
-                        try imports.appendSlice(allocator, content[line_start..type_end]);
-                        if (type_end < content.len and content[type_end] == '\n') {
-                            try imports.append(allocator, '\n');
-                            i = type_end + 1;
-                        } else {
-                            i = type_end;
+                            // Include the full type (from line_start to include leading whitespace)
+                            try imports.appendSlice(allocator, content[line_start..type_end]);
+                            if (type_end < content.len and content[type_end] == '\n') {
+                                try imports.append(allocator, '\n');
+                                i = type_end + 1;
+                            } else {
+                                i = type_end;
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 }
             }
@@ -9689,6 +9697,37 @@ fn findBraceBlockEnd(content: []const u8, start: usize) usize {
 
 /// Finds the end of a type alias declaration.
 /// Type aliases end at semicolon, or at newline if no brace nesting.
+/// Checks if a type alias contains `typeof` which references local runtime values.
+/// Such types cannot be hoisted to module level because the referenced variable
+/// may not be in scope yet. Returns true if `typeof` is found in the type body.
+fn typeAliasContainsTypeof(content: []const u8, type_start: usize, type_end: usize) bool {
+    // Find the '=' that separates the name from the type body
+    var i = type_start;
+    while (i < type_end) {
+        if (content[i] == '=') {
+            break;
+        }
+        i += 1;
+    }
+    if (i >= type_end) return false;
+
+    // Search the type body for 'typeof' keyword
+    const type_body = content[i..type_end];
+    var j: usize = 0;
+    while (j + 6 <= type_body.len) {
+        if (std.mem.eql(u8, type_body[j .. j + 6], "typeof")) {
+            // Verify it's not part of a longer identifier
+            const before_ok = j == 0 or !isIdentifierChar(type_body[j - 1]);
+            const after_ok = j + 6 >= type_body.len or !isIdentifierChar(type_body[j + 6]);
+            if (before_ok and after_ok) {
+                return true;
+            }
+        }
+        j += 1;
+    }
+    return false;
+}
+
 fn findTypeAliasEnd(content: []const u8, start: usize) usize {
     var i = start;
     var brace_depth: u32 = 0;
@@ -10594,7 +10633,10 @@ fn isIdentStartChar(c: u8) bool {
 /// Transforms $props() calls in SvelteKit route files to add type annotations.
 /// Pattern: `let { data } = $props()` → `let { data }: { data: import('./$types.js').PageData } = $props()`
 /// This enables proper type inference for the `data` prop in +page.svelte and +layout.svelte files.
-fn transformRouteProps(allocator: std.mem.Allocator, content: []const u8, route_info: sveltekit.RouteInfo) ![]const u8 {
+/// Only adds type annotations for TypeScript files to avoid "Type annotations can only be used in TypeScript files" errors.
+fn transformRouteProps(allocator: std.mem.Allocator, content: []const u8, route_info: sveltekit.RouteInfo, is_typescript: bool) ![]const u8 {
+    // For JavaScript files, don't add TypeScript type annotations
+    if (!is_typescript) return content;
     // Only transform for route files that have a data type
     const data_type = route_info.dataTypeName() orelse return content;
 
@@ -10755,22 +10797,39 @@ fn transformRouteProps(allocator: std.mem.Allocator, content: []const u8, route_
         // Check if `data` is in the destructuring pattern
         const pattern = content[destructuring_start .. destructuring_end + 1];
         const has_data = std.mem.indexOf(u8, pattern, "data") != null;
+        const has_children = std.mem.indexOf(u8, pattern, "children") != null;
 
-        if (!has_data) {
-            // No `data` prop, copy through $props()
+        if (!has_data and !has_children) {
+            // No `data` or `children` prop, copy through $props()
             try result.appendSlice(allocator, content[pos .. props_idx + props_pattern.len]);
             pos = props_idx + props_pattern.len;
             continue;
         }
 
-        // Found `let { ... data ... } = $props()` pattern without type annotation
+        // Found `let { ... data/children ... } = $props()` pattern without type annotation
         // Inject type annotation after closing brace: `let { data }: { data: PageData } = $props()`
         // Copy up to and including '}'
         try result.appendSlice(allocator, content[pos .. destructuring_end + 1]);
 
-        // Insert type annotation
-        try result.appendSlice(allocator, ": { data: import('./$types.js').");
-        try result.appendSlice(allocator, data_type);
+        // Insert type annotation with all detected props
+        try result.appendSlice(allocator, ": { ");
+
+        var first_prop = true;
+
+        if (has_data) {
+            try result.appendSlice(allocator, "data: import('./$types.js').");
+            try result.appendSlice(allocator, data_type);
+            first_prop = false;
+        }
+
+        // For layouts, children is a Snippet prop that receives the page content
+        if (has_children and route_info.kind == .layout) {
+            if (!first_prop) {
+                try result.appendSlice(allocator, "; ");
+            }
+            try result.appendSlice(allocator, "children?: Snippet");
+        }
+
         try result.appendSlice(allocator, " }");
 
         // Copy from after '}' through $props()
@@ -11821,7 +11880,7 @@ test "transformRouteProps adds PageData type for +page.svelte" {
     const route_info = sveltekit.detectRoute("src/routes/+page.svelte");
     try std.testing.expectEqual(sveltekit.RouteKind.page, route_info.kind);
 
-    const result = try transformRouteProps(allocator, input, route_info);
+    const result = try transformRouteProps(allocator, input, route_info, true);
     defer allocator.free(result);
 
     try std.testing.expectEqualStrings(
@@ -11837,11 +11896,11 @@ test "transformRouteProps adds LayoutData type for +layout.svelte" {
     const route_info = sveltekit.detectRoute("src/routes/+layout.svelte");
     try std.testing.expectEqual(sveltekit.RouteKind.layout, route_info.kind);
 
-    const result = try transformRouteProps(allocator, input, route_info);
+    const result = try transformRouteProps(allocator, input, route_info, true);
     defer allocator.free(result);
 
     try std.testing.expectEqualStrings(
-        "let { data, children }: { data: import('./$types.js').LayoutData } = $props()",
+        "let { data, children }: { data: import('./$types.js').LayoutData; children?: Snippet } = $props()",
         result,
     );
 }
@@ -11852,7 +11911,7 @@ test "transformRouteProps preserves existing type annotation" {
     const input = "let { data }: { data: PageData } = $props()";
     const route_info = sveltekit.detectRoute("src/routes/+page.svelte");
 
-    const result = try transformRouteProps(allocator, input, route_info);
+    const result = try transformRouteProps(allocator, input, route_info, true);
     defer allocator.free(result);
 
     // Should not add duplicate type annotation
@@ -11869,7 +11928,7 @@ test "transformRouteProps ignores non-route files" {
     const route_info = sveltekit.detectRoute("src/lib/Component.svelte");
     try std.testing.expectEqual(sveltekit.RouteKind.none, route_info.kind);
 
-    const result = try transformRouteProps(allocator, input, route_info);
+    const result = try transformRouteProps(allocator, input, route_info, true);
 
     // For non-route files, input is returned unchanged (same pointer)
     try std.testing.expectEqual(input.ptr, result.ptr);
@@ -11881,11 +11940,22 @@ test "transformRouteProps ignores props without data" {
     const input = "let { name, count } = $props()";
     const route_info = sveltekit.detectRoute("src/routes/+page.svelte");
 
-    const result = try transformRouteProps(allocator, input, route_info);
+    const result = try transformRouteProps(allocator, input, route_info, true);
     defer allocator.free(result);
 
     // No `data` in destructuring, should not add type annotation
     try std.testing.expectEqualStrings("let { name, count } = $props()", result);
+}
+
+test "transformRouteProps skips type annotation for JavaScript files" {
+    const input = "let { data } = $props()";
+    const route_info = sveltekit.detectRoute("src/routes/+page.svelte");
+
+    // For JavaScript files, should not add type annotations
+    const result = try transformRouteProps(std.testing.allocator, input, route_info, false);
+
+    // Should return input unchanged (same pointer)
+    try std.testing.expectEqual(input.ptr, result.ptr);
 }
 
 test "transform store subscription basic" {
@@ -14476,4 +14546,38 @@ test "@render inside if-guard with preceding each block preserves narrowing" {
         return error.TestUnexpectedResult;
     };
     try std.testing.expect(children_call_pos > if_pos);
+}
+
+test "separateImports does not hoist type aliases with typeof" {
+    // Regression test: type aliases like `type X = typeof y` should NOT be hoisted
+    // because `y` might be a local variable not yet in scope at module level.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const content =
+        \\import type { SlimUtterance } from './types';
+        \\
+        \\type SummaryTitle = { time: string; text: string; id?: number };
+        \\const def: SummaryTitle = { time: '00:00', text: '' };
+        \\type UtteranceMap = Map<typeof def, SlimUtterance[]>;
+        \\
+        \\const utterances_by_summary: UtteranceMap = new Map();
+    ;
+
+    const sep = try separateImports(allocator, content);
+
+    // Import should be hoisted
+    try std.testing.expect(std.mem.indexOf(u8, sep.imports, "import type { SlimUtterance }") != null);
+
+    // SummaryTitle (no typeof) should be hoisted
+    try std.testing.expect(std.mem.indexOf(u8, sep.imports, "type SummaryTitle =") != null);
+
+    // UtteranceMap (has typeof) should NOT be hoisted - it belongs in 'other'
+    try std.testing.expect(std.mem.indexOf(u8, sep.imports, "type UtteranceMap =") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sep.other, "type UtteranceMap =") != null);
+
+    // def and utterances_by_summary should be in 'other'
+    try std.testing.expect(std.mem.indexOf(u8, sep.other, "const def") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sep.other, "const utterances_by_summary") != null);
 }
